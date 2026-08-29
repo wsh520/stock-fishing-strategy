@@ -90,7 +90,9 @@ class StrategyConfig:
 
     # === 价格位置 ===
     POSITION_20_MAX: float = 0.35
-    CLOSE_POSITION_MIN: float = 0.45
+    # 原值0.45过高：跌幅-3%~-15%的阴线收盘位置通常在0.1~0.3
+    # 仅长下影线(锤子线)能达到0.45，降低到0.25允许更多底部形态通过
+    CLOSE_POSITION_MIN: float = 0.25
     ALLOW_INTRADAY_BREAK: float = 0.01
 
     # === 基本面 ===
@@ -101,7 +103,9 @@ class StrategyConfig:
     PROFIT_GROWTH_MIN: float = -20.0
 
     # === 日线确认 ===
-    DAILY_CONFIRM_MIN_SCORE: int = 22
+    # 原值22分过高：底部反弹初期MA5<MA10(-7分)，很难凑够22分
+    # 降低到15分，让初期反弹信号（收阳+接近MA5+放量）能通过
+    DAILY_CONFIRM_MIN_SCORE: int = 15
 
     # === 止损止盈 ===
     ATR_STOP_MULTIPLIER: float = 0.5
@@ -112,9 +116,12 @@ class StrategyConfig:
     MIN_RISK_REWARD: float = 1.5
 
     # === 评分 ===
-    MIN_SCORE: int = 65
+    # 原值65分：结合放宽后的子评分门槛，总分门槛也需同步降低
+    # 典型底部反弹初期：周线~25 + 日线~18 + 基本面~5 + RR~6 = 54
+    # 设为50分让有效信号能通过，同时仍然过滤掉低质量标的
+    MIN_SCORE: int = 50
     WEEKLY_MIN_SCORE: int = 15
-    DAILY_MIN_SCORE: int = 18
+    DAILY_MIN_SCORE: int = 15  # 与DAILY_CONFIRM_MIN_SCORE保持一致
     FUNDAMENTAL_MIN_SCORE: int = 3
 
     # === 行业分散 ===
@@ -992,10 +999,11 @@ def check_weekly_bottom(df: pd.DataFrame, config: StrategyConfig) -> dict:
     if pd.isna(vol_ratio):
         return {"pass": False, "score": 0, "details": {"reason": "量能数据缺失"}}
 
-    # 模式A: 放量承接
+    # 模式A: 放量承接（量比 >= 1.5）
     mode_a = vol_ratio >= config.VOLUME_RATIO_THRESHOLD
 
     # 模式B: 缩量企稳后温和回升
+    # 放宽：原来要求三个子条件全部成立，改为满足任意两个即可
     mode_b = False
     volume_mode = "none"
     if len(df) >= 4:
@@ -1005,7 +1013,7 @@ def check_weekly_bottom(df: pd.DataFrame, config: StrategyConfig) -> dict:
         vol_ma12_t2 = df["volume_ma12_prev"].iloc[-3]
         vol_ma4 = T.get("volume_ma4_prev", np.nan)
 
-        # 前期放量
+        # 子条件1: 前期放量
         recent_spike = False
         if not pd.isna(vol_ma12_t1) and vol_ma12_t1 > 0:
             if vol_t1 >= vol_ma12_t1 * config.VOLUME_RECENT_SPIKE:
@@ -1014,40 +1022,46 @@ def check_weekly_bottom(df: pd.DataFrame, config: StrategyConfig) -> dict:
             if vol_t2 >= vol_ma12_t2 * config.VOLUME_RECENT_SPIKE:
                 recent_spike = True
 
-        # 当前温和放量
+        # 子条件2: 当前温和放量
         current_moderate = False
         vol_ma12 = T["volume_ma12_prev"]
         if not pd.isna(vol_ma12) and vol_ma12 > 0:
             current_moderate = (
-                T["volume"] >= vol_ma12 * 1.0 and
+                T["volume"] >= vol_ma12 * 0.8 and
                 T["volume"] < vol_ma12 * 2.5
             )
 
-        # 相对近期回升
+        # 子条件3: 相对近期回升
         recent_recovery = False
         if not pd.isna(vol_ma4) and vol_ma4 > 0:
             recent_recovery = (T["volume"] / vol_ma4) >= config.VOLUME_RECOVERY_RATIO
 
-        mode_b = recent_spike and current_moderate and recent_recovery
+        # 放宽：三个子条件满足任意两个即可
+        mode_b_score = int(recent_spike) + int(current_moderate) + int(recent_recovery)
+        mode_b = mode_b_score >= 2
+
+    # 模式C: 量比虽不到1.5但 >= 1.0（不缩量即可），作为最宽松的通过条件
+    mode_c = vol_ratio >= 1.0
 
     if mode_a:
         volume_mode = "A"
     elif mode_b:
         volume_mode = "B"
+    elif mode_c:
+        volume_mode = "C"
     else:
         return {"pass": False, "score": 0, "details": {"reason": f"量能条件不满足(量比:{vol_ratio:.2f})"}}
 
     details["volume_mode"] = volume_mode
 
     # ---- 换手率条件 ----
+    # 仅保留周换手率上限作为淘汰项（防止游资爆炒）
+    # 换手比 >= 1.5 改为评分项而非淘汰项（缩量阴跌也是有效底部形态）
     turnover_ratio = T.get("turnover_ratio", np.nan)
     if "turnover" in df.columns and not pd.isna(T.get("turnover", np.nan)):
         weekly_turnover = T["turnover"] / 100.0 if T["turnover"] > 1 else T["turnover"]
         if weekly_turnover > config.MAX_WEEKLY_TURNOVER:
             return {"pass": False, "score": 0, "details": {"reason": f"周换手率过高:{weekly_turnover:.2%}"}}
-
-        if not pd.isna(turnover_ratio) and turnover_ratio < config.TURNOVER_RATIO:
-            return {"pass": False, "score": 0, "details": {"reason": f"换手比不足:{turnover_ratio:.2f}"}}
 
     # ---- 不破前低 ----
     prev_20_low = T["prev_20_low"]
@@ -1083,9 +1097,16 @@ def check_weekly_bottom(df: pd.DataFrame, config: StrategyConfig) -> dict:
     score += 8
     details["low_position"] = pos_20
 
-    # 量能模式
-    score += 6
-    details["volume_score"] = 6
+    # 量能模式（A/B给满分，C模式量能信号较弱给少分）
+    if volume_mode == "A":
+        score += 6
+        details["volume_score"] = 6
+    elif volume_mode == "B":
+        score += 5
+        details["volume_score"] = 5
+    else:  # Mode C
+        score += 3
+        details["volume_score"] = 3
 
     # 换手率异常
     if not pd.isna(turnover_ratio) and turnover_ratio >= config.TURNOVER_RATIO:
@@ -1258,7 +1279,9 @@ def check_fundamental(data: Optional[dict], config: StrategyConfig) -> dict:
     返回: {"pass": bool, "score": int, "details": dict}
     """
     if data is None:
-        return {"pass": False, "score": 0, "details": {"reason": "基本面数据获取失败"}}
+        # 数据获取失败时不直接淘汰，给予最低分通过
+        # 原因：AkShare/BaoStock 财务接口不稳定，不应因数据源问题淘汰技术面合格的股票
+        return {"pass": True, "score": 3, "details": {"reason": "基本面数据缺失，给予最低分通过"}}
 
     details = {}
 
@@ -1469,16 +1492,23 @@ def check_right_side_confirmation(df: pd.DataFrame, config: StrategyConfig) -> d
     if pd.isna(ma5) or pd.isna(ma10):
         return {"pass": False, "score": 0, "details": {"reason": "均线数据不足"}}
 
-    # === 必须条件: Close > MA5 ===
-    if T["close"] <= ma5:
-        return {"pass": False, "score": 0, "details": {"reason": "收盘价未站上MA5"}}
-
-    # === 必须条件之二：MA5拐头 或 突破前日高点（二选一）===
+    # === 必须条件（放宽版）===
+    # 原逻辑要求 Close > MA5，但周线刚大跌后日线不可能立刻站上MA5
+    # 放宽为：满足以下任一即可进入评分
+    #   A) Close > MA5（标准右侧确认）
+    #   B) Close > MA5 * 0.98 且当日收阳且 Close > 前日Close（初期反弹信号）
+    #   C) 突破前日高点（不要求站上MA5）
     ma5_turn_up = (not pd.isna(ma5_prev)) and (ma5 > ma5_prev)
     break_prev_high = T["close"] > T1["high"]
+    close_above_ma5 = T["close"] > ma5
+    close_near_ma5 = T["close"] > ma5 * 0.98 and T["close"] > T["open"] and T["close"] > T1["close"]
 
-    if not ma5_turn_up and not break_prev_high:
-        return {"pass": False, "score": 0, "details": {"reason": "MA5未拐头且未突破前日高点"}}
+    if not close_above_ma5 and not close_near_ma5 and not break_prev_high:
+        return {"pass": False, "score": 0, "details": {"reason": "未满足日线反弹条件(未站上MA5/未接近MA5收阳/未突破前高)"}}
+
+    # 如果只是接近MA5（条件B），或仅突破前高，不再要求MA5拐头
+    if not close_above_ma5 and not ma5_turn_up and not break_prev_high and not close_near_ma5:
+        return {"pass": False, "score": 0, "details": {"reason": "反弹力度不足"}}
 
     # 通过必须条件后，进入加权评分
     score, details = score_daily_confirmation(df, config)

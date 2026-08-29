@@ -9,7 +9,7 @@ import json
 import logging
 import os
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Dict, Any
 
 import requests
 import pandas as pd
@@ -253,4 +253,109 @@ def notify_tracking_result(report_df: Optional[pd.DataFrame]) -> bool:
     card = format_tracking_card(report_df)
     if card is None:
         return True  # 无需发送
+    return send_feishu_message(card)
+
+
+def format_monthly_performance_card(stats: Dict[str, Any]) -> dict:
+    """
+    将月度绩效统计格式化为飞书卡片消息
+
+    参数:
+        stats: get_monthly_performance() 返回的统计字典
+    返回:
+        飞书消息体 dict
+    """
+    today_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+    period_days = stats.get("period_days", 30)
+
+    # 涨幅 Top5 / 跌幅 Top5
+    details = stats.get("details", [])
+    tracked_details = [d for d in details if d.get("return_pct") is not None]
+    sorted_by_return = sorted(tracked_details, key=lambda x: x["return_pct"], reverse=True)
+
+    top_winners = sorted_by_return[:5]
+    top_losers = sorted_by_return[-5:] if len(sorted_by_return) > 5 else []
+
+    winners_text = "\n".join([
+        f"  {r['code']} {r['name']} | +{r['return_pct']:.1f}% | {r.get('status', '')}"
+        for r in top_winners if r["return_pct"] > 0
+    ]) or "  暂无"
+
+    losers_text = "\n".join([
+        f"  {r['code']} {r['name']} | {r['return_pct']:.1f}% | {r.get('status', '')}"
+        for r in reversed(top_losers) if r["return_pct"] <= 0
+    ]) or "  暂无"
+
+    # 按信号等级分组
+    by_level = stats.get("by_signal_level", {})
+    level_lines = []
+    for level, ldata in by_level.items():
+        level_lines.append(
+            f"  {level}: {ldata['count']}只 | "
+            f"胜率:{ldata['win_rate']:.0f}% | "
+            f"平均收益:{ldata['avg_return']:.1f}%"
+        )
+    level_text = "\n".join(level_lines) or "  暂无数据"
+
+    # 卡片颜色
+    win_rate = stats.get("win_rate", 0)
+    if win_rate >= 60:
+        template = "green"
+    elif win_rate >= 40:
+        template = "orange"
+    else:
+        template = "red"
+
+    return {
+        "msg_type": "interactive",
+        "card": {
+            "header": {
+                "title": {
+                    "tag": "plain_text",
+                    "content": f"📊 近{period_days}天推荐股票绩效报告",
+                },
+                "template": template,
+            },
+            "elements": [
+                {
+                    "tag": "div",
+                    "text": {
+                        "tag": "lark_md",
+                        "content": (
+                            f"**报告时间**: {today_str}\n"
+                            f"**统计周期**: 近 {period_days} 天\n\n"
+                            "---\n\n"
+                            f"**推荐总数**: {stats['total_signals']} 只\n"
+                            f"**有效追踪**: {stats['valid_signals']} 只\n"
+                            f"**胜率**: {stats['win_rate']:.1f}% "
+                            f"({stats['win_count']}胜 / {stats['loss_count']}负)\n"
+                            f"**平均收益率**: {stats['avg_return']:.2f}%\n"
+                            f"**中位数收益**: {stats['median_return']:.2f}%\n"
+                            f"**最大盈利**: +{stats['max_win']:.2f}%\n"
+                            f"**最大亏损**: {stats['max_loss']:.2f}%\n\n"
+                            "---\n\n"
+                            f"**按信号等级**:\n{level_text}\n\n"
+                            "---\n\n"
+                            f"**涨幅前5**:\n{winners_text}\n\n"
+                            f"**跌幅前5**:\n{losers_text}"
+                        ),
+                    },
+                },
+                {
+                    "tag": "note",
+                    "elements": [
+                        {
+                            "tag": "plain_text",
+                            "content": "⚠️ 历史表现不代表未来收益，仅供策略评估参考。",
+                        }
+                    ],
+                },
+            ],
+        },
+    }
+
+
+def notify_monthly_performance(stats: Dict[str, Any]) -> bool:
+    """发送月度绩效报告通知"""
+    card = format_monthly_performance_card(stats)
     return send_feishu_message(card)
