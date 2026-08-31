@@ -16,6 +16,7 @@ evaluate() 为单股实盘选股入口。
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 import time
@@ -503,7 +504,8 @@ def _fetch_stock_pool_akshare(pool: str = "all_a") -> list[dict]:
                 continue
             result.append({"code": code, "name": name})
         return result
-    except Exception:
+    except Exception as e:
+        logging.error("Error fetching stock pool: %s", e)
         return []
 
 
