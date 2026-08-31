@@ -25,6 +25,7 @@ Thumbs.db
 
 # Cache
 data_cache/
+cache/
 
 # 保留 data 目录但忽略缓存
 !data/

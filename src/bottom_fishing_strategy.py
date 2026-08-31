@@ -10,42 +10,36 @@ Layer 5: 风险收益比过滤（动态止损 + 止盈目标 + 最低1.5倍RR）
 借鉴策略1(strategy.py)的架构：纯函数、向量化计算、参数外置、结构化输出。
 借鉴策略1的逻辑：不破前低、换手率倍率、个股MA斜率、恐慌杀跌、成交额下限、次新剔除。
 
+数据层对齐 weekly/data.py：单一 AkShare 数据源、统一列名映射、带退避重试、
+磁盘 CSV 缓存（行情按交易日失效 / 列表按 TTL 天失效）、股票池过滤由 config 开关驱动。
+
 compute_weekly_signals() / compute_daily_signals() 为纯函数，便于单测与回测。
 evaluate() 为单股实盘选股入口。
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import numpy as np
 import pandas as pd
 
-# ---------------------------------------------------------------------------
-# BaoStock 可选导入
-# ---------------------------------------------------------------------------
-try:
-    import baostock as bs
+# akshare 首次 import 稍慢，放在模块级。数据源为硬依赖：缺失即视为环境未装好，
+# 应当直接 ImportError 暴露问题，而不是静默降级成「所有取数都返回空」。
+import akshare as ak
 
-    _BS_AVAILABLE = True
-except ImportError:
-    bs = None  # type: ignore[assignment]
-    _BS_AVAILABLE = False
-
-try:
-    import akshare as ak
-
-    _AK_AVAILABLE = True
-except ImportError:
-    ak = None  # type: ignore[assignment]
-    _AK_AVAILABLE = False
+# 磁盘缓存默认落在项目根目录下的 cache/，不随进程工作目录变化
+_MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.dirname(_MODULE_DIR)
 
 # ===========================================================================
 # 模块级元数据（沿用策略1模式，供 notify 层读取）
@@ -88,7 +82,6 @@ class StrategyConfig:
     """全部策略参数，带默认值。实例化后可覆盖任意字段用于回测调参。"""
 
     # --- Layer 1: 市场环境 ---
-    CSI300_CODE: str = "sh.000300"
     CSI300_AK_SYMBOL: str = "sh000300"
     MARKET_MA_PERIOD: int = 20
     MARKET_SLOPE_LOOKBACK: int = 4
@@ -168,11 +161,36 @@ class StrategyConfig:
     DATA_DIR: str = "data"
     SIGNAL_HISTORY_FILE: str = "signal_history.csv"
     TRACKING_FILE: str = "tracking_report.csv"
-    STOCK_POOL: str = "all_a"
     MAX_WORKERS: int = 4
     WEEKLY_BARS: int = 60
     DAILY_BARS: int = 120
     FETCH_DELAY: float = 0.05
+
+    # --- 数据获取（对齐 weekly/data.py） ---
+    # 复权方式：qfq 前复权 / hfq 后复权 / "" 不复权
+    ADJUST: str = "qfq"
+    # 是否启用磁盘缓存（内存 CacheManager 之上再叠一层，跨进程/跨次运行复用）
+    USE_CACHE: bool = True
+    CACHE_DIR: str = os.path.join(_PROJECT_ROOT, "cache")
+    # 股票列表缓存有效期（天）。列表变化很慢，可缓存较久。
+    # 注意：行情类缓存改为「按交易日失效」——只有当天写入的才算新鲜，
+    # 保证每个新交易日自动重拉最新数据，同日重复跑仍走缓存。
+    CACHE_TTL_DAYS: float = 6.0
+    # 基本面缓存有效期（天）。财报按季更新，无需每日重拉。
+    FUND_CACHE_TTL_DAYS: float = 7.0
+    # 财务指标接口的起始年份
+    FUND_START_YEAR: str = "2023"
+    # 单只标的取数失败的重试次数
+    MAX_RETRY: int = 2
+    # 股票列表取数失败的重试次数（列表是全流程第一步，失败即整轮中断，多试几次）
+    LIST_MAX_RETRY: int = 4
+
+    # --- 股票池过滤开关（对齐 weekly/config.py，改配置即时生效无需清缓存） ---
+    FILTER_ST: bool = True          # 过滤 ST/*ST
+    EXCLUDE_DELISTING: bool = True  # 剔除退市整理期（名称含「退」）
+    EXCLUDE_BSE: bool = True        # 剔除北交所（8/4 开头，交易规则不同）
+    EXCLUDE_CHINEXT: bool = False   # 剔除创业板（300/301 开头）
+    EXCLUDE_STAR: bool = False      # 剔除科创板（688/689 开头）
 
 
 # ===========================================================================
@@ -203,96 +221,6 @@ class CacheManager:
 
 
 # ===========================================================================
-# 数据提供层 — BaoStock
-# ===========================================================================
-
-
-class BaoStockProvider:
-    """BaoStock 单例包装，管理 login/logout 生命周期。"""
-
-    _logged_in: bool = False
-
-    @classmethod
-    def login(cls) -> None:
-        if not cls._logged_in and _BS_AVAILABLE:
-            bs.login()
-            cls._logged_in = True
-
-    @classmethod
-    def logout(cls) -> None:
-        if cls._logged_in and _BS_AVAILABLE:
-            try:
-                bs.logout()
-            except Exception:
-                pass
-            cls._logged_in = False
-
-    @classmethod
-    def _query(
-        cls,
-        code: str,
-        start: str,
-        end: str,
-        frequency: str = "w",
-        fields: str = "date,open,high,low,close,volume,amount,turn,pctChg",
-    ) -> Optional[pd.DataFrame]:
-        if not _BS_AVAILABLE:
-            return None
-        cls.login()
-        rs = bs.query_history_k_data_plus(
-            code, fields, start_date=start, end_date=end, frequency=frequency, adjustflag="2",
-        )
-        rows = []
-        while (rs.error_code == "0") and rs.next():
-            rows.append(rs.get_row_data())
-        if not rows:
-            return None
-        df = pd.DataFrame(rows, columns=rs.fields)
-        rename = {
-            "turn": "turnover",
-            "pctChg": "pct_chg",
-        }
-        df = df.rename(columns=rename)
-        for col in ["open", "high", "low", "close", "volume", "amount", "turnover", "pct_chg"]:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-        df = df.dropna(subset=["close"])
-        return df if not df.empty else None
-
-    @classmethod
-    def query_weekly(cls, code: str, start: str, end: str) -> Optional[pd.DataFrame]:
-        return cls._query(code, start, end, frequency="w")
-
-    @classmethod
-    def query_daily(cls, code: str, start: str, end: str) -> Optional[pd.DataFrame]:
-        return cls._query(code, start, end, frequency="d")
-
-    @classmethod
-    def query_index_weekly(cls, code: str, start: str, end: str) -> Optional[pd.DataFrame]:
-        if not _BS_AVAILABLE:
-            return None
-        cls.login()
-        rs = bs.query_history_k_data_plus(
-            code,
-            "date,open,high,low,close,volume,amount",
-            start_date=start,
-            end_date=end,
-            frequency="w",
-        )
-        rows = []
-        while (rs.error_code == "0") and rs.next():
-            rows.append(rs.get_row_data())
-        if not rows:
-            return None
-        df = pd.DataFrame(rows, columns=rs.fields)
-        for col in ["open", "high", "low", "close", "volume", "amount"]:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-        df = df.dropna(subset=["close"])
-        return df if not df.empty else None
-
-
-# ===========================================================================
 # 数据提供层 — AkShare
 # ===========================================================================
 
@@ -303,233 +231,559 @@ def _ak_code_to_symbol(code: str) -> str:
     return c.zfill(6)
 
 
-def _ak_code_to_bs(code: str) -> str:
-    """将6位数字代码转为 BaoStock 格式 sh.XXXXXX / sz.XXXXXX。"""
-    c = code.replace("sh.", "").replace("sz.", "").replace("bj.", "").zfill(6)
-    if c.startswith(("6", "9")):
-        return f"sh.{c}"
-    return f"sz.{c}"
+# ---------------------------------------------------------------------------
+# 列名映射（模块级唯一来源，避免各取数函数重复定义 rename dict）
+# ---------------------------------------------------------------------------
+
+# stock_zh_a_hist 返回中文列名；_COLUMN_MAP 的值顺序即输出列顺序
+_COLUMN_MAP = {
+    "日期": "date",
+    "开盘": "open",
+    "收盘": "close",
+    "最高": "high",
+    "最低": "low",
+    "成交量": "volume",
+    "成交额": "amount",
+    "振幅": "amplitude",
+    "涨跌幅": "pct_chg",
+    "涨跌额": "change",
+    "换手率": "turnover",
+}
+
+# 需要强制转数值的列。date 保持 'YYYY-MM-DD' 字符串：
+# 下游指标计算、回测与 CSV/MySQL 落库均依赖该格式。
+_NUMERIC_COLS = (
+    "open", "close", "high", "low", "volume",
+    "amount", "amplitude", "pct_chg", "change", "turnover",
+)
+
+# 指数日线（stock_zh_index_daily）本身就是英文列名，只需转数值
+_INDEX_NUMERIC_COLS = ("open", "high", "low", "close", "volume")
+
+_DATE_FMT = "%Y-%m-%d"
 
 
-def _fetch_weekly_akshare(code: str, weeks: int = 60) -> Optional[pd.DataFrame]:
-    """通过 AkShare 获取个股周线数据。"""
-    if not _AK_AVAILABLE:
-        return None
-    try:
-        symbol = _ak_code_to_symbol(code)
-        end = datetime.now().strftime("%Y%m%d")
-        start = (datetime.now() - timedelta(weeks=weeks)).strftime("%Y%m%d")
-        df = ak.stock_zh_a_hist(symbol=symbol, period="weekly", start_date=start, end_date=end, adjust="qfq")
-        if df is None or df.empty:
-            return None
-        rename = {
-            "日期": "date", "开盘": "open", "收盘": "close", "最高": "high",
-            "最低": "low", "成交量": "volume", "成交额": "amount",
-            "换手率": "turnover", "涨跌幅": "pct_chg",
-        }
-        df = df.rename(columns=rename)
-        df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
-        for col in ["open", "high", "low", "close", "volume", "amount", "turnover", "pct_chg"]:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-        df = df.dropna(subset=["close"])
-        return df.reset_index(drop=True) if not df.empty else None
-    except Exception:
-        return None
+# ---------------------------------------------------------------------------
+# 重试
+# ---------------------------------------------------------------------------
 
 
-def _fetch_daily_akshare(code: str, days: int = 120) -> Optional[pd.DataFrame]:
-    """通过 AkShare 获取个股日线数据。"""
-    if not _AK_AVAILABLE:
-        return None
-    try:
-        symbol = _ak_code_to_symbol(code)
-        end = datetime.now().strftime("%Y%m%d")
-        start = (datetime.now() - timedelta(days=days)).strftime("%Y%m%d")
-        df = ak.stock_zh_a_hist(symbol=symbol, period="daily", start_date=start, end_date=end, adjust="qfq")
-        if df is None or df.empty:
-            return None
-        rename = {
-            "日期": "date", "开盘": "open", "收盘": "close", "最高": "high",
-            "最低": "low", "成交量": "volume", "成交额": "amount",
-            "换手率": "turnover", "涨跌幅": "pct_chg",
-        }
-        df = df.rename(columns=rename)
-        df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
-        for col in ["open", "high", "low", "close", "volume", "amount", "turnover", "pct_chg"]:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-        df = df.dropna(subset=["close"])
-        return df.reset_index(drop=True) if not df.empty else None
-    except Exception:
-        return None
+def _fetch_with_retry(
+    fetcher: Callable[[], Optional[pd.DataFrame]],
+    max_retry: int,
+    label: str,
+    retry_on_empty: bool = False,
+) -> Optional[pd.DataFrame]:
+    """带退避重试地执行一次 akshare 请求，失败返回 None。
 
+    东财接口偶发连接重置与限流，重试比直接放弃划算得多。
 
-def _fetch_index_weekly_akshare(symbol: str = "sh000300", weeks: int = 60) -> Optional[pd.DataFrame]:
-    """通过 AkShare 获取指数周线数据。"""
-    if not _AK_AVAILABLE:
-        return None
-    try:
-        end = datetime.now().strftime("%Y%m%d")
-        start = (datetime.now() - timedelta(weeks=weeks)).strftime("%Y%m%d")
-        df = ak.stock_zh_index_daily(symbol=symbol)
-        if df is None or df.empty:
-            return None
-        rename = {
-            "date": "date", "open": "open", "close": "close", "high": "high",
-            "low": "low", "volume": "volume",
-        }
-        df = df.rename(columns={k: v for k, v in rename.items() if k in df.columns})
-        df["date"] = pd.to_datetime(df["date"])
-        start_dt = pd.to_datetime(start)
-        df = df[df["date"] >= start_dt].copy()
-        df["date"] = df["date"].dt.strftime("%Y-%m-%d")
-        for col in ["open", "high", "low", "close", "volume"]:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-        # 转换为周线：按周聚合
-        df["date_dt"] = pd.to_datetime(df["date"])
-        df = df.set_index("date_dt")
-        weekly = df.resample("W").agg({
-            "open": "first", "high": "max", "low": "min",
-            "close": "last", "volume": "sum",
-        }).dropna(subset=["close"])
-        weekly = weekly.reset_index()
-        weekly["date"] = weekly["date_dt"].dt.strftime("%Y-%m-%d")
-        weekly = weekly.drop(columns=["date_dt"])
-        return weekly if not weekly.empty else None
-    except Exception:
-        return None
-
-
-def _fetch_fundamentals_akshare(code: str) -> Optional[dict]:
-    """通过 AkShare 获取基本面数据：ROE、负债率、商誉占比、扣非比。"""
-    if not _AK_AVAILABLE:
-        return None
-    try:
-        symbol = _ak_code_to_symbol(code)
-        result: dict[str, Optional[float]] = {
-            "roe": None,
-            "debt_ratio": None,
-            "goodwill_ratio": None,
-            "deducted_profit_ratio": None,
-        }
-
-        # ROE + 负债率：财务指标
+    retry_on_empty=False（默认）：「返回空」被视为该标的确实没有数据（如次新股、
+    停牌区间），立即返回不再重试，只对抛异常的情况重试。
+    retry_on_empty=True：用于股票列表这类「空即异常」的场景。
+    """
+    last_err: Optional[Exception] = None
+    for attempt in range(max_retry + 1):
         try:
-            df_fin = ak.stock_financial_analysis_indicator(symbol=symbol, start_year="2023")
-            if df_fin is not None and not df_fin.empty:
-                # 取最近一期
-                for col in df_fin.columns:
-                    col_lower = str(col).lower()
-                    if "净资产收益率" in str(col) or "roe" in col_lower:
-                        val = pd.to_numeric(df_fin.iloc[0][col], errors="coerce")
-                        if not pd.isna(val):
-                            result["roe"] = float(val)
-                    if "资产负债率" in str(col) or "debt" in col_lower:
-                        val = pd.to_numeric(df_fin.iloc[0][col], errors="coerce")
-                        if not pd.isna(val):
-                            result["debt_ratio"] = float(val)
-        except Exception:
-            pass
-
-        # 商誉占比：资产负债表
-        try:
-            df_bs = ak.stock_balance_sheet_by_report_em(symbol=symbol)
-            if df_bs is not None and not df_bs.empty:
-                row = df_bs.iloc[0]
-                goodwill = 0.0
-                net_assets = 0.0
-                for col in df_bs.columns:
-                    if "商誉" in str(col):
-                        val = pd.to_numeric(row.get(col), errors="coerce")
-                        if not pd.isna(val):
-                            goodwill = float(val)
-                    if "股东权益合计" in str(col) or "净资产" in str(col):
-                        val = pd.to_numeric(row.get(col), errors="coerce")
-                        if not pd.isna(val) and val > 0:
-                            net_assets = float(val)
-                if net_assets > 0:
-                    result["goodwill_ratio"] = goodwill / net_assets * 100
-        except Exception:
-            pass
-
-        # 扣非利润占比：利润表
-        try:
-            df_income = ak.stock_profit_sheet_by_report_em(symbol=symbol)
-            if df_income is not None and not df_income.empty:
-                row = df_income.iloc[0]
-                net_profit = 0.0
-                deducted_profit = 0.0
-                for col in df_income.columns:
-                    col_str = str(col)
-                    if "净利润" in col_str and "扣" not in col_str and "归" not in col_str:
-                        val = pd.to_numeric(row.get(col), errors="coerce")
-                        if not pd.isna(val):
-                            net_profit = float(val)
-                    if "扣非" in col_str or "扣除非经常" in col_str:
-                        val = pd.to_numeric(row.get(col), errors="coerce")
-                        if not pd.isna(val):
-                            deducted_profit = float(val)
-                if net_profit > 0:
-                    result["deducted_profit_ratio"] = deducted_profit / net_profit
-        except Exception:
-            pass
-
-        # 至少有一项有效数据才返回
-        if any(v is not None for v in result.values()):
-            return result
-        return None
-    except Exception:
-        return None
+            raw = fetcher()
+            if raw is not None and not raw.empty:
+                return raw
+            if not retry_on_empty:
+                return None
+            last_err = RuntimeError(f"{label} 返回空")
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+        if attempt < max_retry:
+            time.sleep(0.5 * (attempt + 1))
+    # 全市场扫描下逐只打印会刷屏，降级为 debug，由上层统计失败数
+    logging.debug("%s 获取失败（已重试 %d 次）: %s", label, max_retry, last_err)
+    return None
 
 
-def _fetch_stock_pool_akshare(pool: str = "all_a") -> list[dict]:
-    """获取全A股票列表，返回 [{"code": "000001", "name": "平安银行"}, ...]。"""
-    if not _AK_AVAILABLE:
-        return []
+# ---------------------------------------------------------------------------
+# 磁盘缓存（内存 CacheManager 之下的第二层，跨进程/跨次运行复用）
+# ---------------------------------------------------------------------------
+
+
+def _cache_path(config: StrategyConfig, name: str) -> str:
+    os.makedirs(config.CACHE_DIR, exist_ok=True)
+    return os.path.join(config.CACHE_DIR, name)
+
+
+def _cache_fresh(path: str, ttl_days: float) -> bool:
+    """缓存是否在 ttl_days 内写入。"""
+    if not os.path.exists(path):
+        return False
+    mtime = datetime.fromtimestamp(os.path.getmtime(path))
+    return datetime.now() - mtime < timedelta(days=ttl_days)
+
+
+def _cache_fresh_today(path: str) -> bool:
+    """缓存是否为「今天」写入的（跨交易日自动失效）。
+
+    行情类数据用这个口径：每个新交易日（含当周最后一根周K收盘）会自动重拉，
+    避免读到上一交易日的旧数据；同一天内重复运行仍走缓存，保证速度。
+    """
+    if not os.path.exists(path):
+        return False
+    mtime = datetime.fromtimestamp(os.path.getmtime(path))
+    return mtime.date() == datetime.now().date()
+
+
+def _read_cache_csv(path: str, dtype: Optional[dict] = None) -> Optional[pd.DataFrame]:
+    """读取缓存 CSV。读失败（文件损坏/半截）当作未命中，由调用方重新拉取。"""
     try:
-        df = ak.stock_zh_a_spot_em()
-        if df is None or df.empty:
+        df = pd.read_csv(path, dtype=dtype or {"date": str})
+        return df if not df.empty else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _write_cache_csv(df: pd.DataFrame, path: str) -> None:
+    """原子写入：先写临时文件再 os.replace，避免并发或中断留下半截缓存。"""
+    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+    try:
+        df.to_csv(tmp, index=False)
+        os.replace(tmp, path)
+    except Exception as e:  # noqa: BLE001
+        # 缓存只是加速手段，写失败不影响主流程；残留 .tmp 由下次同名写入覆盖
+        logging.debug("写缓存失败 %s: %s", path, e)
+
+
+def _read_cache_json(path: str) -> Optional[dict]:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _write_cache_json(obj: dict, path: str) -> None:
+    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+# ---------------------------------------------------------------------------
+# 列名与类型规整
+# ---------------------------------------------------------------------------
+
+
+def _normalize_hist(raw: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
+    """把 stock_zh_a_hist 的中文列原始数据规整为统一英文列。
+
+    只保留 _COLUMN_MAP 中声明的列（丢掉「股票代码」等冗余列），按日期升序排列。
+    """
+    if raw is None or raw.empty:
+        return None
+    df = raw.rename(columns=_COLUMN_MAP)
+    keep = [c for c in _COLUMN_MAP.values() if c in df.columns]
+    if "date" not in keep or "close" not in keep:
+        return None
+    df = df[keep].copy()
+    df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.strftime(_DATE_FMT)
+    for col in _NUMERIC_COLS:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=["date", "close"])
+    if df.empty:
+        return None
+    return df.sort_values("date").reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------------
+# 个股 K 线
+# ---------------------------------------------------------------------------
+
+
+def _fetch_hist(
+    code: str,
+    period: str,
+    start: str,
+    end: str,
+    config: StrategyConfig,
+    cache_name: Optional[str] = None,
+) -> Optional[pd.DataFrame]:
+    """取个股 K 线。period: daily / weekly，start/end 格式 YYYYMMDD。
+
+    cache_name 显式指定磁盘缓存文件名；缺省时按区间命名。缓存按交易日失效。
+    """
+    symbol = _ak_code_to_symbol(code)
+    path = ""
+    if config.USE_CACHE:
+        name = cache_name or (
+            f"{period}_{symbol}_{start}_{end}_{config.ADJUST or 'none'}.csv"
+        )
+        path = _cache_path(config, name)
+        if _cache_fresh_today(path):
+            cached = _read_cache_csv(path)
+            if cached is not None:
+                return cached
+
+    raw = _fetch_with_retry(
+        lambda: ak.stock_zh_a_hist(
+            symbol=symbol,
+            period=period,
+            start_date=start,
+            end_date=end,
+            adjust=config.ADJUST,
+        ),
+        config.MAX_RETRY,
+        f"stock_zh_a_hist({symbol},{period})",
+    )
+    df = _normalize_hist(raw)
+    if df is not None and path:
+        _write_cache_csv(df, path)
+    return df
+
+
+def fetch_weekly_range(
+    code: str, start: str, end: str, config: Optional[StrategyConfig] = None,
+) -> Optional[pd.DataFrame]:
+    """获取个股指定区间的周线数据。start/end 格式 YYYYMMDD。"""
+    return _fetch_hist(code, "weekly", start, end, config or StrategyConfig())
+
+
+def fetch_daily_range(
+    code: str, start: str, end: str, config: Optional[StrategyConfig] = None,
+) -> Optional[pd.DataFrame]:
+    """获取个股指定区间的日线数据。start/end 格式 YYYYMMDD。"""
+    return _fetch_hist(code, "daily", start, end, config or StrategyConfig())
+
+
+def _window_dates(bars: int, unit: str) -> tuple[str, str]:
+    """把「回看 N 周 / N 天」换算成 (start, end) 的 YYYYMMDD 字符串。"""
+    end = datetime.now()
+    delta = timedelta(weeks=bars) if unit == "weeks" else timedelta(days=bars)
+    return (end - delta).strftime("%Y%m%d"), end.strftime("%Y%m%d")
+
+
+def _window_cache_name(period: str, symbol: str, bars: int, config: StrategyConfig) -> str:
+    """实盘「回看 N 根」路径的缓存文件名。
+
+    区间由「今天」推算，每天都不同；若把日期写进文件名，每个新交易日都会为每只
+    股票新建一份缓存，磁盘无限膨胀。因此这里只用 (周期, 代码, 回看根数, 复权方式)
+    命名，配合按交易日失效——每天覆盖同一个文件（与 weekly/data.py 的做法一致）。
+    """
+    return f"{period}_{symbol}_last{bars}_{config.ADJUST or 'none'}.csv"
+
+
+def _fetch_weekly_akshare(
+    code: str, weeks: int = 60, config: Optional[StrategyConfig] = None,
+) -> Optional[pd.DataFrame]:
+    """通过 AkShare 获取个股周线数据（回看 weeks 周）。"""
+    config = config or StrategyConfig()
+    start, end = _window_dates(weeks, "weeks")
+    name = _window_cache_name("weekly", _ak_code_to_symbol(code), weeks, config)
+    return _fetch_hist(code, "weekly", start, end, config, cache_name=name)
+
+
+def _fetch_daily_akshare(
+    code: str, days: int = 120, config: Optional[StrategyConfig] = None,
+) -> Optional[pd.DataFrame]:
+    """通过 AkShare 获取个股日线数据（回看 days 天）。"""
+    config = config or StrategyConfig()
+    start, end = _window_dates(days, "days")
+    name = _window_cache_name("daily", _ak_code_to_symbol(code), days, config)
+    return _fetch_hist(code, "daily", start, end, config, cache_name=name)
+
+
+# ---------------------------------------------------------------------------
+# 指数 K 线
+# ---------------------------------------------------------------------------
+
+
+def _fetch_index_daily_raw(
+    symbol: str, config: StrategyConfig,
+) -> Optional[pd.DataFrame]:
+    """取指数日线全量历史。
+
+    stock_zh_index_daily 不支持区间参数，只能全量拉取后在本地切片。全量历史较大，
+    因此按交易日缓存一次，供实盘与回测的所有区间共用。
+    """
+    path = ""
+    if config.USE_CACHE:
+        path = _cache_path(config, f"index_daily_{symbol}.csv")
+        if _cache_fresh_today(path):
+            cached = _read_cache_csv(path)
+            if cached is not None:
+                return cached
+
+    raw = _fetch_with_retry(
+        lambda: ak.stock_zh_index_daily(symbol=symbol),
+        config.MAX_RETRY,
+        f"stock_zh_index_daily({symbol})",
+        retry_on_empty=True,
+    )
+    if raw is None:
+        return None
+
+    df = raw.copy()
+    if "date" not in df.columns or "close" not in df.columns:
+        return None
+    df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.strftime(_DATE_FMT)
+    for col in _INDEX_NUMERIC_COLS:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=["date", "close"])
+    if df.empty:
+        return None
+    df = df.sort_values("date").reset_index(drop=True)
+    if path:
+        _write_cache_csv(df, path)
+    return df
+
+
+def fetch_index_weekly_range(
+    symbol: str, start: str, end: str, config: Optional[StrategyConfig] = None,
+) -> Optional[pd.DataFrame]:
+    """获取指数指定区间的周线数据（日线切片后按周聚合）。start/end 格式 YYYYMMDD。"""
+    config = config or StrategyConfig()
+    df = _fetch_index_daily_raw(symbol, config)
+    if df is None:
+        return None
+
+    dt = pd.to_datetime(df["date"])
+    sub = df[(dt >= pd.to_datetime(start)) & (dt <= pd.to_datetime(end))].copy()
+    if sub.empty:
+        return None
+
+    agg = {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
+    agg = {k: v for k, v in agg.items() if k in sub.columns}
+    sub["_dt"] = pd.to_datetime(sub["date"])
+    weekly = (
+        sub.set_index("_dt").resample("W").agg(agg).dropna(subset=["close"]).reset_index()
+    )
+    weekly["date"] = weekly["_dt"].dt.strftime(_DATE_FMT)
+    weekly = weekly.drop(columns=["_dt"])
+    return weekly if not weekly.empty else None
+
+
+def _fetch_index_weekly_akshare(
+    symbol: str = "sh000300", weeks: int = 60, config: Optional[StrategyConfig] = None,
+) -> Optional[pd.DataFrame]:
+    """通过 AkShare 获取指数周线数据（回看 weeks 周）。"""
+    config = config or StrategyConfig()
+    start, end = _window_dates(weeks, "weeks")
+    return fetch_index_weekly_range(symbol, start, end, config)
+
+
+# ---------------------------------------------------------------------------
+# 基本面
+# ---------------------------------------------------------------------------
+
+
+def _fetch_fundamentals_akshare(
+    code: str, config: Optional[StrategyConfig] = None,
+) -> Optional[dict]:
+    """通过 AkShare 获取基本面数据：ROE、负债率、商誉占比、扣非比。
+
+    三张报表各自独立取数，任一失败不影响其余项；至少一项有效才返回。
+    磁盘缓存按 FUND_CACHE_TTL_DAYS 失效——财报按季更新，无需每个交易日重拉。
+    """
+    config = config or StrategyConfig()
+    symbol = _ak_code_to_symbol(code)
+
+    path = ""
+    if config.USE_CACHE:
+        path = _cache_path(config, f"fund_{symbol}.json")
+        if _cache_fresh(path, config.FUND_CACHE_TTL_DAYS):
+            cached = _read_cache_json(path)
+            if cached is not None:
+                return cached
+
+    result: dict[str, Optional[float]] = {
+        "roe": None,
+        "debt_ratio": None,
+        "goodwill_ratio": None,
+        "deducted_profit_ratio": None,
+    }
+
+    # ROE + 负债率：财务指标
+    df_fin = _fetch_with_retry(
+        lambda: ak.stock_financial_analysis_indicator(
+            symbol=symbol, start_year=config.FUND_START_YEAR,
+        ),
+        config.MAX_RETRY,
+        f"stock_financial_analysis_indicator({symbol})",
+    )
+    if df_fin is not None:
+        # 取最近一期
+        row = df_fin.iloc[0]
+        for col in df_fin.columns:
+            col_str = str(col)
+            col_lower = col_str.lower()
+            if "净资产收益率" in col_str or "roe" in col_lower:
+                val = pd.to_numeric(row[col], errors="coerce")
+                if not pd.isna(val):
+                    result["roe"] = float(val)
+            if "资产负债率" in col_str or "debt" in col_lower:
+                val = pd.to_numeric(row[col], errors="coerce")
+                if not pd.isna(val):
+                    result["debt_ratio"] = float(val)
+
+    # 商誉占比：资产负债表
+    df_bs = _fetch_with_retry(
+        lambda: ak.stock_balance_sheet_by_report_em(symbol=symbol),
+        config.MAX_RETRY,
+        f"stock_balance_sheet_by_report_em({symbol})",
+    )
+    if df_bs is not None:
+        row = df_bs.iloc[0]
+        goodwill = 0.0
+        net_assets = 0.0
+        for col in df_bs.columns:
+            col_str = str(col)
+            if "商誉" in col_str:
+                val = pd.to_numeric(row.get(col), errors="coerce")
+                if not pd.isna(val):
+                    goodwill = float(val)
+            if "股东权益合计" in col_str or "净资产" in col_str:
+                val = pd.to_numeric(row.get(col), errors="coerce")
+                if not pd.isna(val) and val > 0:
+                    net_assets = float(val)
+        if net_assets > 0:
+            result["goodwill_ratio"] = goodwill / net_assets * 100
+
+    # 扣非利润占比：利润表
+    df_income = _fetch_with_retry(
+        lambda: ak.stock_profit_sheet_by_report_em(symbol=symbol),
+        config.MAX_RETRY,
+        f"stock_profit_sheet_by_report_em({symbol})",
+    )
+    if df_income is not None:
+        row = df_income.iloc[0]
+        net_profit = 0.0
+        deducted_profit = 0.0
+        for col in df_income.columns:
+            col_str = str(col)
+            if "净利润" in col_str and "扣" not in col_str and "归" not in col_str:
+                val = pd.to_numeric(row.get(col), errors="coerce")
+                if not pd.isna(val):
+                    net_profit = float(val)
+            if "扣非" in col_str or "扣除非经常" in col_str:
+                val = pd.to_numeric(row.get(col), errors="coerce")
+                if not pd.isna(val):
+                    deducted_profit = float(val)
+        if net_profit > 0:
+            result["deducted_profit_ratio"] = deducted_profit / net_profit
+
+    # 至少有一项有效数据才返回
+    if not any(v is not None for v in result.values()):
+        return None
+    if path:
+        _write_cache_json(result, path)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# 股票池
+# ---------------------------------------------------------------------------
+
+
+def _fetch_stock_list_raw(config: StrategyConfig) -> Optional[pd.DataFrame]:
+    """拉取全 A 股列表（列: code, name），带重试。
+
+    列表是全流程第一步，失败即整轮中断，因此用 LIST_MAX_RETRY 多试几次，
+    且「返回空」也视为异常需要重试。
+    """
+    raw = _fetch_with_retry(
+        lambda: ak.stock_info_a_code_name(),
+        config.LIST_MAX_RETRY,
+        "stock_info_a_code_name",
+        retry_on_empty=True,
+    )
+    if raw is None:
+        return None
+    if "code" not in raw.columns or "name" not in raw.columns:
+        return None
+    df = raw[["code", "name"]].copy()
+    df["code"] = df["code"].astype(str).str.zfill(6)
+    df["name"] = df["name"].astype(str)
+    return df.reset_index(drop=True)
+
+
+def _apply_universe_filters(df: pd.DataFrame, config: StrategyConfig) -> pd.DataFrame:
+    """按 config 开关过滤股票池。
+
+    过滤在每次返回时应用（而非写缓存前），因此改配置即时生效，无需清缓存。
+    """
+    out = df.copy()
+    out["code"] = out["code"].astype(str).str.zfill(6)
+    out["name"] = out["name"].astype(str)
+
+    if config.EXCLUDE_BSE:
+        # 北交所以 8 / 4 开头
+        out = out[~out["code"].str.startswith(("8", "4"))]
+
+    if config.EXCLUDE_CHINEXT:
+        # 创业板以 300 / 301 开头
+        out = out[~out["code"].str.startswith(("300", "301"))]
+
+    if config.EXCLUDE_STAR:
+        # 科创板以 688 / 689 开头
+        out = out[~out["code"].str.startswith(("688", "689"))]
+
+    if config.FILTER_ST:
+        out = out[~out["name"].str.contains("ST", case=False, na=False)]
+
+    if config.EXCLUDE_DELISTING:
+        # 退市整理期个股名称含「退」
+        out = out[~out["name"].str.contains("退", na=False)]
+
+    return out.reset_index(drop=True)
+
+
+def _fetch_stock_pool_akshare(
+    config: Optional[StrategyConfig] = None,
+) -> list[dict]:
+    """获取全A股票列表，返回 [{"code": "000001", "name": "平安银行"}, ...]。
+
+    磁盘缓存只存未过滤的原始全量列表（按 CACHE_TTL_DAYS 失效，列表变化很慢）。
+    """
+    config = config or StrategyConfig()
+
+    path = ""
+    df: Optional[pd.DataFrame] = None
+    if config.USE_CACHE:
+        path = _cache_path(config, "stock_list.csv")
+        if _cache_fresh(path, config.CACHE_TTL_DAYS):
+            df = _read_cache_csv(path, dtype={"code": str, "name": str})
+            if df is not None and ("code" not in df.columns or "name" not in df.columns):
+                df = None
+
+    if df is None:
+        df = _fetch_stock_list_raw(config)
+        if df is None:
+            logging.error("获取股票列表失败（已重试 %d 次）", config.LIST_MAX_RETRY)
             return []
-        result = []
-        for _, row in df.iterrows():
-            code = str(row.get("代码", "")).zfill(6)
-            name = str(row.get("名称", ""))
-            # 排除ST和退市
-            if "ST" in name or "退" in name:
-                continue
-            # 排除北交所（8开头）
-            if code.startswith("8"):
-                continue
-            result.append({"code": code, "name": name})
-        return result
-    except Exception as e:
-        logging.error("Error fetching stock pool: %s", e)
-        return []
+        if path:
+            _write_cache_csv(df, path)
+
+    return _apply_universe_filters(df, config).to_dict("records")
 
 
 # ===========================================================================
-# 统一数据接口（AkShare优先 → BaoStock降级）
+# 统一数据接口（AkShare 单一数据源 + 两级缓存：内存 → 磁盘）
 # ===========================================================================
 
 
 def get_weekly_data(
     code: str, config: StrategyConfig, cache: Optional[CacheManager] = None,
 ) -> Optional[pd.DataFrame]:
-    """获取个股周线数据，优先 AkShare，降级 BaoStock。"""
+    """获取个股周线数据。"""
     cache_key = f"weekly_{code}"
     if cache:
         cached = cache.get(cache_key)
         if cached is not None:
             return cached
 
-    df = _fetch_weekly_akshare(code, weeks=config.WEEKLY_BARS)
-    if df is None and _BS_AVAILABLE:
-        end = datetime.now().strftime("%Y-%m-%d")
-        start = (datetime.now() - timedelta(weeks=config.WEEKLY_BARS)).strftime("%Y-%m-%d")
-        bs_code = _ak_code_to_bs(code)
-        df = BaoStockProvider.query_weekly(bs_code, start, end)
+    df = _fetch_weekly_akshare(code, weeks=config.WEEKLY_BARS, config=config)
 
     if cache and df is not None:
         cache.set(cache_key, df)
@@ -546,12 +800,7 @@ def get_daily_data(
         if cached is not None:
             return cached
 
-    df = _fetch_daily_akshare(code, days=config.DAILY_BARS)
-    if df is None and _BS_AVAILABLE:
-        end = datetime.now().strftime("%Y-%m-%d")
-        start = (datetime.now() - timedelta(days=config.DAILY_BARS)).strftime("%Y-%m-%d")
-        bs_code = _ak_code_to_bs(code)
-        df = BaoStockProvider.query_daily(bs_code, start, end)
+    df = _fetch_daily_akshare(code, days=config.DAILY_BARS, config=config)
 
     if cache and df is not None:
         cache.set(cache_key, df)
@@ -568,11 +817,9 @@ def get_index_weekly(
         if cached is not None:
             return cached
 
-    df = _fetch_index_weekly_akshare(symbol=config.CSI300_AK_SYMBOL, weeks=config.WEEKLY_BARS)
-    if df is None and _BS_AVAILABLE:
-        end = datetime.now().strftime("%Y-%m-%d")
-        start = (datetime.now() - timedelta(weeks=config.WEEKLY_BARS)).strftime("%Y-%m-%d")
-        df = BaoStockProvider.query_index_weekly(config.CSI300_CODE, start, end)
+    df = _fetch_index_weekly_akshare(
+        symbol=config.CSI300_AK_SYMBOL, weeks=config.WEEKLY_BARS, config=config,
+    )
 
     if cache and df is not None:
         cache.set(cache_key, df)
@@ -580,7 +827,9 @@ def get_index_weekly(
 
 
 def get_fundamentals(
-    code: str, cache: Optional[CacheManager] = None,
+    code: str,
+    cache: Optional[CacheManager] = None,
+    config: Optional[StrategyConfig] = None,
 ) -> Optional[dict]:
     """获取基本面数据。"""
     cache_key = f"fund_{code}"
@@ -589,7 +838,7 @@ def get_fundamentals(
         if cached is not None:
             return cached
 
-    data = _fetch_fundamentals_akshare(code)
+    data = _fetch_fundamentals_akshare(code, config)
     if cache and data is not None:
         cache.set(cache_key, data)
     return data
@@ -605,7 +854,7 @@ def get_stock_list(
         if cached is not None:
             return cached
 
-    stocks = _fetch_stock_pool_akshare(config.STOCK_POOL)
+    stocks = _fetch_stock_pool_akshare(config)
     if cache and stocks:
         cache.set(cache_key, stocks)
     return stocks
@@ -1217,7 +1466,7 @@ def main(
             if weekly_df is None:
                 return None
             daily_df = get_daily_data(code, config, cache)
-            fund_data = get_fundamentals(code, cache)
+            fund_data = get_fundamentals(code, cache, config)
             if config.FETCH_DELAY > 0:
                 time.sleep(config.FETCH_DELAY)
             return evaluate(weekly_df, daily_df, code, name, config, market_env, fund_data)

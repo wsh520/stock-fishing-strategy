@@ -37,7 +37,7 @@ if _SRC_DIR not in sys.path:
 if _ROOT_DIR not in sys.path:
     sys.path.insert(0, _ROOT_DIR)
 
-from bottom_fishing_strategy import (
+from src.bottom_fishing_strategy import (
     StrategyConfig,
     CacheManager,
     compute_weekly_signals,
@@ -46,18 +46,10 @@ from bottom_fishing_strategy import (
     compute_market_environment,
     get_stock_list,
     _grade_from_score,
-    _fetch_weekly_akshare,
-    _fetch_daily_akshare,
-    _fetch_index_weekly_akshare,
-    _ak_code_to_symbol,
+    fetch_weekly_range,
+    fetch_daily_range,
+    fetch_index_weekly_range,
 )
-
-try:
-    import akshare as ak
-    _AK_AVAILABLE = True
-except ImportError:
-    ak = None
-    _AK_AVAILABLE = False
 
 
 # ===========================================================================
@@ -79,109 +71,6 @@ class BacktestConfig:
     max_workers: int = 4  # 并发获取数据线程数
     fetch_delay: float = 0.05  # API调用间隔（秒）
     incremental: bool = False  # 增量模式：自动从上次结束日期续跑
-
-
-# ===========================================================================
-# 数据获取（指定日期范围）
-# ===========================================================================
-
-
-def _fetch_weekly_range(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
-    """获取个股指定日期范围的周线数据（前复权）。
-
-    start/end 格式: YYYYMMDD
-    """
-    if not _AK_AVAILABLE:
-        return None
-    try:
-        symbol = _ak_code_to_symbol(code)
-        df = ak.stock_zh_a_hist(
-            symbol=symbol, period="weekly",
-            start_date=start, end_date=end, adjust="qfq",
-        )
-        if df is None or df.empty:
-            return None
-        rename = {
-            "日期": "date", "开盘": "open", "收盘": "close", "最高": "high",
-            "最低": "low", "成交量": "volume", "成交额": "amount",
-            "换手率": "turnover", "涨跌幅": "pct_chg",
-        }
-        df = df.rename(columns=rename)
-        df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
-        for col in ["open", "high", "low", "close", "volume", "amount", "turnover", "pct_chg"]:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-        df = df.dropna(subset=["close"])
-        return df.reset_index(drop=True) if not df.empty else None
-    except Exception:
-        return None
-
-
-def _fetch_daily_range(code: str, start: str, end: str) -> Optional[pd.DataFrame]:
-    """获取个股指定日期范围的日线数据（前复权）。
-
-    start/end 格式: YYYYMMDD
-    """
-    if not _AK_AVAILABLE:
-        return None
-    try:
-        symbol = _ak_code_to_symbol(code)
-        df = ak.stock_zh_a_hist(
-            symbol=symbol, period="daily",
-            start_date=start, end_date=end, adjust="qfq",
-        )
-        if df is None or df.empty:
-            return None
-        rename = {
-            "日期": "date", "开盘": "open", "收盘": "close", "最高": "high",
-            "最低": "low", "成交量": "volume", "成交额": "amount",
-            "换手率": "turnover", "涨跌幅": "pct_chg",
-        }
-        df = df.rename(columns=rename)
-        df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
-        for col in ["open", "high", "low", "close", "volume", "amount", "turnover", "pct_chg"]:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-        df = df.dropna(subset=["close"])
-        return df.reset_index(drop=True) if not df.empty else None
-    except Exception:
-        return None
-
-
-def _fetch_index_weekly_range(symbol: str, start: str, end: str) -> Optional[pd.DataFrame]:
-    """获取指数指定日期范围的周线数据。"""
-    if not _AK_AVAILABLE:
-        return None
-    try:
-        df = ak.stock_zh_index_daily(symbol=symbol)
-        if df is None or df.empty:
-            return None
-        rename = {
-            "date": "date", "open": "open", "close": "close",
-            "high": "high", "low": "low", "volume": "volume",
-        }
-        df = df.rename(columns={k: v for k, v in rename.items() if k in df.columns})
-        df["date"] = pd.to_datetime(df["date"])
-        start_dt = pd.to_datetime(start)
-        end_dt = pd.to_datetime(end)
-        df = df[(df["date"] >= start_dt) & (df["date"] <= end_dt)].copy()
-        df["date"] = df["date"].dt.strftime("%Y-%m-%d")
-        for col in ["open", "high", "low", "close", "volume"]:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-        # 日线 → 周线聚合
-        df["date_dt"] = pd.to_datetime(df["date"])
-        df = df.set_index("date_dt")
-        weekly = df.resample("W").agg({
-            "open": "first", "high": "max", "low": "min",
-            "close": "last", "volume": "sum",
-        }).dropna(subset=["close"])
-        weekly = weekly.reset_index()
-        weekly["date"] = weekly["date_dt"].dt.strftime("%Y-%m-%d")
-        weekly = weekly.drop(columns=["date_dt"])
-        return weekly if not weekly.empty else None
-    except Exception:
-        return None
 
 
 # ===========================================================================
@@ -310,12 +199,12 @@ def _process_stock(
     time.sleep(bt_config.fetch_delay)
 
     # 获取完整日期范围的周线数据（含 lookback）
-    weekly_df = _fetch_weekly_range(code, data_start, data_end)
+    weekly_df = fetch_weekly_range(code, data_start, data_end, strategy_config)
     if weekly_df is None or len(weekly_df) < strategy_config.MIN_WEEKS:
         return trades
 
     # 获取完整日期范围的日线数据
-    daily_df = _fetch_daily_range(code, data_start, data_end)
+    daily_df = fetch_daily_range(code, data_start, data_end, strategy_config)
     if daily_df is None or len(daily_df) < strategy_config.MIN_DAYS:
         return trades
 
@@ -442,8 +331,8 @@ def _compute_rolling_market_envs(
 
     返回 {week_key: {"regime": ..., ...}} 的字典，week_key = "YYYY-WW"。
     """
-    index_df = _fetch_index_weekly_range(
-        strategy_config.CSI300_AK_SYMBOL, data_start, data_end,
+    index_df = fetch_index_weekly_range(
+        strategy_config.CSI300_AK_SYMBOL, data_start, data_end, strategy_config,
     )
     if index_df is None or index_df.empty:
         print("[WARN] 无法获取 CSI300 指数数据，市场环境默认 unknown")

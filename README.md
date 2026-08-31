@@ -186,9 +186,14 @@ python src/backtest.py --max-hold-weeks 6 --workers 8
 
 ## 数据源
 
-- **主数据源**：AkShare（东方财富）
-- **备用数据源**：BaoStock（证券宝）
-- 当主数据源请求失败时自动降级到备用源
+- **数据源**：AkShare（东方财富），单一通道，硬依赖
+- **取数接口**：`stock_zh_a_hist`（个股周线/日线，前复权）、`stock_zh_index_daily`（指数）、`stock_info_a_code_name`（股票列表）、`stock_financial_analysis_indicator` / `stock_balance_sheet_by_report_em` / `stock_profit_sheet_by_report_em`（基本面）
+- **失败重试**：请求异常按退避重试（个股 `MAX_RETRY`，股票列表 `LIST_MAX_RETRY`）；「返回空」视为该标的确实无数据，不重试
+- **两级缓存**：内存 `CacheManager`（进程内，`CACHE_EXPIRE_HOURS`）→ `cache/` 目录磁盘 CSV/JSON
+  - 行情类按交易日失效：新交易日自动重拉，同日重复运行走缓存
+  - 股票列表按 `CACHE_TTL_DAYS` 失效，基本面按 `FUND_CACHE_TTL_DAYS` 失效
+  - 磁盘只缓存未过滤的原始列表，过滤在返回时应用，改 config 即时生效无需清缓存
+- **股票池过滤**：由 `StrategyConfig` 开关驱动（`FILTER_ST` / `EXCLUDE_DELISTING` / `EXCLUDE_BSE` / `EXCLUDE_CHINEXT` / `EXCLUDE_STAR`）
 
 ## 免责声明
 

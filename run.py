@@ -27,7 +27,7 @@ from db import get_mysql_store
 def run():
     """主执行流程"""
     # 延迟导入策略模块（确保路径已设置）
-    from bottom_fishing_strategy import (
+    from src.bottom_fishing_strategy import (
         StrategyConfig,
         CacheManager,
         get_market_environment,
@@ -36,12 +36,6 @@ def run():
         weekly_performance_review,
         update_signal_status,
     )
-
-    # 尝试导入 BaoStock 清理函数
-    try:
-        from bottom_fishing_strategy import BaoStockProvider, _BS_AVAILABLE
-    except ImportError:
-        _BS_AVAILABLE = False
 
     config = StrategyConfig()
     cache = CacheManager(expire_hours=config.CACHE_EXPIRE_HOURS)
@@ -113,14 +107,6 @@ def run():
         # 发送错误通知
         notify_screening_result(None, market_env=market_env_desc, error_msg=str(e))
         sys.exit(1)
-
-    finally:
-        # 清理 BaoStock 连接
-        try:
-            if _BS_AVAILABLE:
-                BaoStockProvider.logout()
-        except Exception:
-            pass
 
 
 if __name__ == "__main__":

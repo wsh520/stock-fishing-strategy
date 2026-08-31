@@ -105,7 +105,7 @@ def notify_screening_result(
 
     # 尝试导入 describe 函数
     try:
-        from bottom_fishing_strategy import describe
+        from src.bottom_fishing_strategy import describe
     except ImportError:
         describe = None
 
