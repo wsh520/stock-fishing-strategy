@@ -62,9 +62,9 @@ def run():
         except Exception:
             market_env_desc = "获取失败"
 
-        # Step 2: 运行选股策略
+        # Step 2: 运行选股策略（传入 config/cache 复用市场环境缓存）
         print("[INFO] 开始执行选股策略...")
-        output_df = main()
+        output_df = main(config=config, cache=cache)
 
         # Step 3: 保存推荐信号
         if output_df is not None and not output_df.empty:

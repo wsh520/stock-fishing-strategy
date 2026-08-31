@@ -1,18 +1,27 @@
 # A股量化选股策略 - 自动化执行系统
 
-基于「周线左侧寻底 + 日线右侧确认」的量化选股策略，通过 GitHub Actions 每日自动执行，结果通过飞书机器人推送通知。
+基于「周线左侧寻底 + 日线右侧确认」的量化选股策略，通过 GitHub Actions 每日自动执行，结果通过飞书机器人推送通知。支持历史回测与增量回测。
 
 ## 策略简介
 
-- **市场环境过滤**：沪深300周线MA20斜率判断牛/熊/中性环境
-- **周线左侧寻底**：ATR归一化跌幅 + 量能模式识别 + CCI超卖确认
-- **基本面防雷**：ROE/负债率/商誉/扣非利润等否决项
-- **日线右侧确认**：MA5拐头 + EMA金叉 + RSI超卖反弹 + 量价配合
-- **风险收益比过滤**：动态止损 + 止盈目标 + 最低1.5倍风险收益比
+5层量化过滤体系：
+
+1. **市场环境过滤**：沪深300周线MA20斜率判断牛/熊/中性环境，熊市收紧等级阈值
+2. **周线左侧寻底**：ATR归一化跌幅 + 量能模式识别 + CCI超卖确认 + MACD底背离 + 不破前低
+3. **基本面防雷**：ROE/负债率/商誉/扣非利润等否决项
+4. **日线右侧确认**：MA5拐头 + EMA金叉 + RSI超卖反弹 + 量价配合（至少一个信号触发）
+5. **风险收益比过滤**：动态止损(ATR) + 止盈目标(MA20) + 最低1.5倍风险收益比
+
+评分体系：周线最高70分 + 日线最高30分 = 100分，按分数分为 A/B/C/D 四个等级（D级淘汰）。
 
 ## 自动执行
 
-GitHub Actions 每个交易日（周一至周五）北京时间 **15:10** 自动执行选股策略，执行结果通过飞书机器人推送。
+| 工作流 | 触发时间 | 说明 |
+|--------|----------|------|
+| **Daily Stock Screening** | 交易日 15:10 (北京) | 每日选股 + 追踪 + 绩效报告 |
+| **Weekly Backtest** | 每周六 16:00 (北京) | 增量回测（首次自动全量） |
+
+两个工作流均支持手动触发 (`workflow_dispatch`)。
 
 ## 快速部署
 
@@ -31,14 +40,18 @@ GitHub Actions 每个交易日（周一至周五）北京时间 **15:10** 自动
 
 ### 3. 配置 GitHub Secrets
 
-1. 进入你 Fork 的仓库页面
-2. 点击 **Settings** → 左侧 **Secrets and variables** → **Actions**
-3. 点击 **New repository secret**
-4. 添加以下 Secret：
+进入 Fork 仓库 → **Settings** → **Secrets and variables** → **Actions** → **New repository secret**：
 
-| Name | Value |
-|------|-------|
-| `FEISHU_WEBHOOK_URL` | 你在第2步获取的飞书 Webhook 地址 |
+| Name | Value | 必填 |
+|------|-------|------|
+| `FEISHU_WEBHOOK_URL` | 飞书 Webhook 地址 | 推荐（不配则跳过通知） |
+| `MYSQL_HOST` | MySQL 主机地址 | 可选 |
+| `MYSQL_PORT` | MySQL 端口 (默认 3306) | 可选 |
+| `MYSQL_USER` | MySQL 用户名 | 可选 |
+| `MYSQL_PASSWORD` | MySQL 密码 | 可选 |
+| `MYSQL_DATABASE` | MySQL 数据库名 (默认 stock_strategy) | 可选 |
+
+> MySQL 为可选配置。未配置时系统仅使用 CSV 存储，不影响选股和回测主流程。配置后可自动建表，支持绩效统计和增量回测续跑。
 
 ### 4. 启用 GitHub Actions
 
@@ -49,24 +62,34 @@ GitHub Actions 每个交易日（周一至周五）北京时间 **15:10** 自动
 ### 5. 手动测试
 
 1. 进入 **Actions** 页面
-2. 左侧选择 **Daily Stock Screening**
-3. 点击 **Run workflow** → **Run workflow**
-4. 等待执行完成，检查飞书是否收到通知
+2. 左侧选择 **Daily Stock Screening** → **Run workflow**
+3. 等待执行完成，检查飞书是否收到通知
+
+首次运行回测：
+
+1. 左侧选择 **Weekly Backtest** → **Run workflow**
+2. 模式选择 `incremental`（首次无历史记录时自动执行全量回测 20260101 至今）
+3. 后续每周六自动增量续跑
 
 ## 项目结构
 
 ```
 ├── .github/workflows/
-│   └── daily_screen.yml        # GitHub Actions 定时工作流
+│   ├── daily_screen.yml          # 每日选股工作流
+│   └── weekly_backtest.yml       # 每周回测工作流
 ├── src/
-│   └── bottom_fishing_strategy.py  # 核心策略脚本
+│   ├── bottom_fishing_strategy.py  # 核心策略（5层过滤 + 评分）
+│   └── backtest.py               # 回测引擎（全量/增量）
 ├── notify/
-│   └── feishu.py               # 飞书通知模块
-├── data/
-│   ├── signal_history.csv      # 推荐信号历史（自动生成）
-│   └── tracking_report.csv     # 追踪报告（自动生成）
-├── run.py                      # 入口脚本
-├── requirements.txt            # Python 依赖
+│   └── feishu.py                 # 飞书通知模块
+├── data/                         # 自动生成的数据文件
+│   ├── signal_history.csv        # 推荐信号历史
+│   ├── tracking_report.csv       # 追踪报告
+│   ├── backtest_trades_*.csv     # 回测交易明细
+│   └── backtest_summary_*.csv    # 回测统计汇总
+├── db.py                         # MySQL 存储模块（可选）
+├── run.py                        # 每日选股入口
+├── requirements.txt              # Python 依赖
 └── README.md
 ```
 
@@ -79,11 +102,11 @@ pip install -r requirements.txt
 # 设置飞书 Webhook（可选，不设置则跳过通知）
 export FEISHU_WEBHOOK_URL="https://open.feishu.cn/open-apis/bot/v2/hook/your-webhook-id"
 
-# 运行
+# 运行每日选股
 python run.py
 ```
 
-也可以直接运行策略脚本（不发送通知）：
+直接运行策略脚本（不发送通知）：
 
 ```bash
 # 仅选股
@@ -96,13 +119,58 @@ python src/bottom_fishing_strategy.py track
 python src/bottom_fishing_strategy.py full
 ```
 
+## 回测
+
+对历史数据批量执行选股策略，模拟每个信号的入场/退出，计算收益率统计。
+
+```bash
+# 全量回测：20260101 至今
+python src/backtest.py
+
+# 指定日期范围
+python src/backtest.py --start 20260101 --end 20260831
+
+# 增量回测：自动从上次结束日期续跑（首次等同全量）
+python src/backtest.py --incremental
+
+# 调整参数
+python src/backtest.py --max-hold-weeks 6 --workers 8
+```
+
+回测输出：
+- 交易明细（入场/出场日期价格、收益率、退出原因）
+- 统计报告（胜率、盈亏比、平均收益、等级分布、月度分布）
+- 结果保存至 CSV（`data/backtest_*`），配置 MySQL 时同时写入数据库
+
+退出机制：
+- **止损**：入场价 - ATR × 2
+- **止盈**：MA20（均值回归目标）
+- **到期**：最大持有4周未触发止损/止盈，按收盘价退出
+
+增量回测自动探测上次结束日期（优先级：MySQL → CSV → 默认起始日期）。
+
+## MySQL 存储
+
+配置 MySQL 环境变量后，系统自动创建以下表：
+
+| 表名 | 说明 |
+|------|------|
+| `recommendations` | 每日推荐信号记录 |
+| `tracking` | 追踪状态（幂等更新） |
+| `performance_snapshots` | 月度绩效快照 |
+| `backtest_trades` | 回测交易明细 |
+| `backtest_summary` | 回测统计汇总 |
+
+未配置 MySQL 时降级为纯 CSV 存储，不影响任何功能。
+
 ## 通知样例
 
 选股结果推送到飞书群后，消息卡片包含：
 - 市场环境判断
 - 推荐股票列表（代码/名称/评分/信号等级）
-- 交易级别（止损价/止盈价/风险收益比）
+- 交易计划（止损价/止盈价/风险收益比）
 - 周度追踪报告（胜率/平均收益/状态分布）
+- 月度绩效报告（需配置 MySQL）
 
 ## 技术指标
 

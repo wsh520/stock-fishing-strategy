@@ -1,0 +1,70 @@
+name: Weekly Backtest
+
+on:
+  schedule:
+    # UTC 08:00 = 北京时间 16:00（每周六执行，收盘后回测本周数据）
+    - cron: "0 8 * * 6"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "回测模式"
+        required: true
+        default: "incremental"
+        type: choice
+        options:
+          - incremental
+          - full
+      start_date:
+        description: "全量模式起始日期 YYYYMMDD（仅 full 模式生效）"
+        required: false
+        default: "20260101"
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run backtest
+        env:
+          MYSQL_HOST: ${{ secrets.MYSQL_HOST }}
+          MYSQL_PORT: ${{ secrets.MYSQL_PORT }}
+          MYSQL_USER: ${{ secrets.MYSQL_USER }}
+          MYSQL_PASSWORD: ${{ secrets.MYSQL_PASSWORD }}
+          MYSQL_DATABASE: ${{ secrets.MYSQL_DATABASE }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            MODE="${{ github.event.inputs.mode }}"
+            START="${{ github.event.inputs.start_date }}"
+          else
+            MODE="incremental"
+            START="20260101"
+          fi
+
+          if [ "$MODE" = "incremental" ]; then
+            echo "Running incremental backtest..."
+            python src/backtest.py --incremental
+          else
+            echo "Running full backtest from $START..."
+            python src/backtest.py --start "$START"
+          fi
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backtest-data-${{ github.run_number }}
+          path: data/backtest_*
+          retention-days: 90
