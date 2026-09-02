@@ -6,6 +6,13 @@ MySQL 存储模块
 
 环境变量:
     MYSQL_HOST, MYSQL_PORT, MYSQL_USER, MYSQL_PASSWORD, MYSQL_DATABASE
+
+K线数据表:
+    kline_daily   — 个股日线 OHLCV（增量同步，UPSERT）
+    kline_weekly  — 个股周线 OHLCV（由日线聚合或独立同步）
+    index_daily   — 指数日线（沪深300等）
+    stock_info    — 股票列表快照
+    sync_log      — 同步任务日志（记录每次同步的进度）
 """
 
 from __future__ import annotations
@@ -193,6 +200,79 @@ class MySQLStore:
                         params_json TEXT,
                         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                         INDEX idx_bt_id (backtest_id)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """)
+                # ---- K线数据表（增量同步） ----
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS kline_daily (
+                        code VARCHAR(10) NOT NULL,
+                        date DATE NOT NULL,
+                        open DECIMAL(10,3),
+                        close DECIMAL(10,3),
+                        high DECIMAL(10,3),
+                        low DECIMAL(10,3),
+                        volume BIGINT,
+                        amount DECIMAL(18,2),
+                        amplitude DECIMAL(8,4),
+                        pct_chg DECIMAL(8,4),
+                        change_amt DECIMAL(10,3),
+                        turnover DECIMAL(8,4),
+                        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                        PRIMARY KEY (code, date),
+                        INDEX idx_date (date)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS kline_weekly (
+                        code VARCHAR(10) NOT NULL,
+                        date DATE NOT NULL,
+                        open DECIMAL(10,3),
+                        close DECIMAL(10,3),
+                        high DECIMAL(10,3),
+                        low DECIMAL(10,3),
+                        volume BIGINT,
+                        amount DECIMAL(18,2),
+                        amplitude DECIMAL(8,4),
+                        pct_chg DECIMAL(8,4),
+                        change_amt DECIMAL(10,3),
+                        turnover DECIMAL(8,4),
+                        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                        PRIMARY KEY (code, date),
+                        INDEX idx_date (date)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS index_daily (
+                        symbol VARCHAR(20) NOT NULL,
+                        date DATE NOT NULL,
+                        open DECIMAL(12,3),
+                        close DECIMAL(12,3),
+                        high DECIMAL(12,3),
+                        low DECIMAL(12,3),
+                        volume BIGINT,
+                        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                        PRIMARY KEY (symbol, date),
+                        INDEX idx_date (date)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS stock_info (
+                        code VARCHAR(10) NOT NULL PRIMARY KEY,
+                        name VARCHAR(50),
+                        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS sync_log (
+                        id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                        sync_type VARCHAR(20) NOT NULL COMMENT 'daily/weekly/index/stock_list',
+                        sync_date DATE NOT NULL,
+                        rows_affected INT DEFAULT 0,
+                        status VARCHAR(20) DEFAULT 'running',
+                        started_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        finished_at DATETIME NULL,
+                        error_msg TEXT NULL,
+                        INDEX idx_type_date (sync_type, sync_date)
                     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
                 """)
         finally:
@@ -431,5 +511,344 @@ class MySQLStore:
         except Exception as e:
             print(f"[WARN] MySQL 查询回测记录失败: {e}")
             return None
+        finally:
+            conn.close()
+
+    # ===================================================================
+    # K线数据持久化（增量同步 + 查询）
+    # ===================================================================
+
+    def save_kline_daily(self, code: str, df: pd.DataFrame) -> int:
+        """批量 UPSERT 个股日线数据到 kline_daily 表。
+
+        使用 INSERT ... ON DUPLICATE KEY UPDATE 实现幂等写入。
+        返回受影响行数。
+        """
+        if df is None or df.empty:
+            return 0
+        conn = self._get_conn()
+        try:
+            with conn.cursor() as cur:
+                sql = """
+                    INSERT INTO kline_daily
+                    (code, date, open, close, high, low, volume, amount,
+                     amplitude, pct_chg, change_amt, turnover)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    ON DUPLICATE KEY UPDATE
+                        open=VALUES(open), close=VALUES(close),
+                        high=VALUES(high), low=VALUES(low),
+                        volume=VALUES(volume), amount=VALUES(amount),
+                        amplitude=VALUES(amplitude), pct_chg=VALUES(pct_chg),
+                        change_amt=VALUES(change_amt), turnover=VALUES(turnover)
+                """
+                rows = []
+                for _, r in df.iterrows():
+                    rows.append((
+                        code,
+                        r.get("date"),
+                        r.get("open"), r.get("close"),
+                        r.get("high"), r.get("low"),
+                        r.get("volume"), r.get("amount"),
+                        r.get("amplitude"), r.get("pct_chg"),
+                        r.get("change"), r.get("turnover"),
+                    ))
+                cur.executemany(sql, rows)
+                return cur.rowcount
+        except Exception as e:
+            print(f"[WARN] MySQL 保存日线失败 ({code}): {e}")
+            return 0
+        finally:
+            conn.close()
+
+    def save_kline_weekly(self, code: str, df: pd.DataFrame) -> int:
+        """批量 UPSERT 个股周线数据到 kline_weekly 表。"""
+        if df is None or df.empty:
+            return 0
+        conn = self._get_conn()
+        try:
+            with conn.cursor() as cur:
+                sql = """
+                    INSERT INTO kline_weekly
+                    (code, date, open, close, high, low, volume, amount,
+                     amplitude, pct_chg, change_amt, turnover)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    ON DUPLICATE KEY UPDATE
+                        open=VALUES(open), close=VALUES(close),
+                        high=VALUES(high), low=VALUES(low),
+                        volume=VALUES(volume), amount=VALUES(amount),
+                        amplitude=VALUES(amplitude), pct_chg=VALUES(pct_chg),
+                        change_amt=VALUES(change_amt), turnover=VALUES(turnover)
+                """
+                rows = []
+                for _, r in df.iterrows():
+                    rows.append((
+                        code,
+                        r.get("date"),
+                        r.get("open"), r.get("close"),
+                        r.get("high"), r.get("low"),
+                        r.get("volume"), r.get("amount"),
+                        r.get("amplitude"), r.get("pct_chg"),
+                        r.get("change"), r.get("turnover"),
+                    ))
+                cur.executemany(sql, rows)
+                return cur.rowcount
+        except Exception as e:
+            print(f"[WARN] MySQL 保存周线失败 ({code}): {e}")
+            return 0
+        finally:
+            conn.close()
+
+    def save_index_daily(self, symbol: str, df: pd.DataFrame) -> int:
+        """批量 UPSERT 指数日线数据。"""
+        if df is None or df.empty:
+            return 0
+        conn = self._get_conn()
+        try:
+            with conn.cursor() as cur:
+                sql = """
+                    INSERT INTO index_daily
+                    (symbol, date, open, close, high, low, volume)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s)
+                    ON DUPLICATE KEY UPDATE
+                        open=VALUES(open), close=VALUES(close),
+                        high=VALUES(high), low=VALUES(low),
+                        volume=VALUES(volume)
+                """
+                rows = []
+                for _, r in df.iterrows():
+                    rows.append((
+                        symbol,
+                        r.get("date"),
+                        r.get("open"), r.get("close"),
+                        r.get("high"), r.get("low"),
+                        r.get("volume"),
+                    ))
+                cur.executemany(sql, rows)
+                return cur.rowcount
+        except Exception as e:
+            print(f"[WARN] MySQL 保存指数日线失败 ({symbol}): {e}")
+            return 0
+        finally:
+            conn.close()
+
+    def save_stock_info(self, df: pd.DataFrame) -> int:
+        """全量替换股票列表（先清空再插入）。"""
+        if df is None or df.empty:
+            return 0
+        conn = self._get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("TRUNCATE TABLE stock_info")
+                sql = """
+                    INSERT INTO stock_info (code, name)
+                    VALUES (%s, %s)
+                    ON DUPLICATE KEY UPDATE name=VALUES(name)
+                """
+                rows = [(r["code"], r["name"]) for _, r in df.iterrows()]
+                cur.executemany(sql, rows)
+                return len(rows)
+        except Exception as e:
+            print(f"[WARN] MySQL 保存股票列表失败: {e}")
+            return 0
+        finally:
+            conn.close()
+
+    def get_kline_daily(
+        self, code: str, start: str = "", end: str = "",
+    ) -> Optional[pd.DataFrame]:
+        """从 DB 读取个股日线数据。start/end 格式 YYYY-MM-DD 或 YYYYMMDD。
+
+        返回与 _normalize_hist() 输出格式一致的 DataFrame。
+        """
+        conn = self._get_conn()
+        try:
+            conditions = ["code = %s"]
+            params: list = [code]
+            if start:
+                s = start.replace("-", "")
+                s = f"{s[:4]}-{s[4:6]}-{s[6:]}" if len(s) == 8 else start
+                conditions.append("date >= %s")
+                params.append(s)
+            if end:
+                e = end.replace("-", "")
+                e = f"{e[:4]}-{e[4:6]}-{e[6:]}" if len(e) == 8 else end
+                conditions.append("date <= %s")
+                params.append(e)
+
+            where = " AND ".join(conditions)
+            sql = f"""
+                SELECT date, open, close, high, low, volume, amount,
+                       amplitude, pct_chg, change_amt AS change, turnover
+                FROM kline_daily
+                WHERE {where}
+                ORDER BY date
+            """
+            df = pd.read_sql(sql, conn, params=params)
+            if df.empty:
+                return None
+            df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
+            return df
+        except Exception as e:
+            print(f"[WARN] MySQL 读取日线失败 ({code}): {e}")
+            return None
+        finally:
+            conn.close()
+
+    def get_kline_weekly(
+        self, code: str, start: str = "", end: str = "",
+    ) -> Optional[pd.DataFrame]:
+        """从 DB 读取个股周线数据。"""
+        conn = self._get_conn()
+        try:
+            conditions = ["code = %s"]
+            params: list = [code]
+            if start:
+                s = start.replace("-", "")
+                s = f"{s[:4]}-{s[4:6]}-{s[6:]}" if len(s) == 8 else start
+                conditions.append("date >= %s")
+                params.append(s)
+            if end:
+                e = end.replace("-", "")
+                e = f"{e[:4]}-{e[4:6]}-{e[6:]}" if len(e) == 8 else end
+                conditions.append("date <= %s")
+                params.append(e)
+
+            where = " AND ".join(conditions)
+            sql = f"""
+                SELECT date, open, close, high, low, volume, amount,
+                       amplitude, pct_chg, change_amt AS change, turnover
+                FROM kline_weekly
+                WHERE {where}
+                ORDER BY date
+            """
+            df = pd.read_sql(sql, conn, params=params)
+            if df.empty:
+                return None
+            df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
+            return df
+        except Exception as e:
+            print(f"[WARN] MySQL 读取周线失败 ({code}): {e}")
+            return None
+        finally:
+            conn.close()
+
+    def get_index_daily(
+        self, symbol: str, start: str = "", end: str = "",
+    ) -> Optional[pd.DataFrame]:
+        """从 DB 读取指数日线数据。"""
+        conn = self._get_conn()
+        try:
+            conditions = ["symbol = %s"]
+            params: list = [symbol]
+            if start:
+                s = start.replace("-", "")
+                s = f"{s[:4]}-{s[4:6]}-{s[6:]}" if len(s) == 8 else start
+                conditions.append("date >= %s")
+                params.append(s)
+            if end:
+                e = end.replace("-", "")
+                e = f"{e[:4]}-{e[4:6]}-{e[6:]}" if len(e) == 8 else end
+                conditions.append("date <= %s")
+                params.append(e)
+
+            where = " AND ".join(conditions)
+            sql = f"""
+                SELECT date, open, close, high, low, volume
+                FROM index_daily
+                WHERE {where}
+                ORDER BY date
+            """
+            df = pd.read_sql(sql, conn, params=params)
+            if df.empty:
+                return None
+            df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
+            return df
+        except Exception as e:
+            print(f"[WARN] MySQL 读取指数日线失败 ({symbol}): {e}")
+            return None
+        finally:
+            conn.close()
+
+    def get_stock_list_from_db(self) -> Optional[pd.DataFrame]:
+        """从 DB 读取股票列表。"""
+        conn = self._get_conn()
+        try:
+            df = pd.read_sql("SELECT code, name FROM stock_info ORDER BY code", conn)
+            if df.empty:
+                return None
+            df["code"] = df["code"].astype(str).str.zfill(6)
+            return df
+        except Exception as e:
+            print(f"[WARN] MySQL 读取股票列表失败: {e}")
+            return None
+        finally:
+            conn.close()
+
+    def get_latest_kline_date(self, table: str, code: str = "", symbol: str = "") -> Optional[str]:
+        """查询某只股票/指数在指定表中的最新日期。
+
+        返回 'YYYYMMDD' 格式，无数据时返回 None。
+        """
+        conn = self._get_conn()
+        try:
+            with conn.cursor() as cur:
+                if table == "index_daily":
+                    cur.execute(
+                        "SELECT MAX(date) FROM index_daily WHERE symbol = %s",
+                        (symbol,),
+                    )
+                elif table == "kline_weekly":
+                    cur.execute(
+                        "SELECT MAX(date) FROM kline_weekly WHERE code = %s",
+                        (code,),
+                    )
+                else:
+                    cur.execute(
+                        "SELECT MAX(date) FROM kline_daily WHERE code = %s",
+                        (code,),
+                    )
+                row = cur.fetchone()
+                if row and row[0]:
+                    return pd.to_datetime(row[0]).strftime("%Y%m%d")
+            return None
+        except Exception as e:
+            print(f"[WARN] MySQL 查询最新日期失败: {e}")
+            return None
+        finally:
+            conn.close()
+
+    def log_sync_start(self, sync_type: str, sync_date: str) -> int:
+        """记录同步任务开始，返回 log id。"""
+        conn = self._get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO sync_log (sync_type, sync_date, status) VALUES (%s, %s, 'running')",
+                    (sync_type, sync_date),
+                )
+                return cur.lastrowid
+        except Exception as e:
+            print(f"[WARN] MySQL 记录同步开始失败: {e}")
+            return 0
+        finally:
+            conn.close()
+
+    def log_sync_finish(
+        self, log_id: int, rows_affected: int = 0,
+        status: str = "success", error_msg: str = "",
+    ) -> None:
+        """更新同步任务完成状态。"""
+        if not log_id:
+            return
+        conn = self._get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE sync_log SET rows_affected=%s, status=%s,
+                       finished_at=NOW(), error_msg=%s WHERE id=%s""",
+                    (rows_affected, status, error_msg or None, log_id),
+                )
+        except Exception as e:
+            print(f"[WARN] MySQL 更新同步日志失败: {e}")
         finally:
             conn.close()

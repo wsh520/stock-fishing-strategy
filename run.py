@@ -2,11 +2,12 @@
 选股策略 GitHub Actions 入口脚本
 
 功能：
-1. 执行选股策略
-2. 保存推荐信号（CSV + MySQL）
-3. 执行周度追踪
-4. 计算近一个月绩效统计（胜率/涨跌幅）
-5. 通过飞书 Webhook 发送结果通知
+1. 增量同步当日 K 线数据到 DB（MySQL 可用时）
+2. 执行选股策略（优先从 DB 读取数据）
+3. 保存推荐信号（CSV + MySQL）
+4. 执行周度追踪
+5. 计算近一个月绩效统计（胜率/涨跌幅）
+6. 通过飞书 Webhook 发送结果通知
 """
 
 import sys
@@ -49,6 +50,24 @@ def run():
         print("[INFO] MySQL 未配置或不可用，仅使用 CSV 存储")
 
     try:
+        # Step 0: 增量同步当日数据到 DB（MySQL 可用时自动执行）
+        if db:
+            try:
+                from src.sync_data import run_sync
+                print("[INFO] 开始增量同步当日数据...")
+                sync_result = run_sync(full=False, max_workers=config.MAX_WORKERS)
+                if "error" not in sync_result:
+                    print(
+                        f"[INFO] 数据同步完成: "
+                        f"日线 {sync_result.get('daily_rows', 0)} 行, "
+                        f"周线 {sync_result.get('weekly_rows', 0)} 行, "
+                        f"耗时 {sync_result.get('elapsed_seconds', 0):.1f}s"
+                    )
+                else:
+                    print(f"[WARN] 数据同步异常: {sync_result.get('error')}")
+            except Exception as e:
+                print(f"[WARN] 数据同步失败（不影响选股）: {e}")
+
         # Step 1: 获取市场环境（用于通知）
         try:
             env_result = get_market_environment(config, cache)

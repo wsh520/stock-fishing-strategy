@@ -37,6 +37,26 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Sync data to DB
+        env:
+          MYSQL_HOST: ${{ secrets.MYSQL_HOST }}
+          MYSQL_PORT: ${{ secrets.MYSQL_PORT }}
+          MYSQL_USER: ${{ secrets.MYSQL_USER }}
+          MYSQL_PASSWORD: ${{ secrets.MYSQL_PASSWORD }}
+          MYSQL_DATABASE: ${{ secrets.MYSQL_DATABASE }}
+        run: |
+          if [ -n "$MYSQL_HOST" ]; then
+            if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.mode }}" = "full" ]; then
+              echo "Full mode: syncing all data from ${{ github.event.inputs.start_date }}..."
+              python src/sync_data.py --full --start "${{ github.event.inputs.start_date }}" --workers 4
+            else
+              echo "Incremental mode: syncing recent data..."
+              python src/sync_data.py --workers 4
+            fi
+          else
+            echo "MySQL not configured, skipping data sync"
+          fi
+
       - name: Run backtest
         env:
           MYSQL_HOST: ${{ secrets.MYSQL_HOST }}

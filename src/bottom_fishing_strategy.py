@@ -90,7 +90,7 @@ class StrategyConfig:
 
     # --- Layer 2: 周线寻底 ---
     WEEKLY_ATR_PERIOD: int = 14
-    WEEKLY_ATR_DECLINE_THRESHOLD: float = 1.5
+    WEEKLY_ATR_DECLINE_THRESHOLD: float = 1.3  # 放宽门槛，让更多潜在底部信号进入评分池
     WEEKLY_CCI_PERIOD: int = 14
     WEEKLY_CCI_OVERSOLD: float = -100.0
     WEEKLY_MACD_FAST: int = 12
@@ -124,14 +124,14 @@ class StrategyConfig:
     DAILY_RSI_OVERSOLD: float = 30.0
     DAILY_RSI_REBOUND_MIN: float = 35.0
     DAILY_RSI_OVERBOUGHT: float = 70.0
-    DAILY_VOL_EXPAND: float = 1.2
+    DAILY_VOL_EXPAND: float = 1.3  # 提高量价配合标准，过滤无量假反弹
     DAILY_TURNOVER_LOOKBACK: int = 20
 
     # --- Layer 5: 风控 ---
     ATR_STOP_MULTIPLIER: float = 2.0
     TAKE_PROFIT_TARGET: str = "ma20"
     FIXED_TP_PCT: float = 15.0
-    MIN_RR_RATIO: float = 1.5
+    MIN_RR_RATIO: float = 1.8  # 动态止盈后RR更真实，适当提高门槛过滤低质量信号
 
     # --- 过滤（借鉴策略1） ---
     MIN_AMOUNT: float = 5_000_000.0
@@ -145,8 +145,8 @@ class StrategyConfig:
     W_MACD_DIVERGENCE: float = 10.0
     W_PRIOR_LOW_HOLD: float = 10.0
     W_PANIC_BONUS: float = 5.0
-    W_DAILY_MA_TURN: float = 8.0
-    W_DAILY_EMA_CROSS: float = 8.0
+    W_DAILY_MA_TURN: float = 10.0   # 提升早期反转信号权重（优先于EMA金叉）
+    W_DAILY_EMA_CROSS: float = 6.0   # 降低滞后指标权重，避免与MA5拐头重复计分
     W_DAILY_RSI_REBOUND: float = 7.0
     W_DAILY_VOL_PRICE: float = 7.0
 
@@ -445,14 +445,30 @@ def _fetch_hist(
 def fetch_weekly_range(
     code: str, start: str, end: str, config: Optional[StrategyConfig] = None,
 ) -> Optional[pd.DataFrame]:
-    """获取个股指定区间的周线数据。start/end 格式 YYYYMMDD。"""
+    """获取个股指定区间的周线数据。start/end 格式 YYYYMMDD。
+
+    优先级: DB → AkShare API + 磁盘缓存。
+    """
+    db = _get_db()
+    if db is not None:
+        df = db.get_kline_weekly(code, start=start, end=end)
+        if df is not None and not df.empty:
+            return df
     return _fetch_hist(code, "weekly", start, end, config or StrategyConfig())
 
 
 def fetch_daily_range(
     code: str, start: str, end: str, config: Optional[StrategyConfig] = None,
 ) -> Optional[pd.DataFrame]:
-    """获取个股指定区间的日线数据。start/end 格式 YYYYMMDD。"""
+    """获取个股指定区间的日线数据。start/end 格式 YYYYMMDD。
+
+    优先级: DB → AkShare API + 磁盘缓存。
+    """
+    db = _get_db()
+    if db is not None:
+        df = db.get_kline_daily(code, start=start, end=end)
+        if df is not None and not df.empty:
+            return df
     return _fetch_hist(code, "daily", start, end, config or StrategyConfig())
 
 
@@ -542,9 +558,22 @@ def _fetch_index_daily_raw(
 def fetch_index_weekly_range(
     symbol: str, start: str, end: str, config: Optional[StrategyConfig] = None,
 ) -> Optional[pd.DataFrame]:
-    """获取指数指定区间的周线数据（日线切片后按周聚合）。start/end 格式 YYYYMMDD。"""
+    """获取指数指定区间的周线数据（日线切片后按周聚合）。start/end 格式 YYYYMMDD。
+
+    优先级: DB 指数日线 → AkShare API + 磁盘缓存。
+    """
     config = config or StrategyConfig()
-    df = _fetch_index_daily_raw(symbol, config)
+
+    # 优先从 DB 读取指数日线
+    db = _get_db()
+    df = None
+    if db is not None:
+        df = db.get_index_daily(symbol, start=start, end=end)
+
+    # 降级到 AkShare API
+    if df is None:
+        df = _fetch_index_daily_raw(symbol, config)
+
     if df is None:
         return None
 
@@ -773,16 +802,49 @@ def _fetch_stock_pool_akshare(
 # ===========================================================================
 
 
+# ---------------------------------------------------------------------------
+# DB 访问器（懒加载，避免模块导入时强制连接 MySQL）
+# ---------------------------------------------------------------------------
+
+_db_store = None
+_db_checked = False
+
+
+def _get_db():
+    """懒加载 MySQL 存储实例。未配置或不可用时返回 None。"""
+    global _db_store, _db_checked
+    if not _db_checked:
+        _db_checked = True
+        try:
+            from db import get_mysql_store
+            _db_store = get_mysql_store()
+        except Exception:
+            _db_store = None
+    return _db_store
+
+
 def get_weekly_data(
     code: str, config: StrategyConfig, cache: Optional[CacheManager] = None,
 ) -> Optional[pd.DataFrame]:
-    """获取个股周线数据。"""
+    """获取个股周线数据。优先级: 内存缓存 → DB → AkShare API。"""
     cache_key = f"weekly_{code}"
     if cache:
         cached = cache.get(cache_key)
         if cached is not None:
             return cached
 
+    # 优先从 DB 读取
+    db = _get_db()
+    if db is not None:
+        end = datetime.now().strftime("%Y%m%d")
+        start = (datetime.now() - timedelta(weeks=config.WEEKLY_BARS)).strftime("%Y%m%d")
+        df = db.get_kline_weekly(code, start=start, end=end)
+        if df is not None and len(df) >= config.MIN_WEEKS:
+            if cache:
+                cache.set(cache_key, df)
+            return df
+
+    # 降级到 AkShare API
     df = _fetch_weekly_akshare(code, weeks=config.WEEKLY_BARS, config=config)
 
     if cache and df is not None:
@@ -793,13 +855,25 @@ def get_weekly_data(
 def get_daily_data(
     code: str, config: StrategyConfig, cache: Optional[CacheManager] = None,
 ) -> Optional[pd.DataFrame]:
-    """获取个股日线数据。"""
+    """获取个股日线数据。优先级: 内存缓存 → DB → AkShare API。"""
     cache_key = f"daily_{code}"
     if cache:
         cached = cache.get(cache_key)
         if cached is not None:
             return cached
 
+    # 优先从 DB 读取
+    db = _get_db()
+    if db is not None:
+        end = datetime.now().strftime("%Y%m%d")
+        start = (datetime.now() - timedelta(days=config.DAILY_BARS)).strftime("%Y%m%d")
+        df = db.get_kline_daily(code, start=start, end=end)
+        if df is not None and len(df) >= config.MIN_DAYS:
+            if cache:
+                cache.set(cache_key, df)
+            return df
+
+    # 降级到 AkShare API
     df = _fetch_daily_akshare(code, days=config.DAILY_BARS, config=config)
 
     if cache and df is not None:
@@ -810,13 +884,30 @@ def get_daily_data(
 def get_index_weekly(
     config: StrategyConfig, cache: Optional[CacheManager] = None,
 ) -> Optional[pd.DataFrame]:
-    """获取沪深300指数周线数据。"""
+    """获取沪深300指数周线数据。优先级: 内存缓存 → DB(日线聚合) → AkShare API。"""
     cache_key = "index_weekly_csi300"
     if cache:
         cached = cache.get(cache_key)
         if cached is not None:
             return cached
 
+    # 优先从 DB 读取指数日线 → 本地聚合为周线
+    db = _get_db()
+    if db is not None:
+        end = datetime.now().strftime("%Y%m%d")
+        start = (datetime.now() - timedelta(weeks=config.WEEKLY_BARS)).strftime("%Y%m%d")
+        daily_df = db.get_index_daily(config.CSI300_AK_SYMBOL, start=start, end=end)
+        if daily_df is not None and not daily_df.empty:
+            # 复用已有的日线→周线聚合逻辑
+            weekly_df = fetch_index_weekly_range(
+                config.CSI300_AK_SYMBOL, start, end, config,
+            )
+            if weekly_df is not None and not weekly_df.empty:
+                if cache:
+                    cache.set(cache_key, weekly_df)
+                return weekly_df
+
+    # 降级到 AkShare API
     df = _fetch_index_weekly_akshare(
         symbol=config.CSI300_AK_SYMBOL, weeks=config.WEEKLY_BARS, config=config,
     )
@@ -831,7 +922,7 @@ def get_fundamentals(
     cache: Optional[CacheManager] = None,
     config: Optional[StrategyConfig] = None,
 ) -> Optional[dict]:
-    """获取基本面数据。"""
+    """获取基本面数据。（基本面暂不入库，保持原有逻辑）"""
     cache_key = f"fund_{code}"
     if cache:
         cached = cache.get(cache_key)
@@ -847,13 +938,25 @@ def get_fundamentals(
 def get_stock_list(
     config: StrategyConfig, cache: Optional[CacheManager] = None,
 ) -> list[dict]:
-    """获取待筛选股票列表。"""
+    """获取待筛选股票列表。优先级: 内存缓存 → DB → AkShare API。"""
     cache_key = "stock_list"
     if cache:
         cached = cache.get(cache_key)
         if cached is not None:
             return cached
 
+    # 优先从 DB 读取
+    db = _get_db()
+    if db is not None:
+        stock_df = db.get_stock_list_from_db()
+        if stock_df is not None and not stock_df.empty:
+            stocks = _apply_universe_filters(stock_df, config).to_dict("records")
+            if stocks:
+                if cache:
+                    cache.set(cache_key, stocks)
+                return stocks
+
+    # 降级到 AkShare API
     stocks = _fetch_stock_pool_akshare(config)
     if cache and stocks:
         cache.set(cache_key, stocks)
@@ -1173,16 +1276,25 @@ def compute_daily_signals(
         turnover_expand = out["daily_turnover_ratio"] >= config.DAILY_VOL_EXPAND
     out["vol_price_coord"] = price_up & vol_expand & turnover_expand
 
-    # ------ 评分 ------
+    # ------ 评分（优化：MA5拐头与EMA金叉互斥评分，避免重复计分） ------
+    # MA5拐头是早期反转信号，给予满分权重
     ma5_turn_score = out["ma5_turn"].astype(float) * config.W_DAILY_MA_TURN
-    ema_cross_score = out["ema_golden_cross"].astype(float) * config.W_DAILY_EMA_CROSS
+    # EMA金叉：若MA5已拐头则视为"二次确认"给予较小奖励分，否则独立触发给满分
+    # 避免同一反转动作被两个高度相关指标重复叠加
+    _ema_confirm_bonus = 2.0  # 二次确认固定奖励分
+    ema_cross_score = np.where(
+        out["ma5_turn"],
+        out["ema_golden_cross"].astype(float) * _ema_confirm_bonus,
+        out["ema_golden_cross"].astype(float) * config.W_DAILY_EMA_CROSS,
+    )
     rsi_rebound_score = out["rsi_rebound"].astype(float) * config.W_DAILY_RSI_REBOUND
     # RSI超买惩罚
     rsi_penalty = (out["rsi14"] >= config.DAILY_RSI_OVERBOUGHT).astype(float) * (-3.0)
     vol_price_score = out["vol_price_coord"].astype(float) * config.W_DAILY_VOL_PRICE
 
-    out["daily_score"] = (
-        ma5_turn_score + ema_cross_score + rsi_rebound_score + rsi_penalty + vol_price_score
+    out["daily_score"] = pd.Series(
+        ma5_turn_score + ema_cross_score + rsi_rebound_score + rsi_penalty + vol_price_score,
+        index=out.index,
     ).fillna(0).clip(0, 30).round(1)
 
     out["daily_signal"] = (
@@ -1206,15 +1318,18 @@ def compute_risk_reward(
     """计算止损、止盈、风险收益比。
 
     止损 = 入场价 - ATR × 倍数
-    止盈 = MA20（均值回归目标）或固定百分比
+    止盈 = min(MA20, 固定百分比上限)，避免MA20过远时高估收益空间
     RR = 收益空间 / 风险空间
     """
     stop_loss = entry_price - atr * config.ATR_STOP_MULTIPLIER
+    fixed_tp = entry_price * (1 + config.FIXED_TP_PCT / 100)
 
     if config.TAKE_PROFIT_TARGET == "ma20" and ma20 > entry_price:
-        take_profit = ma20
+        # 取较小值：MA20是均值回归目标，固定百分比是合理收益上限
+        # 防止MA20距离过远导致RR虚高，也防止MA20过近时忽略实际压力位
+        take_profit = min(ma20, fixed_tp)
     else:
-        take_profit = entry_price * (1 + config.FIXED_TP_PCT / 100)
+        take_profit = fixed_tp
 
     risk = entry_price - stop_loss
     reward = take_profit - entry_price
