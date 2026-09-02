@@ -447,13 +447,23 @@ def fetch_weekly_range(
 ) -> Optional[pd.DataFrame]:
     """获取个股指定区间的周线数据。start/end 格式 YYYYMMDD。
 
-    优先级: DB → AkShare API + 磁盘缓存。
+    优先级: DB周线表 → DB日线聚合 → AkShare API + 磁盘缓存。
+    周线复用已同步的日线数据聚合生成，不额外调用 API。
     """
     db = _get_db()
     if db is not None:
+        # 1) 直接从周线表读取
         df = db.get_kline_weekly(code, start=start, end=end)
         if df is not None and not df.empty:
             return df
+        # 2) 周线表无数据 → 从日线聚合
+        try:
+            db.aggregate_daily_to_weekly(code)
+            df = db.get_kline_weekly(code, start=start, end=end)
+            if df is not None and not df.empty:
+                return df
+        except Exception:
+            pass
     return _fetch_hist(code, "weekly", start, end, config or StrategyConfig())
 
 
@@ -823,28 +833,58 @@ def _get_db():
     return _db_store
 
 
+def _aggregate_weekly_from_daily_db(code: str, config: StrategyConfig) -> Optional[pd.DataFrame]:
+    """从 DB 日线数据聚合生成周线（不额外调用 API）。
+
+    先触发 DB 内聚合写入 kline_weekly，再读取返回。
+    这样后续请求可直接命中 kline_weekly 表，无需重复聚合。
+    """
+    db = _get_db()
+    if db is None:
+        return None
+    try:
+        db.aggregate_daily_to_weekly(code)
+        end = datetime.now().strftime("%Y%m%d")
+        start = (datetime.now() - timedelta(weeks=config.WEEKLY_BARS)).strftime("%Y%m%d")
+        return db.get_kline_weekly(code, start=start, end=end)
+    except Exception:
+        return None
+
+
 def get_weekly_data(
     code: str, config: StrategyConfig, cache: Optional[CacheManager] = None,
 ) -> Optional[pd.DataFrame]:
-    """获取个股周线数据。优先级: 内存缓存 → DB → AkShare API。"""
+    """获取个股周线数据。
+
+    优先级: 内存缓存 → DB周线表 → DB日线聚合 → AkShare API。
+    周线不从 API 独立拉取，而是复用已同步的日线数据聚合生成。
+    """
     cache_key = f"weekly_{code}"
     if cache:
         cached = cache.get(cache_key)
         if cached is not None:
             return cached
 
-    # 优先从 DB 读取
     db = _get_db()
     if db is not None:
         end = datetime.now().strftime("%Y%m%d")
         start = (datetime.now() - timedelta(weeks=config.WEEKLY_BARS)).strftime("%Y%m%d")
+
+        # 1) 直接从 DB 周线表读取
         df = db.get_kline_weekly(code, start=start, end=end)
         if df is not None and len(df) >= config.MIN_WEEKS:
             if cache:
                 cache.set(cache_key, df)
             return df
 
-    # 降级到 AkShare API
+        # 2) 周线表数据不足 → 从 DB 日线聚合生成
+        df = _aggregate_weekly_from_daily_db(code, config)
+        if df is not None and len(df) >= config.MIN_WEEKS:
+            if cache:
+                cache.set(cache_key, df)
+            return df
+
+    # 3) 降级到 AkShare API（DB 不可用或无数据时）
     df = _fetch_weekly_akshare(code, weeks=config.WEEKLY_BARS, config=config)
 
     if cache and df is not None:
