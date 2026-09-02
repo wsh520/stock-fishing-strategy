@@ -24,7 +24,7 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Sync daily data to DB
+      - name: Sync data to DB
         env:
           MYSQL_HOST: ${{ secrets.MYSQL_HOST }}
           MYSQL_PORT: ${{ secrets.MYSQL_PORT }}
@@ -33,8 +33,14 @@ jobs:
           MYSQL_DATABASE: ${{ secrets.MYSQL_DATABASE }}
         run: |
           if [ -n "$MYSQL_HOST" ]; then
-            echo "MySQL configured, running incremental sync..."
-            python src/sync_data.py --workers 4
+            DAY_OF_WEEK=$(date +%u)
+            if [ "$DAY_OF_WEEK" = "6" ]; then
+              echo "Saturday: syncing daily + weekly data..."
+              python src/sync_data.py --period both --workers 4
+            else
+              echo "Weekday: syncing daily data only (weekly synced on Saturday)..."
+              python src/sync_data.py --period daily --workers 4
+            fi
           else
             echo "MySQL not configured, skipping data sync"
           fi

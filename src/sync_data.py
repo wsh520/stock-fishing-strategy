@@ -127,15 +127,43 @@ def _sync_one_stock_daily(
     return db.save_kline_daily(code, df)
 
 
-def _aggregate_one_stock_weekly(code: str, db) -> int:
-    """从 DB 中该股票的日线数据聚合生成周线。返回写入行数。
+def _sync_one_stock_weekly(
+    code: str, db, config: StrategyConfig, start_date: str, end_date: str,
+) -> int:
+    """增量同步单只股票的周线数据。返回写入行数。
 
-    周线不需要独立从 API 拉取：
-    - 日线已包含完整 OHLCV，按周聚合即可得到等价周线
-    - 避免每只股票额外一次 AkShare 请求（全市场节省 ~5000 次 API 调用）
-    - 周线仅在日线有更新时才需要重新聚合
+    周线从 AkShare API 独立拉取（不从日线聚合，避免日线缺失导致周线失真）。
+    通过查询 DB 中最新周线日期实现增量：只拉取上次之后的新数据。
+    设计为每周六执行一次，工作日跳过。
     """
-    return db.aggregate_daily_to_weekly(code)
+    symbol = _ak_code_to_symbol(code)
+
+    latest = db.get_latest_kline_date("kline_weekly", code=code)
+    if latest and latest >= end_date:
+        return 0  # 已是最新
+
+    fetch_start = latest if latest else start_date
+    if latest:
+        next_day = (datetime.strptime(latest, "%Y%m%d") + timedelta(days=1)).strftime("%Y%m%d")
+        fetch_start = next_day
+
+    if fetch_start > end_date:
+        return 0
+
+    raw = _fetch_with_retry(
+        lambda: ak.stock_zh_a_hist(
+            symbol=symbol, period="weekly",
+            start_date=fetch_start, end_date=end_date,
+            adjust=config.ADJUST,
+        ),
+        config.MAX_RETRY,
+        f"sync_weekly({symbol})",
+    )
+    df = _normalize_hist(raw)
+    if df is None or df.empty:
+        return 0
+
+    return db.save_kline_weekly(code, df)
 
 
 def sync_klines(
@@ -198,26 +226,20 @@ def sync_klines(
         result["daily_stocks"] = daily_stocks
         print(f"[SYNC] ✓ 日线完成: {daily_rows} 行, {daily_stocks} 只股票有更新")
 
-    # --- 周线聚合（从已同步的日线数据生成，不额外调用 API） ---
+    # --- 周线同步（从 AkShare API 增量拉取，每周六执行一次） ---
     if sync_period in ("weekly", "both"):
         log_id = db.log_sync_start("weekly", today)
-        print(f"[SYNC] 周线聚合: {total} 只股票 (从日线生成，无需API请求)")
+        print(f"[SYNC] 同步周线: {total} 只股票, {start_date} ~ {end_date}, workers={max_workers}")
         completed = 0
         weekly_rows = 0
         weekly_stocks = 0
         errors = 0
 
-        # 仅对日线有更新的股票执行聚合（减少无效 SQL）
-        # 如果日线阶段已有 daily_stocks 记录，只聚合那些股票
-        # 否则（单独 --period weekly 模式）聚合全部
-        if sync_period == "both" and result.get("daily_stocks", 0) > 0:
-            # 复用日线阶段的 futures 结果不太方便，这里直接全量聚合
-            # SQL 本身是幂等的，无更新的股票开销很小
-            pass
-
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             futures = {
-                pool.submit(_aggregate_one_stock_weekly, s["code"], db): s["code"]
+                pool.submit(
+                    _sync_one_stock_weekly, s["code"], db, config, start_date, end_date,
+                ): s["code"]
                 for s in stocks
             }
             for f in as_completed(futures):
@@ -241,7 +263,7 @@ def sync_klines(
         db.log_sync_finish(log_id, weekly_rows, status)
         result["weekly_rows"] = weekly_rows
         result["weekly_stocks"] = weekly_stocks
-        print(f"[SYNC] ✓ 周线聚合完成: {weekly_rows} 行, {weekly_stocks} 只股票有更新")
+        print(f"[SYNC] ✓ 周线完成: {weekly_rows} 行, {weekly_stocks} 只股票有更新")
 
     return result
 

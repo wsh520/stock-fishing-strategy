@@ -694,45 +694,6 @@ class MySQLStore:
         finally:
             conn.close()
 
-    def aggregate_daily_to_weekly(self, code: str) -> int:
-        """从 kline_daily 聚合生成该股票的周线数据并写入 kline_weekly。
-
-        使用 SQL GROUP BY YEARWEEK 直接在 DB 内完成聚合，避免读出再写回。
-        返回受影响行数。
-        """
-        conn = self._get_conn()
-        try:
-            with conn.cursor() as cur:
-                sql = """
-                    INSERT INTO kline_weekly
-                    (code, date, open, close, high, low, volume, amount, turnover)
-                    SELECT
-                        code,
-                        MAX(date) AS date,
-                        SUBSTRING_INDEX(GROUP_CONCAT(open ORDER BY date ASC), ',', 1) AS open,
-                        SUBSTRING_INDEX(GROUP_CONCAT(close ORDER BY date DESC), ',', 1) AS close,
-                        MAX(high) AS high,
-                        MIN(low) AS low,
-                        SUM(volume) AS volume,
-                        SUM(amount) AS amount,
-                        AVG(turnover) AS turnover
-                    FROM kline_daily
-                    WHERE code = %s
-                    GROUP BY YEARWEEK(date, 1)
-                    ON DUPLICATE KEY UPDATE
-                        open=VALUES(open), close=VALUES(close),
-                        high=VALUES(high), low=VALUES(low),
-                        volume=VALUES(volume), amount=VALUES(amount),
-                        turnover=VALUES(turnover)
-                """
-                cur.execute(sql, (code,))
-                return cur.rowcount
-        except Exception as e:
-            print(f"[WARN] MySQL 日线聚合周线失败 ({code}): {e}")
-            return 0
-        finally:
-            conn.close()
-
     def get_kline_weekly(
         self, code: str, start: str = "", end: str = "",
     ) -> Optional[pd.DataFrame]:
