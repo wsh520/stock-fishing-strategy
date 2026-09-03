@@ -108,9 +108,12 @@ class StrategyConfig:
     DAILY_TURNOVER_LOOKBACK: int = 20
 
     # --- Layer 4: 风控 ---
-    FIXED_STOP_LOSS_PCT: float = 5.0  # 固定百分比止损
+    FIXED_STOP_LOSS_PCT: float = 5.0  # 固定百分比止损（ATR 缺失时的兜底）
     FIXED_TAKE_PROFIT_PCT: float = 10.0  # 固定百分比止盈
     MIN_RR_RATIO: float = 1.5
+    ATR_PERIOD: int = 14             # 动态止损的 ATR 周期
+    ATR_STOP_MULT: float = 2.0       # 止损 = 入场价 - ATR_STOP_MULT × ATR14
+    USE_ATR_STOP: bool = True        # True: ATR 动态止损；False: 回退固定百分比止损
 
     # --- 过滤 ---
     MIN_AMOUNT: float = 5_000_000.0
@@ -121,6 +124,10 @@ class StrategyConfig:
     W_DAILY_EMA_CROSS: float = 25.0
     W_DAILY_RSI_REBOUND: float = 25.0
     W_DAILY_VOL_PRICE: float = 25.0
+    # 多指标共振额外加分（叠加在四项基础分之上）
+    DAILY_MULTI_RESONANCE_BONUS: float = 10.0
+    # RSI 超买（>= OVERBOUGHT）惩罚分，从 daily_score 中扣除
+    DAILY_RSI_OVERBOUGHT_PENALTY: float = 3.0
 
     # --- 等级阈值 ---
     GRADE_A: float = 80.0
@@ -132,6 +139,7 @@ class StrategyConfig:
     CACHE_EXPIRE_HOURS: float = 4.0
     MAX_WORKERS: int = 4
     DAILY_BARS: int = 120
+    WEEKLY_BARS: int = 60  # 周线接口回看周数（get_weekly_data/get_index_weekly 使用）
     FETCH_DELAY: float = 0.05
 
     # --- 数据获取（对齐 weekly/data.py） ---
@@ -896,7 +904,7 @@ def compute_market_environment(
 
 
 # ===========================================================================
-# Layer 3: 基本面防雷（纯函数）
+# Layer 2: 基本面防雷（纯函数）
 # ===========================================================================
 
 
@@ -941,11 +949,14 @@ def compute_daily_signals(
 ) -> Optional[pd.DataFrame]:
     """向量化计算日线技术指标信号与评分。
 
-    评分项（0-100分）:
+    评分项（clip 到 0-100 分）:
       - MA5拐头:          0-25分
       - EMA5/10金叉:      0-25分
       - RSI超卖反弹:      0-25分
       - 量价配合+换手率:  0-25分
+      - 多指标共振加分:   +10分（默认）
+      - RSI超买惩罚:      -3分（默认）
+    同时计算 ATR（供动态止损使用）。
     """
     if df is None or df.empty:
         return None
@@ -999,6 +1010,23 @@ def compute_daily_signals(
     out["macd_diff"] = exp1 - exp2
     out["macd_dea"] = out["macd_diff"].ewm(span=config.DAILY_MACD_SIGNAL, adjust=False).mean()
     out["macd_histogram"] = out["macd_diff"] - out["macd_dea"]  # MACD柱状图
+
+    # ATR（Wilder 平滑）— 动态止损用。需要 high/low，缺列时置 NaN。
+    if {"high", "low"}.issubset(out.columns):
+        prev_close = out["close"].shift(1)
+        tr = pd.concat(
+            [
+                out["high"] - out["low"],
+                (out["high"] - prev_close).abs(),
+                (out["low"] - prev_close).abs(),
+            ],
+            axis=1,
+        ).max(axis=1)
+        out["atr"] = tr.ewm(
+            com=config.ATR_PERIOD - 1, min_periods=config.ATR_PERIOD, adjust=False,
+        ).mean()
+    else:
+        out["atr"] = np.nan
 
     # 日线量比
     out["daily_vol_base"] = out["volume"].shift(1).rolling(20).mean()
@@ -1064,39 +1092,49 @@ def compute_daily_signals(
     rsi_rebound_score = out["rsi_rebound"].astype(float) * config.W_DAILY_RSI_REBOUND
     
     # 多指标共振加分
-    multi_resonance_bonus = out["multi_resonance"].astype(float) * 10.0  # 共振额外加分
+    multi_resonance_bonus = (
+        out["multi_resonance"].astype(float) * config.DAILY_MULTI_RESONANCE_BONUS
+    )
     
-    # RSI超买惩罚
-    rsi_penalty = (out["rsi14"] >= config.DAILY_RSI_OVERBOUGHT).astype(float) * (-3.0)
+    # RSI 超买惩罚（负分）
+    rsi_penalty = (
+        (out["rsi14"] >= config.DAILY_RSI_OVERBOUGHT).astype(float)
+        * (-config.DAILY_RSI_OVERBOUGHT_PENALTY)
+    )
     vol_price_score = out["vol_price_coord"].astype(float) * config.W_DAILY_VOL_PRICE
 
     out["daily_score"] = (
-        ma5_turn_score + ema_cross_score + rsi_rebound_score + vol_price_score + multi_resonance_bonus
+        ma5_turn_score
+        + ema_cross_score
+        + rsi_rebound_score
+        + vol_price_score
+        + multi_resonance_bonus
+        + rsi_penalty
     ).fillna(0).clip(0, 100).round(1)
-
-    out["daily_signal"] = (
-        out["ma5_turn"] | out["ema_golden_cross"] | out["rsi_rebound"] | out["multi_resonance"]
-    ).fillna(False)
 
     return out
 
 
 # ===========================================================================
-# Layer 5: 风险收益比（纯函数）
+# Layer 4: 风险收益比（纯函数）
 # ===========================================================================
 
 
 def compute_risk_reward(
     entry_price: float,
     config: StrategyConfig,
+    atr: Optional[float] = None,
 ) -> dict:
     """计算止损、止盈、风险收益比。
 
-    止损 = 入场价 * (1 - 固定百分比)
-    止盈 = 入场价 * (1 + 固定百分比)
-    RR = 收益空间 / 风险空间
+    止损：默认 ATR 动态（入场价 - ATR_STOP_MULT × ATR14），ATR 缺失时回退固定百分比。
+    止盈：固定百分比。
+    RR = 收益空间 / 风险空间，随个股波动率变化，真正起到过滤作用。
     """
-    stop_loss = entry_price * (1 - config.FIXED_STOP_LOSS_PCT / 100)
+    if config.USE_ATR_STOP and atr is not None and atr > 0:
+        stop_loss = entry_price - config.ATR_STOP_MULT * atr
+    else:
+        stop_loss = entry_price * (1 - config.FIXED_STOP_LOSS_PCT / 100)
     take_profit = entry_price * (1 + config.FIXED_TAKE_PROFIT_PCT / 100)
 
     risk = entry_price - stop_loss
@@ -1168,7 +1206,7 @@ def describe(r: dict) -> str:
 
 
 # ===========================================================================
-# evaluate() — 单股5层评估入口（沿用策略1模式）
+# evaluate() — 单股4层评估入口（沿用策略1模式）
 # ===========================================================================
 
 
@@ -1187,7 +1225,7 @@ def evaluate(
     Layer 1: 市场环境 → 熊市收紧等级阈值（BEAR_GRADE_BOOST）
     Layer 2: 基本面防雷 → 否决制
     Layer 3: 日线技术指标 → 评分
-    Layer 4: 风险收益比 → RR >= 1.5
+    Layer 4: 风险收益比 → ATR 动态止损 + RR >= 1.5
     """
     if config is None:
         config = StrategyConfig()
@@ -1222,10 +1260,13 @@ def evaluate(
 
     # Layer 4: 风险收益比
     last_close = float(daily_out.iloc[-1]["close"])
+    atr_val = daily_out.iloc[-1].get("atr")
+    atr_val = float(atr_val) if atr_val is not None and not pd.isna(atr_val) else None
 
     rr = compute_risk_reward(
         entry_price=last_close,
         config=config,
+        atr=atr_val,
     )
     if not rr["passes"]:
         return None
