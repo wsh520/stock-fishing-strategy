@@ -9,7 +9,7 @@ on:
 jobs:
   screen:
     runs-on: ubuntu-latest
-    timeout-minutes: 240
+    timeout-minutes: 30
 
     steps:
       - name: Checkout
@@ -24,35 +24,25 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Sync data to DB
-        env:
-          MYSQL_HOST: ${{ secrets.MYSQL_HOST }}
-          MYSQL_PORT: ${{ secrets.MYSQL_PORT }}
-          MYSQL_USER: ${{ secrets.MYSQL_USER }}
-          MYSQL_PASSWORD: ${{ secrets.MYSQL_PASSWORD }}
-          MYSQL_DATABASE: ${{ secrets.MYSQL_DATABASE }}
-        run: |
-          if [ -n "$MYSQL_HOST" ]; then
-            DAY_OF_WEEK=$(date +%u)
-            if [ "$DAY_OF_WEEK" = "6" ]; then
-              echo "Saturday: syncing daily + weekly data..."
-              python src/sync_data.py --period both --workers 4
-            else
-              echo "Weekday: syncing daily data only (weekly synced on Saturday)..."
-              python src/sync_data.py --period daily --workers 4
-            fi
-          else
-            echo "MySQL not configured, skipping data sync"
-          fi
+      # 缓存 akshare 磁盘缓存目录。数据层按文件 mtime 判新鲜度，而 actions/cache
+      # 基于 tar 会保留 mtime，因此恢复的「昨日行情」会被正确判定为过期并重新拉取，
+      # 仍在 TTL 内的股票列表（6天）与基本面（7天）则直接复用，省下大量请求。
+      - name: Resolve cache date
+        id: cachedate
+        run: echo "ymd=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache akshare data
+        uses: actions/cache@v4
+        with:
+          path: cache
+          key: akshare-cache-${{ steps.cachedate.outputs.ymd }}
+          restore-keys: |
+            akshare-cache-
 
       - name: Run strategy
         env:
           FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
-          MYSQL_HOST: ${{ secrets.MYSQL_HOST }}
-          MYSQL_PORT: ${{ secrets.MYSQL_PORT }}
-          MYSQL_USER: ${{ secrets.MYSQL_USER }}
-          MYSQL_PASSWORD: ${{ secrets.MYSQL_PASSWORD }}
-          MYSQL_DATABASE: ${{ secrets.MYSQL_DATABASE }}
+
         run: python run.py
 
       - name: Upload artifacts

@@ -1,19 +1,15 @@
 """
-策略2：周线左侧寻底 + 日线右侧确认 — 5层量化选股系统
+精简版日线选股策略
 
-Layer 1: 市场环境过滤（沪深300周线MA20斜率）
-Layer 2: 周线左侧寻底（ATR归一化跌幅 + 量能模式 + CCI超卖 + MACD底背离）
-Layer 3: 基本面防雷（ROE/负债率/商誉/扣非利润否决）
-Layer 4: 日线右侧确认（MA5拐头 + EMA金叉 + RSI超卖反弹 + 量价配合）
-Layer 5: 风险收益比过滤（动态止损 + 止盈目标 + 最低1.5倍RR）
+仅使用日线数据进行选股，简化策略逻辑：
+1. 市场环境过滤（沪深300日线MA20斜率）
+2. 基本面防雷（ROE/负债率/商誉/扣非利润否决）
+3. 日线技术指标筛选（MA5拐头 + EMA金叉 + RSI超卖反弹 + 量价配合）
+4. 风险收益比过滤（固定止损止盈）
 
-借鉴策略1(strategy.py)的架构：纯函数、向量化计算、参数外置、结构化输出。
-借鉴策略1的逻辑：不破前低、换手率倍率、个股MA斜率、恐慌杀跌、成交额下限、次新剔除。
-
-数据层对齐 weekly/data.py：单一 AkShare 数据源、统一列名映射、带退避重试、
+数据层：单一 AkShare 数据源、统一列名映射、带退避重试、
 磁盘 CSV 缓存（行情按交易日失效 / 列表按 TTL 天失效）、股票池过滤由 config 开关驱动。
 
-compute_weekly_signals() / compute_daily_signals() 为纯函数，便于单测与回测。
 evaluate() 为单股实盘选股入口。
 """
 
@@ -52,12 +48,10 @@ DISPLAY_COLS = [
     ("close", "收盘"),
     ("score", "评分"),
     ("grade", "等级"),
-    ("weekly_score", "周线分"),
     ("daily_score", "日线分"),
-    ("pct_chg_w", "周涨跌%"),
-    ("atr_decline", "ATR跌幅"),
-    ("cci", "CCI"),
     ("rsi", "RSI"),
+    ("rsi7", "RSI7"),
+    ("rsi21", "RSI21"),
     ("vol_ratio", "量比"),
     ("turnover_ratio", "换手比"),
     ("stop_loss", "止损"),
@@ -66,7 +60,7 @@ DISPLAY_COLS = [
     ("market_env", "市场"),
 ]
 
-TITLE = "左侧寻底+右侧确认选股结果"
+TITLE = "日线技术指标选股结果"
 PREFIX = "bf"
 SORT_BY = ["score"]
 SORT_ASC = [False]
@@ -88,67 +82,45 @@ class StrategyConfig:
     MARKET_BULL_SLOPE: float = 0.01
     MARKET_BEAR_SLOPE: float = -0.01
 
-    # --- Layer 2: 周线寻底 ---
-    WEEKLY_ATR_PERIOD: int = 14
-    WEEKLY_ATR_DECLINE_THRESHOLD: float = 1.3  # 放宽门槛，让更多潜在底部信号进入评分池
-    WEEKLY_CCI_PERIOD: int = 14
-    WEEKLY_CCI_OVERSOLD: float = -100.0
-    WEEKLY_MACD_FAST: int = 12
-    WEEKLY_MACD_SLOW: int = 26
-    WEEKLY_MACD_SIGNAL: int = 9
-    WEEKLY_VOL_LOOKBACK: int = 10
-    WEEKLY_VOL_SHRINK_RATIO: float = 0.7
-    WEEKLY_VOL_EXPAND_RATIO: float = 1.5
-    WEEKLY_MA_PERIOD: int = 20
-    WEEKLY_SLOPE_LOOKBACK: int = 4
-
-    # 借鉴策略1
-    PANIC_PCT: float = -5.0
-    PRIOR_LOW_LOOKBACK: int = 12
-    TURNOVER_LOOKBACK: int = 10
-    TURNOVER_RATIO_THRESHOLD: float = 1.5
-
-    # --- Layer 3: 基本面 ---
+    # --- Layer 2: 基本面 ---
     MIN_ROE: float = 5.0
     MAX_DEBT_RATIO: float = 70.0
     MAX_GOODWILL_RATIO: float = 20.0
     MIN_DEDUCTED_PROFIT_RATIO: float = 0.5
 
-    # --- Layer 4: 日线确认 ---
+    # --- Layer 3: 日线技术指标 ---
     DAILY_MA5: int = 5
     DAILY_MA10: int = 10
     DAILY_EMA5: int = 5
     DAILY_EMA10: int = 10
     DAILY_EMA20: int = 20
     DAILY_RSI_PERIOD: int = 14
+    DAILY_RSI_SHORT_PERIOD: int = 7      # 新增：短期RSI周期
+    DAILY_RSI_LONG_PERIOD: int = 21      # 新增：长期RSI周期
     DAILY_RSI_OVERSOLD: float = 30.0
     DAILY_RSI_REBOUND_MIN: float = 35.0
     DAILY_RSI_OVERBOUGHT: float = 70.0
-    DAILY_VOL_EXPAND: float = 1.3  # 提高量价配合标准，过滤无量假反弹
+    DAILY_RSI_DIVERGENCE_THRESHOLD: float = 2.0  # 新增：RSI背离阈值
+    DAILY_MACD_FAST: int = 12           # 新增：MACD快线
+    DAILY_MACD_SLOW: int = 26           # 新增：MACD慢线
+    DAILY_MACD_SIGNAL: int = 9          # 新增：MACD信号线
+    DAILY_VOL_EXPAND: float = 1.2
     DAILY_TURNOVER_LOOKBACK: int = 20
 
-    # --- Layer 5: 风控 ---
-    ATR_STOP_MULTIPLIER: float = 2.0
-    TAKE_PROFIT_TARGET: str = "ma20"
-    FIXED_TP_PCT: float = 15.0
-    MIN_RR_RATIO: float = 1.8  # 动态止盈后RR更真实，适当提高门槛过滤低质量信号
+    # --- Layer 4: 风控 ---
+    FIXED_STOP_LOSS_PCT: float = 5.0  # 固定百分比止损
+    FIXED_TAKE_PROFIT_PCT: float = 10.0  # 固定百分比止盈
+    MIN_RR_RATIO: float = 1.5
 
-    # --- 过滤（借鉴策略1） ---
+    # --- 过滤 ---
     MIN_AMOUNT: float = 5_000_000.0
-    MIN_WEEKS: int = 30
     MIN_DAYS: int = 60
 
-    # --- 评分权重（周线最高70，日线最高30） ---
-    W_ATR_DECLINE: float = 20.0
-    W_CCI_OVERSOLD: float = 15.0
-    W_VOLUME_PATTERN: float = 10.0
-    W_MACD_DIVERGENCE: float = 10.0
-    W_PRIOR_LOW_HOLD: float = 10.0
-    W_PANIC_BONUS: float = 5.0
-    W_DAILY_MA_TURN: float = 10.0   # 提升早期反转信号权重（优先于EMA金叉）
-    W_DAILY_EMA_CROSS: float = 6.0   # 降低滞后指标权重，避免与MA5拐头重复计分
-    W_DAILY_RSI_REBOUND: float = 7.0
-    W_DAILY_VOL_PRICE: float = 7.0
+    # --- 评分权重（日线最高100） ---
+    W_DAILY_MA_TURN: float = 25.0
+    W_DAILY_EMA_CROSS: float = 25.0
+    W_DAILY_RSI_REBOUND: float = 25.0
+    W_DAILY_VOL_PRICE: float = 25.0
 
     # --- 等级阈值 ---
     GRADE_A: float = 80.0
@@ -158,11 +130,7 @@ class StrategyConfig:
 
     # --- 基础设施 ---
     CACHE_EXPIRE_HOURS: float = 4.0
-    DATA_DIR: str = "data"
-    SIGNAL_HISTORY_FILE: str = "signal_history.csv"
-    TRACKING_FILE: str = "tracking_report.csv"
     MAX_WORKERS: int = 4
-    WEEKLY_BARS: int = 60
     DAILY_BARS: int = 120
     FETCH_DELAY: float = 0.05
 
@@ -445,31 +413,14 @@ def _fetch_hist(
 def fetch_weekly_range(
     code: str, start: str, end: str, config: Optional[StrategyConfig] = None,
 ) -> Optional[pd.DataFrame]:
-    """获取个股指定区间的周线数据。start/end 格式 YYYYMMDD。
-
-    优先级: DB周线表 → AkShare API + 磁盘缓存。
-    周线由每周六 sync 任务从 API 增量拉取写入 DB，不从日线聚合。
-    """
-    db = _get_db()
-    if db is not None:
-        df = db.get_kline_weekly(code, start=start, end=end)
-        if df is not None and not df.empty:
-            return df
+    """获取个股指定区间的周线数据。start/end 格式 YYYYMMDD。"""
     return _fetch_hist(code, "weekly", start, end, config or StrategyConfig())
 
 
 def fetch_daily_range(
     code: str, start: str, end: str, config: Optional[StrategyConfig] = None,
 ) -> Optional[pd.DataFrame]:
-    """获取个股指定区间的日线数据。start/end 格式 YYYYMMDD。
-
-    优先级: DB → AkShare API + 磁盘缓存。
-    """
-    db = _get_db()
-    if db is not None:
-        df = db.get_kline_daily(code, start=start, end=end)
-        if df is not None and not df.empty:
-            return df
+    """获取个股指定区间的日线数据。start/end 格式 YYYYMMDD。"""
     return _fetch_hist(code, "daily", start, end, config or StrategyConfig())
 
 
@@ -559,22 +510,9 @@ def _fetch_index_daily_raw(
 def fetch_index_weekly_range(
     symbol: str, start: str, end: str, config: Optional[StrategyConfig] = None,
 ) -> Optional[pd.DataFrame]:
-    """获取指数指定区间的周线数据（日线切片后按周聚合）。start/end 格式 YYYYMMDD。
-
-    优先级: DB 指数日线 → AkShare API + 磁盘缓存。
-    """
+    """获取指数指定区间的周线数据（日线切片后按周聚合）。start/end 格式 YYYYMMDD。"""
     config = config or StrategyConfig()
-
-    # 优先从 DB 读取指数日线
-    db = _get_db()
-    df = None
-    if db is not None:
-        df = db.get_index_daily(symbol, start=start, end=end)
-
-    # 降级到 AkShare API
-    if df is None:
-        df = _fetch_index_daily_raw(symbol, config)
-
+    df = _fetch_index_daily_raw(symbol, config)
     if df is None:
         return None
 
@@ -803,54 +741,16 @@ def _fetch_stock_pool_akshare(
 # ===========================================================================
 
 
-# ---------------------------------------------------------------------------
-# DB 访问器（懒加载，避免模块导入时强制连接 MySQL）
-# ---------------------------------------------------------------------------
-
-_db_store = None
-_db_checked = False
-
-
-def _get_db():
-    """懒加载 MySQL 存储实例。未配置或不可用时返回 None。"""
-    global _db_store, _db_checked
-    if not _db_checked:
-        _db_checked = True
-        try:
-            from db import get_mysql_store
-            _db_store = get_mysql_store()
-        except Exception:
-            _db_store = None
-    return _db_store
-
-
 def get_weekly_data(
     code: str, config: StrategyConfig, cache: Optional[CacheManager] = None,
 ) -> Optional[pd.DataFrame]:
-    """获取个股周线数据。
-
-    优先级: 内存缓存 → DB周线表 → AkShare API。
-    周线由每周六 sync 任务从 API 增量拉取写入 DB，工作日直接读 DB。
-    不从日线聚合（日线可能有缺失导致周线失真）。
-    """
+    """获取个股周线数据。"""
     cache_key = f"weekly_{code}"
     if cache:
         cached = cache.get(cache_key)
         if cached is not None:
             return cached
 
-    # 优先从 DB 周线表读取
-    db = _get_db()
-    if db is not None:
-        end = datetime.now().strftime("%Y%m%d")
-        start = (datetime.now() - timedelta(weeks=config.WEEKLY_BARS)).strftime("%Y%m%d")
-        df = db.get_kline_weekly(code, start=start, end=end)
-        if df is not None and len(df) >= config.MIN_WEEKS:
-            if cache:
-                cache.set(cache_key, df)
-            return df
-
-    # 降级到 AkShare API（DB 不可用或数据不足时）
     df = _fetch_weekly_akshare(code, weeks=config.WEEKLY_BARS, config=config)
 
     if cache and df is not None:
@@ -861,26 +761,34 @@ def get_weekly_data(
 def get_daily_data(
     code: str, config: StrategyConfig, cache: Optional[CacheManager] = None,
 ) -> Optional[pd.DataFrame]:
-    """获取个股日线数据。优先级: 内存缓存 → DB → AkShare API。"""
+    """获取个股日线数据。"""
     cache_key = f"daily_{code}"
     if cache:
         cached = cache.get(cache_key)
         if cached is not None:
             return cached
 
-    # 优先从 DB 读取
-    db = _get_db()
-    if db is not None:
-        end = datetime.now().strftime("%Y%m%d")
-        start = (datetime.now() - timedelta(days=config.DAILY_BARS)).strftime("%Y%m%d")
-        df = db.get_kline_daily(code, start=start, end=end)
-        if df is not None and len(df) >= config.MIN_DAYS:
-            if cache:
-                cache.set(cache_key, df)
-            return df
-
-    # 降级到 AkShare API
     df = _fetch_daily_akshare(code, days=config.DAILY_BARS, config=config)
+
+    if cache and df is not None:
+        cache.set(cache_key, df)
+    return df
+
+
+def get_index_daily(
+    config: StrategyConfig, cache: Optional[CacheManager] = None,
+) -> Optional[pd.DataFrame]:
+    """获取沪深300指数日线数据。"""
+    cache_key = "index_daily_csi300"
+    if cache:
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+    df = _fetch_index_daily_raw(config.CSI300_AK_SYMBOL, config)
+    # 取最近的DAILY_BARS个交易日
+    if df is not None and len(df) > config.DAILY_BARS:
+        df = df.tail(config.DAILY_BARS).reset_index(drop=True)
 
     if cache and df is not None:
         cache.set(cache_key, df)
@@ -890,30 +798,13 @@ def get_daily_data(
 def get_index_weekly(
     config: StrategyConfig, cache: Optional[CacheManager] = None,
 ) -> Optional[pd.DataFrame]:
-    """获取沪深300指数周线数据。优先级: 内存缓存 → DB(日线聚合) → AkShare API。"""
+    """获取沪深300指数周线数据。"""
     cache_key = "index_weekly_csi300"
     if cache:
         cached = cache.get(cache_key)
         if cached is not None:
             return cached
 
-    # 优先从 DB 读取指数日线 → 本地聚合为周线
-    db = _get_db()
-    if db is not None:
-        end = datetime.now().strftime("%Y%m%d")
-        start = (datetime.now() - timedelta(weeks=config.WEEKLY_BARS)).strftime("%Y%m%d")
-        daily_df = db.get_index_daily(config.CSI300_AK_SYMBOL, start=start, end=end)
-        if daily_df is not None and not daily_df.empty:
-            # 复用已有的日线→周线聚合逻辑
-            weekly_df = fetch_index_weekly_range(
-                config.CSI300_AK_SYMBOL, start, end, config,
-            )
-            if weekly_df is not None and not weekly_df.empty:
-                if cache:
-                    cache.set(cache_key, weekly_df)
-                return weekly_df
-
-    # 降级到 AkShare API
     df = _fetch_index_weekly_akshare(
         symbol=config.CSI300_AK_SYMBOL, weeks=config.WEEKLY_BARS, config=config,
     )
@@ -928,7 +819,7 @@ def get_fundamentals(
     cache: Optional[CacheManager] = None,
     config: Optional[StrategyConfig] = None,
 ) -> Optional[dict]:
-    """获取基本面数据。（基本面暂不入库，保持原有逻辑）"""
+    """获取基本面数据。"""
     cache_key = f"fund_{code}"
     if cache:
         cached = cache.get(cache_key)
@@ -944,25 +835,13 @@ def get_fundamentals(
 def get_stock_list(
     config: StrategyConfig, cache: Optional[CacheManager] = None,
 ) -> list[dict]:
-    """获取待筛选股票列表。优先级: 内存缓存 → DB → AkShare API。"""
+    """获取待筛选股票列表。"""
     cache_key = "stock_list"
     if cache:
         cached = cache.get(cache_key)
         if cached is not None:
             return cached
 
-    # 优先从 DB 读取
-    db = _get_db()
-    if db is not None:
-        stock_df = db.get_stock_list_from_db()
-        if stock_df is not None and not stock_df.empty:
-            stocks = _apply_universe_filters(stock_df, config).to_dict("records")
-            if stocks:
-                if cache:
-                    cache.set(cache_key, stocks)
-                return stocks
-
-    # 降级到 AkShare API
     stocks = _fetch_stock_pool_akshare(config)
     if cache and stocks:
         cache.set(cache_key, stocks)
@@ -1015,155 +894,6 @@ def compute_market_environment(
     }
 
 
-# ===========================================================================
-# Layer 2: 周线左侧寻底信号（纯函数，向量化）
-# ===========================================================================
-
-_WEEKLY_NEED_COLS = {"close", "high", "low", "volume", "pct_chg", "amount", "date"}
-
-
-def compute_weekly_signals(
-    df: pd.DataFrame, config: StrategyConfig,
-) -> Optional[pd.DataFrame]:
-    """向量化计算周线寻底信号与评分。
-
-    返回原df + 信号/评分列的副本，其中 weekly_signal 为布尔列，weekly_score 为连续评分。
-    回测时直接使用返回的 DataFrame；实盘时通过 evaluate() 只取最后一行。
-
-    硬性门槛（全部满足才产生信号）:
-      1. 个股下跌趋势: close < MA20 且 MA20 向下（借鉴策略1）
-      2. ATR归一化跌幅 >= 阈值
-      3. CCI14 <= 超卖线
-      4. 成交额 >= 下限（借鉴策略1）
-      5. 非次新股（借鉴策略1）
-
-    评分项（0-70分）:
-      - ATR跌幅深度:   0-20分
-      - CCI超卖深度:   0-15分
-      - 量能模式:       0-10分
-      - MACD底背离:     0-10分
-      - 守住前低:       0-10分（借鉴策略1）
-      - 恐慌杀跌:       0-5分 （借鉴策略1）
-    """
-    if df is None or df.empty:
-        return None
-    if not _WEEKLY_NEED_COLS.issubset(df.columns):
-        return None
-    if len(df) < config.MIN_WEEKS:
-        return None
-
-    out = df.copy().reset_index(drop=True)
-
-    # ------ 技术指标计算（全部向量化） ------
-
-    # 1) 个股MA20 + 斜率（下跌趋势确认，借鉴策略1的 ma < ma_prev）
-    out["ma20"] = out["close"].rolling(config.WEEKLY_MA_PERIOD).mean()
-    out["ma20_prev"] = out["ma20"].shift(config.WEEKLY_SLOPE_LOOKBACK)
-    in_downtrend = (out["close"] < out["ma20"]) & (out["ma20"] < out["ma20_prev"])
-
-    # 2) ATR14
-    prev_close = out["close"].shift(1)
-    tr = pd.concat([
-        out["high"] - out["low"],
-        (out["high"] - prev_close).abs(),
-        (out["low"] - prev_close).abs(),
-    ], axis=1).max(axis=1)
-    out["atr14"] = tr.rolling(config.WEEKLY_ATR_PERIOD).mean()
-
-    # ATR归一化跌幅：本周下跌幅度 / ATR（正数表示下跌）
-    weekly_decline = prev_close - out["close"]
-    out["atr_decline"] = weekly_decline / out["atr14"]
-    atr_decline_ok = out["atr_decline"] >= config.WEEKLY_ATR_DECLINE_THRESHOLD
-
-    # 3) CCI14
-    tp = (out["high"] + out["low"] + out["close"]) / 3
-    tp_sma = tp.rolling(config.WEEKLY_CCI_PERIOD).mean()
-    tp_mad = tp.rolling(config.WEEKLY_CCI_PERIOD).apply(
-        lambda x: np.mean(np.abs(x - np.mean(x))), raw=True,
-    )
-    out["cci14"] = (tp - tp_sma) / (0.015 * tp_mad)
-    cci_oversold = out["cci14"] <= config.WEEKLY_CCI_OVERSOLD
-
-    # 4) MACD
-    ema_fast = out["close"].ewm(span=config.WEEKLY_MACD_FAST, adjust=False).mean()
-    ema_slow = out["close"].ewm(span=config.WEEKLY_MACD_SLOW, adjust=False).mean()
-    out["macd"] = ema_fast - ema_slow
-    out["macd_signal"] = out["macd"].ewm(span=config.WEEKLY_MACD_SIGNAL, adjust=False).mean()
-    out["macd_hist"] = out["macd"] - out["macd_signal"]
-
-    # MACD底背离：价格创新低但MACD柱不创新低
-    price_low_min = out["low"].shift(1).rolling(config.PRIOR_LOW_LOOKBACK).min()
-    macd_hist_min = out["macd_hist"].shift(1).rolling(config.PRIOR_LOW_LOOKBACK).min()
-    out["macd_divergence"] = (out["low"] <= price_low_min) & (out["macd_hist"] > macd_hist_min)
-
-    # 5) 量能模式：前期缩量 + 本周放量
-    out["vol_base"] = out["volume"].shift(1).rolling(config.WEEKLY_VOL_LOOKBACK).mean()
-    out["vol_ratio"] = out["volume"] / out["vol_base"].replace(0, np.nan)
-
-    vol_prev_2 = out["volume"].shift(2) / out["vol_base"].shift(1).replace(0, np.nan)
-    vol_prev_3 = out["volume"].shift(3) / out["vol_base"].shift(2).replace(0, np.nan)
-    vol_shrink = (vol_prev_2 <= config.WEEKLY_VOL_SHRINK_RATIO) | (
-        vol_prev_3 <= config.WEEKLY_VOL_SHRINK_RATIO
-    )
-    vol_expand = out["vol_ratio"] >= config.WEEKLY_VOL_EXPAND_RATIO
-
-    # 6) 换手率倍率（借鉴策略1）
-    if "turnover" in out.columns:
-        out["turnover_base"] = out["turnover"].shift(1).rolling(config.TURNOVER_LOOKBACK).mean()
-        out["turnover_ratio"] = out["turnover"] / out["turnover_base"].replace(0, np.nan)
-    else:
-        out["turnover_base"] = np.nan
-        out["turnover_ratio"] = np.nan
-
-    # 7) 不破前低（借鉴策略1）
-    out["prior_low"] = out["low"].shift(1).rolling(config.PRIOR_LOW_LOOKBACK).min()
-    out["holds_prior_low"] = out["low"] >= out["prior_low"]
-
-    # ------ 硬性门槛 ------
-    amount_ok = out["amount"] >= config.MIN_AMOUNT
-    not_newly = pd.Series(out.index >= config.MIN_WEEKS, index=out.index)
-
-    out["weekly_signal"] = (
-        in_downtrend & atr_decline_ok & cci_oversold & amount_ok & not_newly
-    ).fillna(False)
-
-    # ------ 评分（连续值） ------
-
-    # ATR跌幅深度: 从阈值到2倍阈值线性映射 0→满分
-    atr_score = (
-        (out["atr_decline"] - config.WEEKLY_ATR_DECLINE_THRESHOLD)
-        / config.WEEKLY_ATR_DECLINE_THRESHOLD
-    ).clip(0, 1) * config.W_ATR_DECLINE
-
-    # CCI超卖深度: 越深分越高
-    if config.WEEKLY_CCI_OVERSOLD != 0:
-        cci_score = (
-            (config.WEEKLY_CCI_OVERSOLD - out["cci14"]) / abs(config.WEEKLY_CCI_OVERSOLD)
-        ).clip(0, 1) * config.W_CCI_OVERSOLD
-    else:
-        cci_score = pd.Series(0.0, index=out.index)
-
-    # 量能模式: 缩量→放量
-    vol_pattern_score = (
-        vol_shrink.astype(float) * vol_expand.astype(float) * config.W_VOLUME_PATTERN
-    )
-
-    # MACD底背离
-    macd_div_score = out["macd_divergence"].astype(float) * config.W_MACD_DIVERGENCE
-
-    # 守住前低（借鉴策略1）
-    prior_low_score = out["holds_prior_low"].astype(float) * config.W_PRIOR_LOW_HOLD
-
-    # 恐慌杀跌（借鉴策略1）
-    panic_score = (out["pct_chg"] <= config.PANIC_PCT).astype(float) * config.W_PANIC_BONUS
-
-    out["weekly_score"] = (
-        atr_score + cci_score + vol_pattern_score
-        + macd_div_score + prior_low_score + panic_score
-    ).fillna(0).round(1)
-
-    return out
-
 
 # ===========================================================================
 # Layer 3: 基本面防雷（纯函数）
@@ -1200,22 +930,22 @@ def check_fundamentals(
 
 
 # ===========================================================================
-# Layer 4: 日线右侧确认信号（纯函数，向量化）
+# Layer 3: 日线技术指标信号（纯函数，向量化）
 # ===========================================================================
 
-_DAILY_NEED_COLS = {"close", "volume", "date"}
+_DAILY_NEED_COLS = {"close", "volume", "date", "high", "low", "pct_chg", "turnover"}
 
 
 def compute_daily_signals(
     df: pd.DataFrame, config: StrategyConfig,
 ) -> Optional[pd.DataFrame]:
-    """向量化计算日线右侧确认信号与评分。
+    """向量化计算日线技术指标信号与评分。
 
-    评分项（0-30分）:
-      - MA5拐头:          0-8分
-      - EMA5/10金叉:      0-8分
-      - RSI超卖反弹:      0-7分
-      - 量价配合+换手率:  0-7分（借鉴策略1的换手率维度）
+    评分项（0-100分）:
+      - MA5拐头:          0-25分
+      - EMA5/10金叉:      0-25分
+      - RSI超卖反弹:      0-25分
+      - 量价配合+换手率:  0-25分
     """
     if df is None or df.empty:
         return None
@@ -1235,6 +965,7 @@ def compute_daily_signals(
     out["ema10"] = out["close"].ewm(span=config.DAILY_EMA10, adjust=False).mean()
     out["ema20"] = out["close"].ewm(span=config.DAILY_EMA20, adjust=False).mean()
 
+    # RSI计算（多周期）
     # RSI14
     delta = out["close"].diff()
     gain = delta.clip(lower=0)
@@ -1243,6 +974,31 @@ def compute_daily_signals(
     avg_loss = loss.ewm(com=config.DAILY_RSI_PERIOD - 1, min_periods=config.DAILY_RSI_PERIOD).mean()
     rs = avg_gain / avg_loss.replace(0, np.nan)
     out["rsi14"] = 100 - (100 / (1 + rs))
+
+    # RSI7 (短期)
+    short_delta = out["close"].diff()
+    short_gain = short_delta.clip(lower=0)
+    short_loss = (-short_delta).clip(lower=0)
+    short_avg_gain = short_gain.ewm(com=config.DAILY_RSI_SHORT_PERIOD - 1, min_periods=config.DAILY_RSI_SHORT_PERIOD).mean()
+    short_avg_loss = short_loss.ewm(com=config.DAILY_RSI_SHORT_PERIOD - 1, min_periods=config.DAILY_RSI_SHORT_PERIOD).mean()
+    short_rs = short_avg_gain / short_avg_loss.replace(0, np.nan)
+    out["rsi7"] = 100 - (100 / (1 + short_rs))
+
+    # RSI21 (长期)
+    long_delta = out["close"].diff()
+    long_gain = long_delta.clip(lower=0)
+    long_loss = (-long_delta).clip(lower=0)
+    long_avg_gain = long_gain.ewm(com=config.DAILY_RSI_LONG_PERIOD - 1, min_periods=config.DAILY_RSI_LONG_PERIOD).mean()
+    long_avg_loss = long_loss.ewm(com=config.DAILY_RSI_LONG_PERIOD - 1, min_periods=config.DAILY_RSI_LONG_PERIOD).mean()
+    long_rs = long_avg_gain / long_avg_loss.replace(0, np.nan)
+    out["rsi21"] = 100 - (100 / (1 + long_rs))
+
+    # MACD
+    exp1 = out["close"].ewm(span=config.DAILY_MACD_FAST, adjust=False).mean()
+    exp2 = out["close"].ewm(span=config.DAILY_MACD_SLOW, adjust=False).mean()
+    out["macd_diff"] = exp1 - exp2
+    out["macd_dea"] = out["macd_diff"].ewm(span=config.DAILY_MACD_SIGNAL, adjust=False).mean()
+    out["macd_histogram"] = out["macd_diff"] - out["macd_dea"]  # MACD柱状图
 
     # 日线量比
     out["daily_vol_base"] = out["volume"].shift(1).rolling(20).mean()
@@ -1267,12 +1023,27 @@ def compute_daily_signals(
         (out["ema5"] > out["ema10"]) & (out["ema5"].shift(1) <= out["ema10"].shift(1))
     )
 
+    # RSI改进：多周期共振 + 背离检测
     # RSI超卖反弹：近2日曾低于超卖线，当前回升到反弹线上方
     rsi_was_oversold = (
         (out["rsi14"].shift(1) < config.DAILY_RSI_OVERSOLD)
         | (out["rsi14"].shift(2) < config.DAILY_RSI_OVERSOLD)
     )
     out["rsi_rebound"] = rsi_was_oversold & (out["rsi14"] >= config.DAILY_RSI_REBOUND_MIN)
+
+    # RSI多周期共振：短期RSI上穿长期RSI且都在合理区间
+    out["rsi_multi_res"] = (
+        (out["rsi7"] > out["rsi14"]) & 
+        (out["rsi14"] > out["rsi21"]) &
+        (out["rsi7"] < config.DAILY_RSI_OVERBOUGHT) &
+        (out["rsi21"] > config.DAILY_RSI_OVERSOLD)
+    )
+
+    # MACD金叉信号
+    out["macd_golden_cross"] = (
+        (out["macd_diff"] > out["macd_dea"]) & 
+        (out["macd_diff"].shift(1) <= out["macd_dea"].shift(1))
+    )
 
     # 量价配合：价格上涨 + 量放大 + 换手率放大（借鉴策略1）
     price_up = out["close"] > out["close"].shift(1)
@@ -1282,29 +1053,29 @@ def compute_daily_signals(
         turnover_expand = out["daily_turnover_ratio"] >= config.DAILY_VOL_EXPAND
     out["vol_price_coord"] = price_up & vol_expand & turnover_expand
 
-    # ------ 评分（优化：MA5拐头与EMA金叉互斥评分，避免重复计分） ------
-    # MA5拐头是早期反转信号，给予满分权重
-    ma5_turn_score = out["ma5_turn"].astype(float) * config.W_DAILY_MA_TURN
-    # EMA金叉：若MA5已拐头则视为"二次确认"给予较小奖励分，否则独立触发给满分
-    # 避免同一反转动作被两个高度相关指标重复叠加
-    _ema_confirm_bonus = 2.0  # 二次确认固定奖励分
-    ema_cross_score = np.where(
-        out["ma5_turn"],
-        out["ema_golden_cross"].astype(float) * _ema_confirm_bonus,
-        out["ema_golden_cross"].astype(float) * config.W_DAILY_EMA_CROSS,
+    # 多指标共振信号
+    out["multi_resonance"] = (
+        out["rsi_multi_res"] & out["macd_golden_cross"] & out["vol_price_coord"]
     )
+
+    # ------ 评分 ------
+    ma5_turn_score = out["ma5_turn"].astype(float) * config.W_DAILY_MA_TURN
+    ema_cross_score = out["ema_golden_cross"].astype(float) * config.W_DAILY_EMA_CROSS
     rsi_rebound_score = out["rsi_rebound"].astype(float) * config.W_DAILY_RSI_REBOUND
+    
+    # 多指标共振加分
+    multi_resonance_bonus = out["multi_resonance"].astype(float) * 10.0  # 共振额外加分
+    
     # RSI超买惩罚
     rsi_penalty = (out["rsi14"] >= config.DAILY_RSI_OVERBOUGHT).astype(float) * (-3.0)
     vol_price_score = out["vol_price_coord"].astype(float) * config.W_DAILY_VOL_PRICE
 
-    out["daily_score"] = pd.Series(
-        ma5_turn_score + ema_cross_score + rsi_rebound_score + rsi_penalty + vol_price_score,
-        index=out.index,
-    ).fillna(0).clip(0, 30).round(1)
+    out["daily_score"] = (
+        ma5_turn_score + ema_cross_score + rsi_rebound_score + vol_price_score + multi_resonance_bonus
+    ).fillna(0).clip(0, 100).round(1)
 
     out["daily_signal"] = (
-        out["ma5_turn"] | out["ema_golden_cross"] | out["rsi_rebound"]
+        out["ma5_turn"] | out["ema_golden_cross"] | out["rsi_rebound"] | out["multi_resonance"]
     ).fillna(False)
 
     return out
@@ -1317,25 +1088,16 @@ def compute_daily_signals(
 
 def compute_risk_reward(
     entry_price: float,
-    atr: float,
-    ma20: float,
     config: StrategyConfig,
 ) -> dict:
     """计算止损、止盈、风险收益比。
 
-    止损 = 入场价 - ATR × 倍数
-    止盈 = min(MA20, 固定百分比上限)，避免MA20过远时高估收益空间
+    止损 = 入场价 * (1 - 固定百分比)
+    止盈 = 入场价 * (1 + 固定百分比)
     RR = 收益空间 / 风险空间
     """
-    stop_loss = entry_price - atr * config.ATR_STOP_MULTIPLIER
-    fixed_tp = entry_price * (1 + config.FIXED_TP_PCT / 100)
-
-    if config.TAKE_PROFIT_TARGET == "ma20" and ma20 > entry_price:
-        # 取较小值：MA20是均值回归目标，固定百分比是合理收益上限
-        # 防止MA20距离过远导致RR虚高，也防止MA20过近时忽略实际压力位
-        take_profit = min(ma20, fixed_tp)
-    else:
-        take_profit = fixed_tp
+    stop_loss = entry_price * (1 - config.FIXED_STOP_LOSS_PCT / 100)
+    take_profit = entry_price * (1 + config.FIXED_TAKE_PROFIT_PCT / 100)
 
     risk = entry_price - stop_loss
     reward = take_profit - entry_price
@@ -1356,7 +1118,7 @@ def compute_risk_reward(
 
 @dataclass
 class Signal:
-    """单只股票的完整选股信号，涵盖5层信息。"""
+    """单只股票的完整选股信号，涵盖4层信息。"""
 
     code: str
     name: str
@@ -1364,21 +1126,16 @@ class Signal:
     close: float
     score: float
     grade: str
-    weekly_score: float
     daily_score: float
-    pct_chg_w: float
-    atr_decline: float
-    cci: float
     rsi: float
+    rsi7: float
+    rsi21: float
     vol_ratio: float
     turnover_ratio: float
-    holds_prior_low: bool
-    macd_divergence: bool
     stop_loss: float
     take_profit: float
     rr_ratio: float
     market_env: str
-    ma20: float
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -1399,16 +1156,11 @@ def describe(r: dict) -> str:
     """将 Signal.to_dict() 格式化为飞书 lark_md 逐条分析报告。"""
     return "\n".join([
         f"**{r['name']} {r['code']}**  {r['date']}  收盘 {r['close']}",
-        f"综合评分 **{r['score']}** ({r['grade']}级) ｜ 周线 {r['weekly_score']}分 + 日线 {r['daily_score']}分",
+        f"综合评分 **{r['score']}** ({r['grade']}级) ｜ 日线 {r['daily_score']}分",
         "",
-        "**周线寻底:**",
-        f"- ATR跌幅: {r['atr_decline']}倍 ｜ CCI: {r['cci']}",
-        f"- 量比: {r['vol_ratio']}x ｜ 换手比: {r['turnover_ratio']}x",
-        f"- 守住前低: {'是' if r['holds_prior_low'] else '否'}"
-        f" ｜ MACD底背离: {'是' if r['macd_divergence'] else '否'}",
-        "",
-        "**日线确认:**",
-        f"- RSI: {r['rsi']} ｜ 市场环境: {r['market_env']}",
+        "**日线技术指标:**",
+        f"- RSI7: {r['rsi7']}, RSI14: {r['rsi']}, RSI21: {r['rsi21']} ｜ 量比: {r['vol_ratio']}x",
+        f"- 换手比: {r['turnover_ratio']}x ｜ 市场环境: {r['market_env']}",
         "",
         "**交易计划:**",
         f"- 止损: {r['stop_loss']} ｜ 止盈: {r['take_profit']} ｜ 风险收益比: {r['rr_ratio']}",
@@ -1421,7 +1173,6 @@ def describe(r: dict) -> str:
 
 
 def evaluate(
-    weekly_df: Optional[pd.DataFrame],
     daily_df: Optional[pd.DataFrame],
     code: str = "",
     name: str = "",
@@ -1429,15 +1180,14 @@ def evaluate(
     market_env: Optional[dict] = None,
     fund_data: Optional[dict] = None,
 ) -> Optional[Signal]:
-    """对单只股票执行完整5层评估，返回 Signal 或 None。
+    """对单只股票执行完整4层评估，返回 Signal 或 None。
 
-    纯逻辑函数，不做任何数据获取。沿用策略1的 evaluate(df, code, name) 模式。
+    纯逻辑函数，不做任何数据获取。
 
     Layer 1: 市场环境 → 熊市收紧等级阈值（BEAR_GRADE_BOOST）
-    Layer 2: 周线寻底 → 硬性门槛 + 评分
-    Layer 3: 基本面防雷 → 否决制
-    Layer 4: 日线确认 → 至少一个确认信号触发（门槛）+ 评分
-    Layer 5: 风险收益比 → RR >= 1.5
+    Layer 2: 基本面防雷 → 否决制
+    Layer 3: 日线技术指标 → 评分
+    Layer 4: 风险收益比 → RR >= 1.5
     """
     if config is None:
         config = StrategyConfig()
@@ -1449,49 +1199,32 @@ def evaluate(
     else:
         grade_boost = 0.0
 
-    # Layer 2: 周线寻底
-    weekly_out = compute_weekly_signals(weekly_df, config)
-    if weekly_out is None or weekly_out.empty:
-        return None
-    w_last = weekly_out.iloc[-1]
-    if not bool(w_last.get("weekly_signal", False)):
-        return None
-
-    # Layer 3: 基本面防雷
+    # Layer 2: 基本面防雷
     if not check_fundamentals(fund_data, config):
         return None
 
-    # Layer 4: 日线确认（门槛 + 评分）
+    # Layer 3: 日线技术指标（评分）
     daily_out = compute_daily_signals(daily_df, config)
     daily_score = 0.0
     rsi_val = 50.0
-    daily_confirmed = False
     if daily_out is not None and not daily_out.empty:
         d_last = daily_out.iloc[-1]
         daily_score = float(d_last.get("daily_score", 0))
         rsi_val = float(d_last.get("rsi14", 50))
-        daily_confirmed = bool(d_last.get("daily_signal", False))
-
-    # 日线确认门槛：至少一个日线信号触发
-    if not daily_confirmed:
+    else:
         return None
 
     # 合并评分（熊市时等级阈值上浮，实质是要求更高分数才能通过）
-    total_score = float(w_last["weekly_score"]) + daily_score
+    total_score = daily_score
     grade = _grade_from_score(total_score - grade_boost, config)
     if grade == "D":
         return None
 
-    # Layer 5: 风险收益比
-    atr_val = float(w_last.get("atr14", 0))
-    ma20_val = float(w_last.get("ma20", 0))
-    if atr_val <= 0:
-        return None
+    # Layer 4: 风险收益比
+    last_close = float(daily_out.iloc[-1]["close"])
 
     rr = compute_risk_reward(
-        entry_price=float(w_last["close"]),
-        atr=atr_val,
-        ma20=ma20_val,
+        entry_price=last_close,
         config=config,
     )
     if not rr["passes"]:
@@ -1500,25 +1233,20 @@ def evaluate(
     return Signal(
         code=code,
         name=name,
-        date=pd.to_datetime(w_last["date"]).strftime("%Y-%m-%d"),
-        close=round(float(w_last["close"]), 2),
+        date=pd.to_datetime(daily_out.iloc[-1]["date"]).strftime("%Y-%m-%d"),
+        close=round(last_close, 2),
         score=round(total_score, 1),
         grade=grade,
-        weekly_score=round(float(w_last["weekly_score"]), 1),
         daily_score=round(daily_score, 1),
-        pct_chg_w=round(float(w_last.get("pct_chg", 0)), 2),
-        atr_decline=round(float(w_last.get("atr_decline", 0)), 2),
-        cci=round(float(w_last.get("cci14", 0)), 1),
         rsi=round(rsi_val, 1),
-        vol_ratio=round(float(w_last.get("vol_ratio", 0)), 2),
-        turnover_ratio=round(float(w_last.get("turnover_ratio", 0)), 2),
-        holds_prior_low=bool(w_last.get("holds_prior_low", False)),
-        macd_divergence=bool(w_last.get("macd_divergence", False)),
+        rsi7=round(float(daily_out.iloc[-1].get("rsi7", 50)), 1),
+        rsi21=round(float(daily_out.iloc[-1].get("rsi21", 50)), 1),
+        vol_ratio=round(float(daily_out.iloc[-1].get("daily_vol_ratio", 0)), 2),
+        turnover_ratio=round(float(daily_out.iloc[-1].get("daily_turnover_ratio", 0)), 2),
         stop_loss=rr["stop_loss"],
         take_profit=rr["take_profit"],
         rr_ratio=rr["rr_ratio"],
         market_env=regime,
-        ma20=round(ma20_val, 2),
     )
 
 
@@ -1530,12 +1258,12 @@ def evaluate(
 def get_market_environment(
     config: StrategyConfig, cache: CacheManager,
 ) -> dict:
-    """获取沪深300周线 → 计算市场环境 → 缓存。供 run.py 调用。"""
+    """获取沪深300日线 → 计算市场环境 → 缓存。供 run.py 调用。"""
     cached = cache.get("market_env")
     if cached is not None:
         return cached
 
-    df_index = get_index_weekly(config, cache)
+    df_index = get_index_daily(config, cache)  # 获取日线数据
     if df_index is None or df_index.empty:
         result = {
             "regime": "unknown",
@@ -1558,7 +1286,7 @@ def main(
     接受外部传入的 config/cache 以复用 run.py 已创建的实例，避免重复数据请求。
     不传参时自动创建默认实例（兼容直接命令行调用）。
 
-    流程: 市场环境 → 股票列表 → 并行筛选(周线+基本面+日线+风控) → 排序输出
+    流程: 市场环境 → 股票列表 → 并行筛选(基本面+日线+风控) → 排序输出
     """
     if config is None:
         config = StrategyConfig()
@@ -1583,14 +1311,13 @@ def main(
     def _screen_one(stock: dict) -> Optional[Signal]:
         code, name = stock["code"], stock["name"]
         try:
-            weekly_df = get_weekly_data(code, config, cache)
-            if weekly_df is None:
-                return None
             daily_df = get_daily_data(code, config, cache)
+            if daily_df is None:
+                return None
             fund_data = get_fundamentals(code, cache, config)
             if config.FETCH_DELAY > 0:
                 time.sleep(config.FETCH_DELAY)
-            return evaluate(weekly_df, daily_df, code, name, config, market_env, fund_data)
+            return evaluate(daily_df, code, name, config, market_env, fund_data)
         except Exception:
             return None
 
@@ -1610,116 +1337,8 @@ def main(
 
     df = pd.DataFrame(signals)
     df = df.sort_values(SORT_BY, ascending=SORT_ASC).reset_index(drop=True)
-    print(f"[INFO] 筛选完成，共 {len(df)} 只股票通过5层过滤")
+    print(f"[INFO] 筛选完成，共 {len(df)} 只股票通过4层过滤")
     return df
-
-
-def save_signal_history(df: pd.DataFrame) -> None:
-    """将选股结果追加保存到 CSV。"""
-    config = StrategyConfig()
-    os.makedirs(config.DATA_DIR, exist_ok=True)
-    path = os.path.join(config.DATA_DIR, config.SIGNAL_HISTORY_FILE)
-
-    df_out = df.copy()
-    df_out["saved_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    if os.path.exists(path):
-        df_out.to_csv(path, mode="a", header=False, index=False)
-    else:
-        df_out.to_csv(path, index=False)
-    print(f"[INFO] 信号已保存至 {path}")
-
-
-def weekly_performance_review(config: StrategyConfig) -> Optional[pd.DataFrame]:
-    """追踪历史推荐股票的后续表现。
-
-    读取信号历史CSV，获取当前价格，计算收益率，判定止损/止盈/持有状态。
-    """
-    path = os.path.join(config.DATA_DIR, config.SIGNAL_HISTORY_FILE)
-    if not os.path.exists(path):
-        return None
-
-    try:
-        history = pd.read_csv(path)
-    except Exception:
-        return None
-
-    if history.empty:
-        return None
-
-    # 筛选近4周的推荐记录
-    history["date"] = pd.to_datetime(history["date"], errors="coerce")
-    cutoff = datetime.now() - timedelta(weeks=4)
-    recent = history[history["date"] >= cutoff].copy()
-    if recent.empty:
-        return None
-
-    cache = CacheManager(expire_hours=config.CACHE_EXPIRE_HOURS)
-    records = []
-
-    for _, row in recent.iterrows():
-        code = str(row.get("code", ""))
-        if not code:
-            continue
-        try:
-            daily_df = get_daily_data(code, config, cache)
-            if daily_df is None or daily_df.empty:
-                continue
-            current_price = float(daily_df.iloc[-1]["close"])
-            rec_price = float(row.get("close", 0))
-            stop_loss = float(row.get("stop_loss", 0))
-            take_profit = float(row.get("take_profit", 0))
-
-            if rec_price <= 0:
-                continue
-
-            return_pct = (current_price - rec_price) / rec_price * 100
-
-            if stop_loss > 0 and current_price <= stop_loss:
-                status = "止损"
-            elif take_profit > 0 and current_price >= take_profit:
-                status = "止盈"
-            else:
-                status = "持有中"
-
-            records.append({
-                "code": code,
-                "name": row.get("name", ""),
-                "rec_date": row.get("date"),
-                "rec_price": round(rec_price, 2),
-                "current_price": round(current_price, 2),
-                "return_pct": round(return_pct, 2),
-                "status": status,
-                "stop_loss": round(stop_loss, 2),
-                "take_profit": round(take_profit, 2),
-                "grade": row.get("grade", ""),
-                "score": row.get("score", 0),
-            })
-        except Exception:
-            continue
-
-    if not records:
-        return None
-
-    report = pd.DataFrame(records)
-    print(f"[INFO] 周度追踪: {len(report)} 只股票")
-
-    # 统计
-    total = len(report)
-    win = len(report[report["return_pct"] > 0])
-    avg_return = report["return_pct"].mean()
-    print(f"[INFO] 胜率: {win}/{total} = {win / total * 100:.1f}%, 平均收益: {avg_return:.2f}%")
-
-    return report
-
-
-def update_signal_status(report: pd.DataFrame) -> None:
-    """保存追踪报告到 CSV。"""
-    config = StrategyConfig()
-    os.makedirs(config.DATA_DIR, exist_ok=True)
-    path = os.path.join(config.DATA_DIR, config.TRACKING_FILE)
-    report.to_csv(path, index=False)
-    print(f"[INFO] 追踪报告已保存至 {path}")
 
 
 # ===========================================================================
@@ -1737,22 +1356,13 @@ if __name__ == "__main__":
             print("未发现信号")
 
     elif mode == "track":
-        cfg = StrategyConfig()
-        report = weekly_performance_review(cfg)
-        if report is not None:
-            print(report.to_string())
-        else:
-            print("无追踪数据")
+        print("跟踪功能已移除")
 
     elif mode == "full":
         result = main()
         if result is not None:
-            save_signal_history(result)
             print(f"共 {len(result)} 只信号")
-        cfg = StrategyConfig()
-        report = weekly_performance_review(cfg)
-        if report is not None:
-            update_signal_status(report)
+        print("回测和跟踪功能已移除")
 
     else:
         print(f"未知模式: {mode}，可选: screen / track / full")

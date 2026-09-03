@@ -1,24 +1,23 @@
-# A股量化选股策略 - 自动化执行系统
+# A股日线量化选股策略 - 自动化执行系统
 
-基于「周线左侧寻底 + 日线右侧确认」的量化选股策略，通过 GitHub Actions 每日自动执行，结果通过飞书机器人推送通知。支持历史回测与增量回测。
+基于日线技术指标的量化选股策略，通过 GitHub Actions 每日自动执行，结果通过飞书机器人推送通知。支持历史回测与增量回测。
 
 ## 策略简介
 
-5层量化过滤体系：
+4层量化过滤体系：
 
-1. **市场环境过滤**：沪深300周线MA20斜率判断牛/熊/中性环境，熊市收紧等级阈值
-2. **周线左侧寻底**：ATR归一化跌幅 + 量能模式识别 + CCI超卖确认 + MACD底背离 + 不破前低
-3. **基本面防雷**：ROE/负债率/商誉/扣非利润等否决项
-4. **日线右侧确认**：MA5拐头 + EMA金叉 + RSI超卖反弹 + 量价配合（至少一个信号触发）
-5. **风险收益比过滤**：动态止损(ATR) + 止盈目标(MA20) + 最低1.5倍风险收益比
+1. **市场环境过滤**：沪深300日线MA20斜率判断牛/熊/中性环境，熊市收紧等级阈值
+2. **基本面防雷**：ROE/负债率/商誉/扣非利润等否决项
+3. **日线技术指标筛选**：MA5拐头 + EMA金叉 + RSI超卖反弹 + 量价配合
+4. **风险收益比过滤**：固定止损止盈 + 最低1.5倍风险收益比
 
-评分体系：周线最高70分 + 日线最高30分 = 100分，按分数分为 A/B/C/D 四个等级（D级淘汰）。
+评分体系：日线技术指标最高100分，按分数分为 A/B/C/D 四个等级（D级淘汰）。
 
 ## 自动执行
 
 | 工作流 | 触发时间 | 说明 |
 |--------|----------|------|
-| **Daily Stock Screening** | 交易日 15:10 (北京) | 每日选股 + 追踪 + 绩效报告 |
+| **Daily Stock Screening** | 交易日 15:10 (北京) | 每日选股 + 追踪 |
 | **Weekly Backtest** | 每周六 16:00 (北京) | 增量回测（首次自动全量） |
 
 两个工作流均支持手动触发 (`workflow_dispatch`)。
@@ -45,13 +44,7 @@
 | Name | Value | 必填 |
 |------|-------|------|
 | `FEISHU_WEBHOOK_URL` | 飞书 Webhook 地址 | 推荐（不配则跳过通知） |
-| `MYSQL_HOST` | MySQL 主机地址 | 可选 |
-| `MYSQL_PORT` | MySQL 端口 (默认 3306) | 可选 |
-| `MYSQL_USER` | MySQL 用户名 | 可选 |
-| `MYSQL_PASSWORD` | MySQL 密码 | 可选 |
-| `MYSQL_DATABASE` | MySQL 数据库名 (默认 stock_strategy) | 可选 |
 
-> MySQL 为可选配置。未配置时系统仅使用 CSV 存储，不影响选股和回测主流程。配置后可自动建表，支持绩效统计和增量回测续跑。
 
 ### 4. 启用 GitHub Actions
 
@@ -87,7 +80,12 @@
 │   ├── tracking_report.csv       # 追踪报告
 │   ├── backtest_trades_*.csv     # 回测交易明细
 │   └── backtest_summary_*.csv    # 回测统计汇总
-├── db.py                         # MySQL 存储模块（可选）
+├── cache/                        # 自动生成的磁盘缓存（已 gitignore）
+│   ├── weekly_*.csv / daily_*.csv  # 个股行情，按交易日失效
+│   ├── index_daily_*.csv         # 指数全量日线，按交易日失效
+│   ├── stock_list.csv            # 原始未过滤股票列表，按 TTL 天失效
+│   └── fund_*.json               # 基本面，按周失效
+
 ├── run.py                        # 每日选股入口
 ├── requirements.txt              # Python 依赖
 └── README.md
@@ -140,28 +138,16 @@ python src/backtest.py --max-hold-weeks 6 --workers 8
 回测输出：
 - 交易明细（入场/出场日期价格、收益率、退出原因）
 - 统计报告（胜率、盈亏比、平均收益、等级分布、月度分布）
-- 结果保存至 CSV（`data/backtest_*`），配置 MySQL 时同时写入数据库
+- 结果保存至 CSV（`data/backtest_*`）
 
 退出机制：
-- **止损**：入场价 - ATR × 2
-- **止盈**：MA20（均值回归目标）
+- **止损**：入场价 × (1 - 固定百分比)
+- **止盈**：入场价 × (1 + 固定百分比)
 - **到期**：最大持有4周未触发止损/止盈，按收盘价退出
 
-增量回测自动探测上次结束日期（优先级：MySQL → CSV → 默认起始日期）。
+增量回测自动探测上次结束日期（优先级：CSV → 默认起始日期）。
 
-## MySQL 存储
 
-配置 MySQL 环境变量后，系统自动创建以下表：
-
-| 表名 | 说明 |
-|------|------|
-| `recommendations` | 每日推荐信号记录 |
-| `tracking` | 追踪状态（幂等更新） |
-| `performance_snapshots` | 月度绩效快照 |
-| `backtest_trades` | 回测交易明细 |
-| `backtest_summary` | 回测统计汇总 |
-
-未配置 MySQL 时降级为纯 CSV 存储，不影响任何功能。
 
 ## 通知样例
 
@@ -170,16 +156,12 @@ python src/backtest.py --max-hold-weeks 6 --workers 8
 - 推荐股票列表（代码/名称/评分/信号等级）
 - 交易计划（止损价/止盈价/风险收益比）
 - 周度追踪报告（胜率/平均收益/状态分布）
-- 月度绩效报告（需配置 MySQL）
 
 ## 技术指标
 
 | 指标 | 环节 | 用途 |
 |------|------|------|
-| MA20 | 周线 | 趋势判断 + 止盈目标 |
-| ATR14 | 周线 | 跌幅标准化 + 止损缓冲 |
-| MACD | 周线 | 底背离检测 |
-| CCI14 | 周线 | 超卖区域确认 |
+
 | MA5/MA10 | 日线 | 右侧确认触发 |
 | EMA5/EMA10/EMA20 | 日线 | 趋势反转确认 + 金叉信号 |
 | RSI14 | 日线 | 超卖/超买加减分 |
@@ -187,7 +169,7 @@ python src/backtest.py --max-hold-weeks 6 --workers 8
 ## 数据源
 
 - **数据源**：AkShare（东方财富），单一通道，硬依赖
-- **取数接口**：`stock_zh_a_hist`（个股周线/日线，前复权）、`stock_zh_index_daily`（指数）、`stock_info_a_code_name`（股票列表）、`stock_financial_analysis_indicator` / `stock_balance_sheet_by_report_em` / `stock_profit_sheet_by_report_em`（基本面）
+- **取数接口**：`stock_zh_a_hist`（个股日线，前复权）、`stock_zh_index_daily`（指数）、`stock_info_a_code_name`（股票列表）、`stock_financial_analysis_indicator` / `stock_balance_sheet_by_report_em` / `stock_profit_sheet_by_report_em`（基本面）
 - **失败重试**：请求异常按退避重试（个股 `MAX_RETRY`，股票列表 `LIST_MAX_RETRY`）；「返回空」视为该标的确实无数据，不重试
 - **两级缓存**：内存 `CacheManager`（进程内，`CACHE_EXPIRE_HOURS`）→ `cache/` 目录磁盘 CSV/JSON
   - 行情类按交易日失效：新交易日自动重拉，同日重复运行走缓存

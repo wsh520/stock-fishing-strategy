@@ -27,6 +27,5 @@ Thumbs.db
 data_cache/
 cache/
 
-# 保留 data 目录但忽略缓存
+# 保留 data 目录（其中的 csv 产物需要作为 artifact 上传）
 !data/
-data/*.parquet
