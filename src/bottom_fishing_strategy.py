@@ -1,16 +1,14 @@
 """
-精简版日线选股策略
+精简版日线选股策略（含底背离增强与漏斗日志版）
 
 仅使用日线数据进行选股，简化策略逻辑：
 1. 市场环境过滤（沪深300日线MA20斜率）
 2. 基本面防雷（ROE/负债率/商誉/扣非利润否决）
-3. 日线技术指标筛选（MA5拐头 + EMA金叉 + RSI超卖反弹 + 量价配合）
+3. 日线技术指标筛选（底背离 + MA5拐头 + EMA金叉 + RSI超卖反弹 + 量价配合）
 4. 风险收益比过滤（固定止损止盈）
 
 数据层：单一 AkShare 数据源、统一列名映射、带退避重试、
 磁盘 CSV 缓存（行情按交易日失效 / 列表按 TTL 天失效）、股票池过滤由 config 开关驱动。
-
-evaluate() 为单股实盘选股入口。
 """
 
 from __future__ import annotations
@@ -29,16 +27,13 @@ from typing import Any, Callable, Optional
 import numpy as np
 import pandas as pd
 
-# akshare 首次 import 稍慢，放在模块级。数据源为硬依赖：缺失即视为环境未装好，
-# 应当直接 ImportError 暴露问题，而不是静默降级成「所有取数都返回空」。
 import akshare as ak
 
-# 磁盘缓存默认落在项目根目录下的 cache/，不随进程工作目录变化
 _MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(_MODULE_DIR)
 
 # ===========================================================================
-# 模块级元数据（沿用策略1模式，供 notify 层读取）
+# 模块级元数据
 # ===========================================================================
 
 DISPLAY_COLS = [
@@ -58,6 +53,7 @@ DISPLAY_COLS = [
     ("take_profit", "止盈"),
     ("rr_ratio", "收益比"),
     ("market_env", "市场"),
+    ("has_divergence", "底背离"),
 ]
 
 TITLE = "日线技术指标选股结果"
@@ -65,15 +61,13 @@ PREFIX = "bf"
 SORT_BY = ["score"]
 SORT_ASC = [False]
 
-
 # ===========================================================================
 # StrategyConfig — 所有参数集中外置
 # ===========================================================================
 
-
 @dataclass
 class StrategyConfig:
-    """全部策略参数，带默认值。实例化后可覆盖任意字段用于回测调参。"""
+    """全部策略参数，带默认值。"""
 
     # --- Layer 1: 市场环境 ---
     CSI300_AK_SYMBOL: str = "sh000300"
@@ -95,25 +89,26 @@ class StrategyConfig:
     DAILY_EMA10: int = 10
     DAILY_EMA20: int = 20
     DAILY_RSI_PERIOD: int = 14
-    DAILY_RSI_SHORT_PERIOD: int = 7      # 新增：短期RSI周期
-    DAILY_RSI_LONG_PERIOD: int = 21      # 新增：长期RSI周期
+    DAILY_RSI_SHORT_PERIOD: int = 7
+    DAILY_RSI_LONG_PERIOD: int = 21
     DAILY_RSI_OVERSOLD: float = 30.0
     DAILY_RSI_REBOUND_MIN: float = 35.0
     DAILY_RSI_OVERBOUGHT: float = 70.0
-    DAILY_RSI_DIVERGENCE_THRESHOLD: float = 2.0  # 新增：RSI背离阈值
-    DAILY_MACD_FAST: int = 12           # 新增：MACD快线
-    DAILY_MACD_SLOW: int = 26           # 新增：MACD慢线
-    DAILY_MACD_SIGNAL: int = 9          # 新增：MACD信号线
+    DAILY_RSI_DIVERGENCE_THRESHOLD: float = 2.0
+    DAILY_MACD_FAST: int = 12
+    DAILY_MACD_SLOW: int = 26
+    DAILY_MACD_SIGNAL: int = 9
     DAILY_VOL_EXPAND: float = 1.2
     DAILY_TURNOVER_LOOKBACK: int = 20
+    DIVERGENCE_LOOKBACK: int = 20  # 寻找前期低点的回看周期
 
     # --- Layer 4: 风控 ---
-    FIXED_STOP_LOSS_PCT: float = 5.0  # 固定百分比止损（ATR 缺失时的兜底）
-    FIXED_TAKE_PROFIT_PCT: float = 10.0  # 固定百分比止盈
+    FIXED_STOP_LOSS_PCT: float = 5.0
+    FIXED_TAKE_PROFIT_PCT: float = 10.0
     MIN_RR_RATIO: float = 1.5
-    ATR_PERIOD: int = 14             # 动态止损的 ATR 周期
-    ATR_STOP_MULT: float = 2.0       # 止损 = 入场价 - ATR_STOP_MULT × ATR14
-    USE_ATR_STOP: bool = True        # True: ATR 动态止损；False: 回退固定百分比止损
+    ATR_PERIOD: int = 14
+    ATR_STOP_MULT: float = 2.0
+    USE_ATR_STOP: bool = True
 
     # --- 过滤 ---
     MIN_AMOUNT: float = 5_000_000.0
@@ -124,59 +119,45 @@ class StrategyConfig:
     W_DAILY_EMA_CROSS: float = 25.0
     W_DAILY_RSI_REBOUND: float = 25.0
     W_DAILY_VOL_PRICE: float = 25.0
-    # 多指标共振额外加分（叠加在四项基础分之上）
     DAILY_MULTI_RESONANCE_BONUS: float = 10.0
-    # RSI 超买（>= OVERBOUGHT）惩罚分，从 daily_score 中扣除
     DAILY_RSI_OVERBOUGHT_PENALTY: float = 3.0
+    W_DIVERGENCE_BONUS: float = 30.0  # 底背离极强信号加分
 
     # --- 等级阈值 ---
     GRADE_A: float = 80.0
     GRADE_B: float = 60.0
     GRADE_C: float = 40.0
-    BEAR_GRADE_BOOST: float = 10.0  # 熊市时各等级阈值上浮（收紧过滤）
+    BEAR_GRADE_BOOST: float = 10.0
 
     # --- 基础设施 ---
     CACHE_EXPIRE_HOURS: float = 4.0
     MAX_WORKERS: int = 4
     DAILY_BARS: int = 120
-    WEEKLY_BARS: int = 60  # 周线接口回看周数（get_weekly_data/get_index_weekly 使用）
+    WEEKLY_BARS: int = 60
     FETCH_DELAY: float = 0.05
 
-    # --- 数据获取（对齐 weekly/data.py） ---
-    # 复权方式：qfq 前复权 / hfq 后复权 / "" 不复权
+    # --- 数据获取 ---
     ADJUST: str = "qfq"
-    # 是否启用磁盘缓存（内存 CacheManager 之上再叠一层，跨进程/跨次运行复用）
     USE_CACHE: bool = True
     CACHE_DIR: str = os.path.join(_PROJECT_ROOT, "cache")
-    # 股票列表缓存有效期（天）。列表变化很慢，可缓存较久。
-    # 注意：行情类缓存改为「按交易日失效」——只有当天写入的才算新鲜，
-    # 保证每个新交易日自动重拉最新数据，同日重复跑仍走缓存。
     CACHE_TTL_DAYS: float = 6.0
-    # 基本面缓存有效期（天）。财报按季更新，无需每日重拉。
     FUND_CACHE_TTL_DAYS: float = 7.0
-    # 财务指标接口的起始年份
     FUND_START_YEAR: str = "2023"
-    # 单只标的取数失败的重试次数
     MAX_RETRY: int = 2
-    # 股票列表取数失败的重试次数（列表是全流程第一步，失败即整轮中断，多试几次）
     LIST_MAX_RETRY: int = 4
 
-    # --- 股票池过滤开关（对齐 weekly/config.py，改配置即时生效无需清缓存） ---
-    FILTER_ST: bool = True          # 过滤 ST/*ST
-    EXCLUDE_DELISTING: bool = True  # 剔除退市整理期（名称含「退」）
-    EXCLUDE_BSE: bool = True        # 剔除北交所（8/4 开头，交易规则不同）
-    EXCLUDE_CHINEXT: bool = False   # 剔除创业板（300/301 开头）
-    EXCLUDE_STAR: bool = False      # 剔除科创板（688/689 开头）
-
+    # --- 股票池过滤开关 ---
+    FILTER_ST: bool = True
+    EXCLUDE_DELISTING: bool = True
+    EXCLUDE_BSE: bool = True
+    EXCLUDE_CHINEXT: bool = False
+    EXCLUDE_STAR: bool = False
 
 # ===========================================================================
 # CacheManager — 内存TTL缓存
 # ===========================================================================
 
-
 class CacheManager:
-    """带过期时间的内存缓存，避免同一运行周期内重复请求。"""
-
     def __init__(self, expire_hours: float = 4.0):
         self._expire_seconds = expire_hours * 3600
         self._store: dict[str, tuple[float, Any]] = {}
@@ -195,69 +176,24 @@ class CacheManager:
     def clear(self) -> None:
         self._store.clear()
 
-
 # ===========================================================================
 # 数据提供层 — AkShare
 # ===========================================================================
 
-
 def _ak_code_to_symbol(code: str) -> str:
-    """将6位数字代码转为 AkShare stock_zh_a_hist 所需的纯数字 symbol。"""
     c = code.replace("sh.", "").replace("sz.", "").replace("bj.", "")
     return c.zfill(6)
 
-
-# ---------------------------------------------------------------------------
-# 列名映射（模块级唯一来源，避免各取数函数重复定义 rename dict）
-# ---------------------------------------------------------------------------
-
-# stock_zh_a_hist 返回中文列名；_COLUMN_MAP 的值顺序即输出列顺序
 _COLUMN_MAP = {
-    "日期": "date",
-    "开盘": "open",
-    "收盘": "close",
-    "最高": "high",
-    "最低": "low",
-    "成交量": "volume",
-    "成交额": "amount",
-    "振幅": "amplitude",
-    "涨跌幅": "pct_chg",
-    "涨跌额": "change",
-    "换手率": "turnover",
+    "日期": "date", "开盘": "open", "收盘": "close", "最高": "high",
+    "最低": "low", "成交量": "volume", "成交额": "amount", "振幅": "amplitude",
+    "涨跌幅": "pct_chg", "涨跌额": "change", "换手率": "turnover",
 }
-
-# 需要强制转数值的列。date 保持 'YYYY-MM-DD' 字符串：
-# 下游指标计算、回测与 CSV/MySQL 落库均依赖该格式。
-_NUMERIC_COLS = (
-    "open", "close", "high", "low", "volume",
-    "amount", "amplitude", "pct_chg", "change", "turnover",
-)
-
-# 指数日线（stock_zh_index_daily）本身就是英文列名，只需转数值
+_NUMERIC_COLS = ("open", "close", "high", "low", "volume", "amount", "amplitude", "pct_chg", "change", "turnover")
 _INDEX_NUMERIC_COLS = ("open", "high", "low", "close", "volume")
-
 _DATE_FMT = "%Y-%m-%d"
 
-
-# ---------------------------------------------------------------------------
-# 重试
-# ---------------------------------------------------------------------------
-
-
-def _fetch_with_retry(
-    fetcher: Callable[[], Optional[pd.DataFrame]],
-    max_retry: int,
-    label: str,
-    retry_on_empty: bool = False,
-) -> Optional[pd.DataFrame]:
-    """带退避重试地执行一次 akshare 请求，失败返回 None。
-
-    东财接口偶发连接重置与限流，重试比直接放弃划算得多。
-
-    retry_on_empty=False（默认）：「返回空」被视为该标的确实没有数据（如次新股、
-    停牌区间），立即返回不再重试，只对抛异常的情况重试。
-    retry_on_empty=True：用于股票列表这类「空即异常」的场景。
-    """
+def _fetch_with_retry(fetcher: Callable[[], Optional[pd.DataFrame]], max_retry: int, label: str, retry_on_empty: bool = False) -> Optional[pd.DataFrame]:
     last_err: Optional[Exception] = None
     for attempt in range(max_retry + 1):
         try:
@@ -267,73 +203,51 @@ def _fetch_with_retry(
             if not retry_on_empty:
                 return None
             last_err = RuntimeError(f"{label} 返回空")
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             last_err = e
         if attempt < max_retry:
             time.sleep(0.5 * (attempt + 1))
-    # 全市场扫描下逐只打印会刷屏，降级为 debug，由上层统计失败数
     logging.debug("%s 获取失败（已重试 %d 次）: %s", label, max_retry, last_err)
     return None
-
-
-# ---------------------------------------------------------------------------
-# 磁盘缓存（内存 CacheManager 之下的第二层，跨进程/跨次运行复用）
-# ---------------------------------------------------------------------------
-
 
 def _cache_path(config: StrategyConfig, name: str) -> str:
     os.makedirs(config.CACHE_DIR, exist_ok=True)
     return os.path.join(config.CACHE_DIR, name)
 
-
 def _cache_fresh(path: str, ttl_days: float) -> bool:
-    """缓存是否在 ttl_days 内写入。"""
     if not os.path.exists(path):
         return False
     mtime = datetime.fromtimestamp(os.path.getmtime(path))
     return datetime.now() - mtime < timedelta(days=ttl_days)
 
-
 def _cache_fresh_today(path: str) -> bool:
-    """缓存是否为「今天」写入的（跨交易日自动失效）。
-
-    行情类数据用这个口径：每个新交易日（含当周最后一根周K收盘）会自动重拉，
-    避免读到上一交易日的旧数据；同一天内重复运行仍走缓存，保证速度。
-    """
     if not os.path.exists(path):
         return False
     mtime = datetime.fromtimestamp(os.path.getmtime(path))
     return mtime.date() == datetime.now().date()
 
-
 def _read_cache_csv(path: str, dtype: Optional[dict] = None) -> Optional[pd.DataFrame]:
-    """读取缓存 CSV。读失败（文件损坏/半截）当作未命中，由调用方重新拉取。"""
     try:
         df = pd.read_csv(path, dtype=dtype or {"date": str})
         return df if not df.empty else None
-    except Exception:  # noqa: BLE001
+    except Exception:
         return None
 
-
 def _write_cache_csv(df: pd.DataFrame, path: str) -> None:
-    """原子写入：先写临时文件再 os.replace，避免并发或中断留下半截缓存。"""
     tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
     try:
         df.to_csv(tmp, index=False)
         os.replace(tmp, path)
-    except Exception as e:  # noqa: BLE001
-        # 缓存只是加速手段，写失败不影响主流程；残留 .tmp 由下次同名写入覆盖
+    except Exception as e:
         logging.debug("写缓存失败 %s: %s", path, e)
-
 
 def _read_cache_json(path: str) -> Optional[dict]:
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
         return data if isinstance(data, dict) else None
-    except Exception:  # noqa: BLE001
+    except Exception:
         return None
-
 
 def _write_cache_json(obj: dict, path: str) -> None:
     tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
@@ -341,20 +255,10 @@ def _write_cache_json(obj: dict, path: str) -> None:
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(obj, f, ensure_ascii=False)
         os.replace(tmp, path)
-    except Exception:  # noqa: BLE001
+    except Exception:
         pass
 
-
-# ---------------------------------------------------------------------------
-# 列名与类型规整
-# ---------------------------------------------------------------------------
-
-
 def _normalize_hist(raw: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
-    """把 stock_zh_a_hist 的中文列原始数据规整为统一英文列。
-
-    只保留 _COLUMN_MAP 中声明的列（丢掉「股票代码」等冗余列），按日期升序排列。
-    """
     if raw is None or raw.empty:
         return None
     df = raw.rename(columns=_COLUMN_MAP)
@@ -371,117 +275,46 @@ def _normalize_hist(raw: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
         return None
     return df.sort_values("date").reset_index(drop=True)
 
-
-# ---------------------------------------------------------------------------
-# 个股 K 线
-# ---------------------------------------------------------------------------
-
-
-def _fetch_hist(
-    code: str,
-    period: str,
-    start: str,
-    end: str,
-    config: StrategyConfig,
-    cache_name: Optional[str] = None,
-) -> Optional[pd.DataFrame]:
-    """取个股 K 线。period: daily / weekly，start/end 格式 YYYYMMDD。
-
-    cache_name 显式指定磁盘缓存文件名；缺省时按区间命名。缓存按交易日失效。
-    """
+def _fetch_hist(code: str, period: str, start: str, end: str, config: StrategyConfig, cache_name: Optional[str] = None) -> Optional[pd.DataFrame]:
     symbol = _ak_code_to_symbol(code)
     path = ""
     if config.USE_CACHE:
-        name = cache_name or (
-            f"{period}_{symbol}_{start}_{end}_{config.ADJUST or 'none'}.csv"
-        )
+        name = cache_name or f"{period}_{symbol}_{start}_{end}_{config.ADJUST or 'none'}.csv"
         path = _cache_path(config, name)
         if _cache_fresh_today(path):
             cached = _read_cache_csv(path)
             if cached is not None:
                 return cached
-
     raw = _fetch_with_retry(
-        lambda: ak.stock_zh_a_hist(
-            symbol=symbol,
-            period=period,
-            start_date=start,
-            end_date=end,
-            adjust=config.ADJUST,
-        ),
-        config.MAX_RETRY,
-        f"stock_zh_a_hist({symbol},{period})",
+        lambda: ak.stock_zh_a_hist(symbol=symbol, period=period, start_date=start, end_date=end, adjust=config.ADJUST),
+        config.MAX_RETRY, f"stock_zh_a_hist({symbol},{period})"
     )
     df = _normalize_hist(raw)
     if df is not None and path:
         _write_cache_csv(df, path)
     return df
 
-
-def fetch_weekly_range(
-    code: str, start: str, end: str, config: Optional[StrategyConfig] = None,
-) -> Optional[pd.DataFrame]:
-    """获取个股指定区间的周线数据。start/end 格式 YYYYMMDD。"""
-    return _fetch_hist(code, "weekly", start, end, config or StrategyConfig())
-
-
-def fetch_daily_range(
-    code: str, start: str, end: str, config: Optional[StrategyConfig] = None,
-) -> Optional[pd.DataFrame]:
-    """获取个股指定区间的日线数据。start/end 格式 YYYYMMDD。"""
-    return _fetch_hist(code, "daily", start, end, config or StrategyConfig())
-
-
 def _window_dates(bars: int, unit: str) -> tuple[str, str]:
-    """把「回看 N 周 / N 天」换算成 (start, end) 的 YYYYMMDD 字符串。"""
     end = datetime.now()
     delta = timedelta(weeks=bars) if unit == "weeks" else timedelta(days=bars)
     return (end - delta).strftime("%Y%m%d"), end.strftime("%Y%m%d")
 
-
 def _window_cache_name(period: str, symbol: str, bars: int, config: StrategyConfig) -> str:
-    """实盘「回看 N 根」路径的缓存文件名。
-
-    区间由「今天」推算，每天都不同；若把日期写进文件名，每个新交易日都会为每只
-    股票新建一份缓存，磁盘无限膨胀。因此这里只用 (周期, 代码, 回看根数, 复权方式)
-    命名，配合按交易日失效——每天覆盖同一个文件（与 weekly/data.py 的做法一致）。
-    """
     return f"{period}_{symbol}_last{bars}_{config.ADJUST or 'none'}.csv"
 
-
-def _fetch_weekly_akshare(
-    code: str, weeks: int = 60, config: Optional[StrategyConfig] = None,
-) -> Optional[pd.DataFrame]:
-    """通过 AkShare 获取个股周线数据（回看 weeks 周）。"""
+def _fetch_weekly_akshare(code: str, weeks: int = 60, config: Optional[StrategyConfig] = None) -> Optional[pd.DataFrame]:
     config = config or StrategyConfig()
     start, end = _window_dates(weeks, "weeks")
     name = _window_cache_name("weekly", _ak_code_to_symbol(code), weeks, config)
     return _fetch_hist(code, "weekly", start, end, config, cache_name=name)
 
-
-def _fetch_daily_akshare(
-    code: str, days: int = 120, config: Optional[StrategyConfig] = None,
-) -> Optional[pd.DataFrame]:
-    """通过 AkShare 获取个股日线数据（回看 days 天）。"""
+def _fetch_daily_akshare(code: str, days: int = 120, config: Optional[StrategyConfig] = None) -> Optional[pd.DataFrame]:
     config = config or StrategyConfig()
     start, end = _window_dates(days, "days")
     name = _window_cache_name("daily", _ak_code_to_symbol(code), days, config)
     return _fetch_hist(code, "daily", start, end, config, cache_name=name)
 
-
-# ---------------------------------------------------------------------------
-# 指数 K 线
-# ---------------------------------------------------------------------------
-
-
-def _fetch_index_daily_raw(
-    symbol: str, config: StrategyConfig,
-) -> Optional[pd.DataFrame]:
-    """取指数日线全量历史。
-
-    stock_zh_index_daily 不支持区间参数，只能全量拉取后在本地切片。全量历史较大，
-    因此按交易日缓存一次，供实盘与回测的所有区间共用。
-    """
+def _fetch_index_daily_raw(symbol: str, config: StrategyConfig) -> Optional[pd.DataFrame]:
     path = ""
     if config.USE_CACHE:
         path = _cache_path(config, f"index_daily_{symbol}.csv")
@@ -489,16 +322,12 @@ def _fetch_index_daily_raw(
             cached = _read_cache_csv(path)
             if cached is not None:
                 return cached
-
     raw = _fetch_with_retry(
         lambda: ak.stock_zh_index_daily(symbol=symbol),
-        config.MAX_RETRY,
-        f"stock_zh_index_daily({symbol})",
-        retry_on_empty=True,
+        config.MAX_RETRY, f"stock_zh_index_daily({symbol})", retry_on_empty=True
     )
     if raw is None:
         return None
-
     df = raw.copy()
     if "date" not in df.columns or "close" not in df.columns:
         return None
@@ -514,525 +343,233 @@ def _fetch_index_daily_raw(
         _write_cache_csv(df, path)
     return df
 
-
-def fetch_index_weekly_range(
-    symbol: str, start: str, end: str, config: Optional[StrategyConfig] = None,
-) -> Optional[pd.DataFrame]:
-    """获取指数指定区间的周线数据（日线切片后按周聚合）。start/end 格式 YYYYMMDD。"""
+def fetch_index_weekly_range(symbol: str, start: str, end: str, config: Optional[StrategyConfig] = None) -> Optional[pd.DataFrame]:
     config = config or StrategyConfig()
     df = _fetch_index_daily_raw(symbol, config)
-    if df is None:
-        return None
-
+    if df is None: return None
     dt = pd.to_datetime(df["date"])
     sub = df[(dt >= pd.to_datetime(start)) & (dt <= pd.to_datetime(end))].copy()
-    if sub.empty:
-        return None
-
+    if sub.empty: return None
     agg = {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
     agg = {k: v for k, v in agg.items() if k in sub.columns}
     sub["_dt"] = pd.to_datetime(sub["date"])
-    weekly = (
-        sub.set_index("_dt").resample("W").agg(agg).dropna(subset=["close"]).reset_index()
-    )
+    weekly = sub.set_index("_dt").resample("W").agg(agg).dropna(subset=["close"]).reset_index()
     weekly["date"] = weekly["_dt"].dt.strftime(_DATE_FMT)
-    weekly = weekly.drop(columns=["_dt"])
-    return weekly if not weekly.empty else None
+    return weekly.drop(columns=["_dt"])
 
-
-def _fetch_index_weekly_akshare(
-    symbol: str = "sh000300", weeks: int = 60, config: Optional[StrategyConfig] = None,
-) -> Optional[pd.DataFrame]:
-    """通过 AkShare 获取指数周线数据（回看 weeks 周）。"""
+def _fetch_index_weekly_akshare(symbol: str = "sh000300", weeks: int = 60, config: Optional[StrategyConfig] = None) -> Optional[pd.DataFrame]:
     config = config or StrategyConfig()
     start, end = _window_dates(weeks, "weeks")
     return fetch_index_weekly_range(symbol, start, end, config)
 
-
-# ---------------------------------------------------------------------------
-# 基本面
-# ---------------------------------------------------------------------------
-
-
-def _fetch_fundamentals_akshare(
-    code: str, config: Optional[StrategyConfig] = None,
-) -> Optional[dict]:
-    """通过 AkShare 获取基本面数据：ROE、负债率、商誉占比、扣非比。
-
-    三张报表各自独立取数，任一失败不影响其余项；至少一项有效才返回。
-    磁盘缓存按 FUND_CACHE_TTL_DAYS 失效——财报按季更新，无需每个交易日重拉。
-    """
+def _fetch_fundamentals_akshare(code: str, config: Optional[StrategyConfig] = None) -> Optional[dict]:
     config = config or StrategyConfig()
     symbol = _ak_code_to_symbol(code)
-
     path = ""
     if config.USE_CACHE:
         path = _cache_path(config, f"fund_{symbol}.json")
         if _cache_fresh(path, config.FUND_CACHE_TTL_DAYS):
             cached = _read_cache_json(path)
-            if cached is not None:
-                return cached
+            if cached is not None: return cached
 
-    result: dict[str, Optional[float]] = {
-        "roe": None,
-        "debt_ratio": None,
-        "goodwill_ratio": None,
-        "deducted_profit_ratio": None,
-    }
-
-    # ROE + 负债率：财务指标
-    df_fin = _fetch_with_retry(
-        lambda: ak.stock_financial_analysis_indicator(
-            symbol=symbol, start_year=config.FUND_START_YEAR,
-        ),
-        config.MAX_RETRY,
-        f"stock_financial_analysis_indicator({symbol})",
-    )
+    result: dict[str, Optional[float]] = {"roe": None, "debt_ratio": None, "goodwill_ratio": None, "deducted_profit_ratio": None}
+    
+    df_fin = _fetch_with_retry(lambda: ak.stock_financial_analysis_indicator(symbol=symbol, start_year=config.FUND_START_YEAR), config.MAX_RETRY, f"fund({symbol})")
     if df_fin is not None:
-        # 取最近一期
         row = df_fin.iloc[0]
         for col in df_fin.columns:
-            col_str = str(col)
-            col_lower = col_str.lower()
+            col_str, col_lower = str(col), str(col).lower()
             if "净资产收益率" in col_str or "roe" in col_lower:
                 val = pd.to_numeric(row[col], errors="coerce")
-                if not pd.isna(val):
-                    result["roe"] = float(val)
+                if not pd.isna(val): result["roe"] = float(val)
             if "资产负债率" in col_str or "debt" in col_lower:
                 val = pd.to_numeric(row[col], errors="coerce")
-                if not pd.isna(val):
-                    result["debt_ratio"] = float(val)
+                if not pd.isna(val): result["debt_ratio"] = float(val)
 
-    # 商誉占比：资产负债表
-    df_bs = _fetch_with_retry(
-        lambda: ak.stock_balance_sheet_by_report_em(symbol=symbol),
-        config.MAX_RETRY,
-        f"stock_balance_sheet_by_report_em({symbol})",
-    )
+    df_bs = _fetch_with_retry(lambda: ak.stock_balance_sheet_by_report_em(symbol=symbol), config.MAX_RETRY, f"bs({symbol})")
     if df_bs is not None:
         row = df_bs.iloc[0]
-        goodwill = 0.0
-        net_assets = 0.0
+        goodwill, net_assets = 0.0, 0.0
         for col in df_bs.columns:
-            col_str = str(col)
-            if "商誉" in col_str:
+            if "商誉" in str(col):
                 val = pd.to_numeric(row.get(col), errors="coerce")
-                if not pd.isna(val):
-                    goodwill = float(val)
-            if "股东权益合计" in col_str or "净资产" in col_str:
+                if not pd.isna(val): goodwill = float(val)
+            if "股东权益合计" in str(col) or "净资产" in str(col):
                 val = pd.to_numeric(row.get(col), errors="coerce")
-                if not pd.isna(val) and val > 0:
-                    net_assets = float(val)
-        if net_assets > 0:
-            result["goodwill_ratio"] = goodwill / net_assets * 100
+                if not pd.isna(val) and val > 0: net_assets = float(val)
+        if net_assets > 0: result["goodwill_ratio"] = goodwill / net_assets * 100
 
-    # 扣非利润占比：利润表
-    df_income = _fetch_with_retry(
-        lambda: ak.stock_profit_sheet_by_report_em(symbol=symbol),
-        config.MAX_RETRY,
-        f"stock_profit_sheet_by_report_em({symbol})",
-    )
+    df_income = _fetch_with_retry(lambda: ak.stock_profit_sheet_by_report_em(symbol=symbol), config.MAX_RETRY, f"income({symbol})")
     if df_income is not None:
         row = df_income.iloc[0]
-        net_profit = 0.0
-        deducted_profit = 0.0
+        net_profit, deducted_profit = 0.0, 0.0
         for col in df_income.columns:
             col_str = str(col)
             if "净利润" in col_str and "扣" not in col_str and "归" not in col_str:
                 val = pd.to_numeric(row.get(col), errors="coerce")
-                if not pd.isna(val):
-                    net_profit = float(val)
+                if not pd.isna(val): net_profit = float(val)
             if "扣非" in col_str or "扣除非经常" in col_str:
                 val = pd.to_numeric(row.get(col), errors="coerce")
-                if not pd.isna(val):
-                    deducted_profit = float(val)
-        if net_profit > 0:
-            result["deducted_profit_ratio"] = deducted_profit / net_profit
+                if not pd.isna(val): deducted_profit = float(val)
+        if net_profit > 0: result["deducted_profit_ratio"] = deducted_profit / net_profit
 
-    # 至少有一项有效数据才返回
-    if not any(v is not None for v in result.values()):
-        return None
-    if path:
-        _write_cache_json(result, path)
+    if not any(v is not None for v in result.values()): return None
+    if path: _write_cache_json(result, path)
     return result
 
-
-# ---------------------------------------------------------------------------
-# 股票池
-# ---------------------------------------------------------------------------
-
-
 def _fetch_stock_list_raw(config: StrategyConfig) -> Optional[pd.DataFrame]:
-    """拉取全 A 股列表（列: code, name），带重试。
-
-    列表是全流程第一步，失败即整轮中断，因此用 LIST_MAX_RETRY 多试几次，
-    且「返回空」也视为异常需要重试。
-    """
-    raw = _fetch_with_retry(
-        lambda: ak.stock_info_a_code_name(),
-        config.LIST_MAX_RETRY,
-        "stock_info_a_code_name",
-        retry_on_empty=True,
-    )
-    if raw is None:
-        return None
-    if "code" not in raw.columns or "name" not in raw.columns:
-        return None
+    raw = _fetch_with_retry(lambda: ak.stock_info_a_code_name(), config.LIST_MAX_RETRY, "stock_info", retry_on_empty=True)
+    if raw is None or "code" not in raw.columns or "name" not in raw.columns: return None
     df = raw[["code", "name"]].copy()
     df["code"] = df["code"].astype(str).str.zfill(6)
     df["name"] = df["name"].astype(str)
     return df.reset_index(drop=True)
 
-
 def _apply_universe_filters(df: pd.DataFrame, config: StrategyConfig) -> pd.DataFrame:
-    """按 config 开关过滤股票池。
-
-    过滤在每次返回时应用（而非写缓存前），因此改配置即时生效，无需清缓存。
-    """
     out = df.copy()
     out["code"] = out["code"].astype(str).str.zfill(6)
     out["name"] = out["name"].astype(str)
-
-    if config.EXCLUDE_BSE:
-        # 北交所以 8 / 4 开头
-        out = out[~out["code"].str.startswith(("8", "4"))]
-
-    if config.EXCLUDE_CHINEXT:
-        # 创业板以 300 / 301 开头
-        out = out[~out["code"].str.startswith(("300", "301"))]
-
-    if config.EXCLUDE_STAR:
-        # 科创板以 688 / 689 开头
-        out = out[~out["code"].str.startswith(("688", "689"))]
-
-    if config.FILTER_ST:
-        out = out[~out["name"].str.contains("ST", case=False, na=False)]
-
-    if config.EXCLUDE_DELISTING:
-        # 退市整理期个股名称含「退」
-        out = out[~out["name"].str.contains("退", na=False)]
-
+    if config.EXCLUDE_BSE: out = out[~out["code"].str.startswith(("8", "4"))]
+    if config.EXCLUDE_CHINEXT: out = out[~out["code"].str.startswith(("300", "301"))]
+    if config.EXCLUDE_STAR: out = out[~out["code"].str.startswith(("688", "689"))]
+    if config.FILTER_ST: out = out[~out["name"].str.contains("ST", case=False, na=False)]
+    if config.EXCLUDE_DELISTING: out = out[~out["name"].str.contains("退", na=False)]
     return out.reset_index(drop=True)
 
-
-def _fetch_stock_pool_akshare(
-    config: Optional[StrategyConfig] = None,
-) -> list[dict]:
-    """获取全A股票列表，返回 [{"code": "000001", "name": "平安银行"}, ...]。
-
-    磁盘缓存只存未过滤的原始全量列表（按 CACHE_TTL_DAYS 失效，列表变化很慢）。
-    """
+def _fetch_stock_pool_akshare(config: Optional[StrategyConfig] = None) -> list[dict]:
     config = config or StrategyConfig()
-
     path = ""
     df: Optional[pd.DataFrame] = None
     if config.USE_CACHE:
         path = _cache_path(config, "stock_list.csv")
         if _cache_fresh(path, config.CACHE_TTL_DAYS):
             df = _read_cache_csv(path, dtype={"code": str, "name": str})
-            if df is not None and ("code" not in df.columns or "name" not in df.columns):
-                df = None
-
+            if df is not None and ("code" not in df.columns or "name" not in df.columns): df = None
     if df is None:
         df = _fetch_stock_list_raw(config)
-        if df is None:
-            logging.error("获取股票列表失败（已重试 %d 次）", config.LIST_MAX_RETRY)
-            return []
-        if path:
-            _write_cache_csv(df, path)
-
+        if df is None: return []
+        if path: _write_cache_csv(df, path)
     return _apply_universe_filters(df, config).to_dict("records")
 
-
 # ===========================================================================
-# 统一数据接口（AkShare 单一数据源 + 两级缓存：内存 → 磁盘）
+# 统一数据接口
 # ===========================================================================
 
-
-def get_weekly_data(
-    code: str, config: StrategyConfig, cache: Optional[CacheManager] = None,
-) -> Optional[pd.DataFrame]:
-    """获取个股周线数据。"""
+def get_weekly_data(code: str, config: StrategyConfig, cache: Optional[CacheManager] = None) -> Optional[pd.DataFrame]:
     cache_key = f"weekly_{code}"
-    if cache:
-        cached = cache.get(cache_key)
-        if cached is not None:
-            return cached
-
+    if cache and (cached := cache.get(cache_key)) is not None: return cached
     df = _fetch_weekly_akshare(code, weeks=config.WEEKLY_BARS, config=config)
-
-    if cache and df is not None:
-        cache.set(cache_key, df)
+    if cache and df is not None: cache.set(cache_key, df)
     return df
 
-
-def get_daily_data(
-    code: str, config: StrategyConfig, cache: Optional[CacheManager] = None,
-) -> Optional[pd.DataFrame]:
-    """获取个股日线数据。"""
+def get_daily_data(code: str, config: StrategyConfig, cache: Optional[CacheManager] = None) -> Optional[pd.DataFrame]:
     cache_key = f"daily_{code}"
-    if cache:
-        cached = cache.get(cache_key)
-        if cached is not None:
-            return cached
-
+    if cache and (cached := cache.get(cache_key)) is not None: return cached
     df = _fetch_daily_akshare(code, days=config.DAILY_BARS, config=config)
-
-    if cache and df is not None:
-        cache.set(cache_key, df)
+    if cache and df is not None: cache.set(cache_key, df)
     return df
 
-
-def get_index_daily(
-    config: StrategyConfig, cache: Optional[CacheManager] = None,
-) -> Optional[pd.DataFrame]:
-    """获取沪深300指数日线数据。"""
+def get_index_daily(config: StrategyConfig, cache: Optional[CacheManager] = None) -> Optional[pd.DataFrame]:
     cache_key = "index_daily_csi300"
-    if cache:
-        cached = cache.get(cache_key)
-        if cached is not None:
-            return cached
-
+    if cache and (cached := cache.get(cache_key)) is not None: return cached
     df = _fetch_index_daily_raw(config.CSI300_AK_SYMBOL, config)
-    # 取最近的DAILY_BARS个交易日
     if df is not None and len(df) > config.DAILY_BARS:
         df = df.tail(config.DAILY_BARS).reset_index(drop=True)
-
-    if cache and df is not None:
-        cache.set(cache_key, df)
+    if cache and df is not None: cache.set(cache_key, df)
     return df
 
-
-def get_index_weekly(
-    config: StrategyConfig, cache: Optional[CacheManager] = None,
-) -> Optional[pd.DataFrame]:
-    """获取沪深300指数周线数据。"""
+def get_index_weekly(config: StrategyConfig, cache: Optional[CacheManager] = None) -> Optional[pd.DataFrame]:
     cache_key = "index_weekly_csi300"
-    if cache:
-        cached = cache.get(cache_key)
-        if cached is not None:
-            return cached
-
-    df = _fetch_index_weekly_akshare(
-        symbol=config.CSI300_AK_SYMBOL, weeks=config.WEEKLY_BARS, config=config,
-    )
-
-    if cache and df is not None:
-        cache.set(cache_key, df)
+    if cache and (cached := cache.get(cache_key)) is not None: return cached
+    df = _fetch_index_weekly_akshare(symbol=config.CSI300_AK_SYMBOL, weeks=config.WEEKLY_BARS, config=config)
+    if cache and df is not None: cache.set(cache_key, df)
     return df
 
-
-def get_fundamentals(
-    code: str,
-    cache: Optional[CacheManager] = None,
-    config: Optional[StrategyConfig] = None,
-) -> Optional[dict]:
-    """获取基本面数据。"""
+def get_fundamentals(code: str, cache: Optional[CacheManager] = None, config: Optional[StrategyConfig] = None) -> Optional[dict]:
     cache_key = f"fund_{code}"
-    if cache:
-        cached = cache.get(cache_key)
-        if cached is not None:
-            return cached
-
+    if cache and (cached := cache.get(cache_key)) is not None: return cached
     data = _fetch_fundamentals_akshare(code, config)
-    if cache and data is not None:
-        cache.set(cache_key, data)
+    if cache and data is not None: cache.set(cache_key, data)
     return data
 
-
-def get_stock_list(
-    config: StrategyConfig, cache: Optional[CacheManager] = None,
-) -> list[dict]:
-    """获取待筛选股票列表。"""
+def get_stock_list(config: StrategyConfig, cache: Optional[CacheManager] = None) -> list[dict]:
     cache_key = "stock_list"
-    if cache:
-        cached = cache.get(cache_key)
-        if cached is not None:
-            return cached
-
+    if cache and (cached := cache.get(cache_key)) is not None: return cached
     stocks = _fetch_stock_pool_akshare(config)
-    if cache and stocks:
-        cache.set(cache_key, stocks)
+    if cache and stocks: cache.set(cache_key, stocks)
     return stocks
 
-
 # ===========================================================================
-# Layer 1: 市场环境计算（纯函数）
+# Layer 1 & 2
 # ===========================================================================
 
-
-def compute_market_environment(
-    df_index: pd.DataFrame, config: StrategyConfig,
-) -> dict:
-    """根据沪深300周线MA20斜率判断牛/熊/中性环境。
-
-    纯函数：输入指数周线DataFrame，输出环境描述dict。
-    """
+def compute_market_environment(df_index: pd.DataFrame, config: StrategyConfig) -> dict:
     if df_index is None or df_index.empty or len(df_index) < config.MARKET_MA_PERIOD + config.MARKET_SLOPE_LOOKBACK:
         return {"regime": "unknown", "description": "数据不足", "ma20": 0, "slope": 0, "close": 0}
-
     df = df_index.copy().reset_index(drop=True)
     df["ma"] = df["close"].rolling(config.MARKET_MA_PERIOD).mean()
-
-    cur = df.iloc[-1]
-    prev = df.iloc[-(1 + config.MARKET_SLOPE_LOOKBACK)]
-
-    ma_now = float(cur["ma"])
-    ma_prev = float(prev["ma"])
-    close_now = float(cur["close"])
-
+    cur, prev = df.iloc[-1], df.iloc[-(1 + config.MARKET_SLOPE_LOOKBACK)]
+    ma_now, ma_prev, close_now = float(cur["ma"]), float(prev["ma"]), float(cur["close"])
     slope = (ma_now - ma_prev) / ma_prev if ma_prev > 0 else 0.0
-
     if slope > config.MARKET_BULL_SLOPE:
-        regime = "bull"
-        desc = f"偏多（MA20斜率 {slope:.4f}，沪深300收于 {close_now:.0f}）"
+        regime, desc = "bull", f"偏多（MA20斜率 {slope:.4f}，沪深300收于 {close_now:.0f}）"
     elif slope < config.MARKET_BEAR_SLOPE:
-        regime = "bear"
-        desc = f"偏空（MA20斜率 {slope:.4f}，沪深300收于 {close_now:.0f}）"
+        regime, desc = "bear", f"偏空（MA20斜率 {slope:.4f}，沪深300收于 {close_now:.0f}）"
     else:
-        regime = "neutral"
-        desc = f"中性（MA20斜率 {slope:.4f}，沪深300收于 {close_now:.0f}）"
+        regime, desc = "neutral", f"中性（MA20斜率 {slope:.4f}，沪深300收于 {close_now:.0f}）"
+    return {"regime": regime, "description": desc, "ma20": round(ma_now, 2), "slope": round(slope, 6), "close": round(close_now, 2)}
 
-    return {
-        "regime": regime,
-        "description": desc,
-        "ma20": round(ma_now, 2),
-        "slope": round(slope, 6),
-        "close": round(close_now, 2),
-    }
-
-
-
-# ===========================================================================
-# Layer 2: 基本面防雷（纯函数）
-# ===========================================================================
-
-
-def check_fundamentals(
-    fund_data: Optional[dict], config: StrategyConfig,
-) -> bool:
-    """否决制基本面筛选。任一指标不达标即拒绝。
-
-    fund_data 为 None 时放行（不因数据缺失误杀）。
-    """
-    if fund_data is None:
-        return True
-
-    roe = fund_data.get("roe")
-    if roe is not None and roe < config.MIN_ROE:
-        return False
-
-    debt = fund_data.get("debt_ratio")
-    if debt is not None and debt > config.MAX_DEBT_RATIO:
-        return False
-
-    goodwill = fund_data.get("goodwill_ratio")
-    if goodwill is not None and goodwill > config.MAX_GOODWILL_RATIO:
-        return False
-
-    deducted = fund_data.get("deducted_profit_ratio")
-    if deducted is not None and deducted < config.MIN_DEDUCTED_PROFIT_RATIO:
-        return False
-
+def check_fundamentals(fund_data: Optional[dict], config: StrategyConfig) -> bool:
+    if fund_data is None: return True
+    if (roe := fund_data.get("roe")) is not None and roe < config.MIN_ROE: return False
+    if (debt := fund_data.get("debt_ratio")) is not None and debt > config.MAX_DEBT_RATIO: return False
+    if (goodwill := fund_data.get("goodwill_ratio")) is not None and goodwill > config.MAX_GOODWILL_RATIO: return False
+    if (deducted := fund_data.get("deducted_profit_ratio")) is not None and deducted < config.MIN_DEDUCTED_PROFIT_RATIO: return False
     return True
 
-
 # ===========================================================================
-# Layer 3: 日线技术指标信号（纯函数，向量化）
+# Layer 3: 日线技术指标信号
 # ===========================================================================
 
 _DAILY_NEED_COLS = {"close", "volume", "date", "high", "low", "pct_chg", "turnover"}
 
-
-def compute_daily_signals(
-    df: pd.DataFrame, config: StrategyConfig,
-) -> Optional[pd.DataFrame]:
-    """向量化计算日线技术指标信号与评分。
-
-    评分项（clip 到 0-100 分）:
-      - MA5拐头:          0-25分
-      - EMA5/10金叉:      0-25分
-      - RSI超卖反弹:      0-25分
-      - 量价配合+换手率:  0-25分
-      - 多指标共振加分:   +10分（默认）
-      - RSI超买惩罚:      -3分（默认）
-    同时计算 ATR（供动态止损使用）。
-    """
-    if df is None or df.empty:
-        return None
-    if not _DAILY_NEED_COLS.issubset(df.columns):
-        return None
-    if len(df) < config.MIN_DAYS:
+def compute_daily_signals(df: pd.DataFrame, config: StrategyConfig) -> Optional[pd.DataFrame]:
+    if df is None or df.empty or not _DAILY_NEED_COLS.issubset(df.columns) or len(df) < config.MIN_DAYS:
         return None
 
     out = df.copy().reset_index(drop=True)
 
-    # MA5, MA10
     out["ma5"] = out["close"].rolling(config.DAILY_MA5).mean()
     out["ma10"] = out["close"].rolling(config.DAILY_MA10).mean()
-
-    # EMA5, EMA10, EMA20
     out["ema5"] = out["close"].ewm(span=config.DAILY_EMA5, adjust=False).mean()
     out["ema10"] = out["close"].ewm(span=config.DAILY_EMA10, adjust=False).mean()
     out["ema20"] = out["close"].ewm(span=config.DAILY_EMA20, adjust=False).mean()
 
-    # RSI计算（多周期）
-    # RSI14
-    delta = out["close"].diff()
-    gain = delta.clip(lower=0)
-    loss = (-delta).clip(lower=0)
-    avg_gain = gain.ewm(com=config.DAILY_RSI_PERIOD - 1, min_periods=config.DAILY_RSI_PERIOD).mean()
-    avg_loss = loss.ewm(com=config.DAILY_RSI_PERIOD - 1, min_periods=config.DAILY_RSI_PERIOD).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    out["rsi14"] = 100 - (100 / (1 + rs))
-
-    # RSI7 (短期)
-    short_delta = out["close"].diff()
-    short_gain = short_delta.clip(lower=0)
-    short_loss = (-short_delta).clip(lower=0)
-    short_avg_gain = short_gain.ewm(com=config.DAILY_RSI_SHORT_PERIOD - 1, min_periods=config.DAILY_RSI_SHORT_PERIOD).mean()
-    short_avg_loss = short_loss.ewm(com=config.DAILY_RSI_SHORT_PERIOD - 1, min_periods=config.DAILY_RSI_SHORT_PERIOD).mean()
-    short_rs = short_avg_gain / short_avg_loss.replace(0, np.nan)
-    out["rsi7"] = 100 - (100 / (1 + short_rs))
-
-    # RSI21 (长期)
-    long_delta = out["close"].diff()
-    long_gain = long_delta.clip(lower=0)
-    long_loss = (-long_delta).clip(lower=0)
-    long_avg_gain = long_gain.ewm(com=config.DAILY_RSI_LONG_PERIOD - 1, min_periods=config.DAILY_RSI_LONG_PERIOD).mean()
-    long_avg_loss = long_loss.ewm(com=config.DAILY_RSI_LONG_PERIOD - 1, min_periods=config.DAILY_RSI_LONG_PERIOD).mean()
-    long_rs = long_avg_gain / long_avg_loss.replace(0, np.nan)
-    out["rsi21"] = 100 - (100 / (1 + long_rs))
+    # RSI 多周期
+    for p, col in [(config.DAILY_RSI_PERIOD, "rsi14"), (config.DAILY_RSI_SHORT_PERIOD, "rsi7"), (config.DAILY_RSI_LONG_PERIOD, "rsi21")]:
+        delta = out["close"].diff()
+        gain, loss = delta.clip(lower=0), (-delta).clip(lower=0)
+        rs = gain.ewm(com=p-1, min_periods=p).mean() / loss.ewm(com=p-1, min_periods=p).mean().replace(0, np.nan)
+        out[col] = 100 - (100 / (1 + rs))
 
     # MACD
     exp1 = out["close"].ewm(span=config.DAILY_MACD_FAST, adjust=False).mean()
     exp2 = out["close"].ewm(span=config.DAILY_MACD_SLOW, adjust=False).mean()
     out["macd_diff"] = exp1 - exp2
     out["macd_dea"] = out["macd_diff"].ewm(span=config.DAILY_MACD_SIGNAL, adjust=False).mean()
-    out["macd_histogram"] = out["macd_diff"] - out["macd_dea"]  # MACD柱状图
+    out["macd_histogram"] = out["macd_diff"] - out["macd_dea"]
 
-    # ATR（Wilder 平滑）— 动态止损用。需要 high/low，缺列时置 NaN。
+    # ATR
     if {"high", "low"}.issubset(out.columns):
         prev_close = out["close"].shift(1)
-        tr = pd.concat(
-            [
-                out["high"] - out["low"],
-                (out["high"] - prev_close).abs(),
-                (out["low"] - prev_close).abs(),
-            ],
-            axis=1,
-        ).max(axis=1)
-        out["atr"] = tr.ewm(
-            com=config.ATR_PERIOD - 1, min_periods=config.ATR_PERIOD, adjust=False,
-        ).mean()
+        tr = pd.concat([out["high"] - out["low"], (out["high"] - prev_close).abs(), (out["low"] - prev_close).abs()], axis=1).max(axis=1)
+        out["atr"] = tr.ewm(com=config.ATR_PERIOD - 1, min_periods=config.ATR_PERIOD, adjust=False).mean()
     else:
         out["atr"] = np.nan
 
-    # 日线量比
     out["daily_vol_base"] = out["volume"].shift(1).rolling(20).mean()
     out["daily_vol_ratio"] = out["volume"] / out["daily_vol_base"].replace(0, np.nan)
 
-    # 日线换手率倍率（借鉴策略1）
     if "turnover" in out.columns:
         out["daily_to_base"] = out["turnover"].shift(1).rolling(config.DAILY_TURNOVER_LOOKBACK).mean()
         out["daily_turnover_ratio"] = out["turnover"] / out["daily_to_base"].replace(0, np.nan)
@@ -1040,124 +577,68 @@ def compute_daily_signals(
         out["daily_turnover_ratio"] = np.nan
 
     # ------ 信号条件 ------
-
-    # MA5拐头：斜率从负转正
     ma5_slope = out["ma5"] - out["ma5"].shift(1)
-    ma5_slope_prev = ma5_slope.shift(1)
-    out["ma5_turn"] = (ma5_slope > 0) & (ma5_slope_prev <= 0)
-
-    # EMA金叉：EMA5上穿EMA10
-    out["ema_golden_cross"] = (
-        (out["ema5"] > out["ema10"]) & (out["ema5"].shift(1) <= out["ema10"].shift(1))
-    )
-
-    # RSI改进：多周期共振 + 背离检测
-    # RSI超卖反弹：近2日曾低于超卖线，当前回升到反弹线上方
-    rsi_was_oversold = (
-        (out["rsi14"].shift(1) < config.DAILY_RSI_OVERSOLD)
-        | (out["rsi14"].shift(2) < config.DAILY_RSI_OVERSOLD)
-    )
+    out["ma5_turn"] = (ma5_slope > 0) & (ma5_slope.shift(1) <= 0)
+    out["ema_golden_cross"] = (out["ema5"] > out["ema10"]) & (out["ema5"].shift(1) <= out["ema10"].shift(1))
+    out["macd_golden_cross"] = (out["macd_diff"] > out["macd_dea"]) & (out["macd_diff"].shift(1) <= out["macd_dea"].shift(1))
+    
+    rsi_was_oversold = (out["rsi14"].shift(1) < config.DAILY_RSI_OVERSOLD) | (out["rsi14"].shift(2) < config.DAILY_RSI_OVERSOLD)
     out["rsi_rebound"] = rsi_was_oversold & (out["rsi14"] >= config.DAILY_RSI_REBOUND_MIN)
+    out["rsi_multi_res"] = (out["rsi7"] > out["rsi14"]) & (out["rsi14"] > out["rsi21"]) & (out["rsi7"] < config.DAILY_RSI_OVERBOUGHT) & (out["rsi21"] > config.DAILY_RSI_OVERSOLD)
 
-    # RSI多周期共振：短期RSI上穿长期RSI且都在合理区间
-    out["rsi_multi_res"] = (
-        (out["rsi7"] > out["rsi14"]) & 
-        (out["rsi14"] > out["rsi21"]) &
-        (out["rsi7"] < config.DAILY_RSI_OVERBOUGHT) &
-        (out["rsi21"] > config.DAILY_RSI_OVERSOLD)
-    )
+    # 🔥 新增：MACD / RSI 底背离检测
+    past_min_close = out["close"].shift(1).rolling(config.DIVERGENCE_LOOKBACK).min()
+    past_min_rsi = out["rsi14"].shift(1).rolling(config.DIVERGENCE_LOOKBACK).min()
+    past_min_macd = out["macd_diff"].shift(1).rolling(config.DIVERGENCE_LOOKBACK).min()
 
-    # MACD金叉信号
-    out["macd_golden_cross"] = (
-        (out["macd_diff"] > out["macd_dea"]) & 
-        (out["macd_diff"].shift(1) <= out["macd_dea"].shift(1))
-    )
+    price_new_low = out["close"] < past_min_close
+    rsi_div_state = price_new_low & (out["rsi14"] > past_min_rsi + config.DAILY_RSI_DIVERGENCE_THRESHOLD)
+    macd_div_state = price_new_low & (out["macd_diff"] > past_min_macd)
+    
+    recent_div = (rsi_div_state | macd_div_state).rolling(3).max() > 0
+    right_confirm = out["macd_golden_cross"] | out["rsi_rebound"] | out["ma5_turn"]
+    out["bottom_divergence"] = recent_div & right_confirm
 
-    # 量价配合：价格上涨 + 量放大 + 换手率放大（借鉴策略1）
     price_up = out["close"] > out["close"].shift(1)
     vol_expand = out["daily_vol_ratio"] >= config.DAILY_VOL_EXPAND
-    turnover_expand = True
-    if "daily_turnover_ratio" in out.columns:
-        turnover_expand = out["daily_turnover_ratio"] >= config.DAILY_VOL_EXPAND
+    turnover_expand = out["daily_turnover_ratio"] >= config.DAILY_VOL_EXPAND if "daily_turnover_ratio" in out.columns else True
     out["vol_price_coord"] = price_up & vol_expand & turnover_expand
-
-    # 多指标共振信号
-    out["multi_resonance"] = (
-        out["rsi_multi_res"] & out["macd_golden_cross"] & out["vol_price_coord"]
-    )
+    out["multi_resonance"] = out["rsi_multi_res"] & out["macd_golden_cross"] & out["vol_price_coord"]
 
     # ------ 评分 ------
-    ma5_turn_score = out["ma5_turn"].astype(float) * config.W_DAILY_MA_TURN
-    ema_cross_score = out["ema_golden_cross"].astype(float) * config.W_DAILY_EMA_CROSS
-    rsi_rebound_score = out["rsi_rebound"].astype(float) * config.W_DAILY_RSI_REBOUND
-    
-    # 多指标共振加分
-    multi_resonance_bonus = (
-        out["multi_resonance"].astype(float) * config.DAILY_MULTI_RESONANCE_BONUS
-    )
-    
-    # RSI 超买惩罚（负分）
-    rsi_penalty = (
-        (out["rsi14"] >= config.DAILY_RSI_OVERBOUGHT).astype(float)
-        * (-config.DAILY_RSI_OVERBOUGHT_PENALTY)
-    )
-    vol_price_score = out["vol_price_coord"].astype(float) * config.W_DAILY_VOL_PRICE
-
     out["daily_score"] = (
-        ma5_turn_score
-        + ema_cross_score
-        + rsi_rebound_score
-        + vol_price_score
-        + multi_resonance_bonus
-        + rsi_penalty
+        out["ma5_turn"].astype(float) * config.W_DAILY_MA_TURN +
+        out["ema_golden_cross"].astype(float) * config.W_DAILY_EMA_CROSS +
+        out["rsi_rebound"].astype(float) * config.W_DAILY_RSI_REBOUND +
+        out["vol_price_coord"].astype(float) * config.W_DAILY_VOL_PRICE +
+        out["multi_resonance"].astype(float) * config.DAILY_MULTI_RESONANCE_BONUS +
+        (out["rsi14"] >= config.DAILY_RSI_OVERBOUGHT).astype(float) * (-config.DAILY_RSI_OVERBOUGHT_PENALTY) +
+        out["bottom_divergence"].astype(float) * config.W_DIVERGENCE_BONUS
     ).fillna(0).clip(0, 100).round(1)
 
     return out
 
-
 # ===========================================================================
-# Layer 4: 风险收益比（纯函数）
+# Layer 4: 风险收益比
 # ===========================================================================
 
-
-def compute_risk_reward(
-    entry_price: float,
-    config: StrategyConfig,
-    atr: Optional[float] = None,
-) -> dict:
-    """计算止损、止盈、风险收益比。
-
-    止损：默认 ATR 动态（入场价 - ATR_STOP_MULT × ATR14），ATR 缺失时回退固定百分比。
-    止盈：固定百分比。
-    RR = 收益空间 / 风险空间，随个股波动率变化，真正起到过滤作用。
-    """
+def compute_risk_reward(entry_price: float, config: StrategyConfig, atr: Optional[float] = None) -> dict:
     if config.USE_ATR_STOP and atr is not None and atr > 0:
         stop_loss = entry_price - config.ATR_STOP_MULT * atr
     else:
         stop_loss = entry_price * (1 - config.FIXED_STOP_LOSS_PCT / 100)
     take_profit = entry_price * (1 + config.FIXED_TAKE_PROFIT_PCT / 100)
-
     risk = entry_price - stop_loss
     reward = take_profit - entry_price
     rr_ratio = reward / risk if risk > 0 else 0.0
-
-    return {
-        "stop_loss": round(stop_loss, 2),
-        "take_profit": round(take_profit, 2),
-        "rr_ratio": round(rr_ratio, 2),
-        "passes": rr_ratio >= config.MIN_RR_RATIO,
-    }
-
+    return {"stop_loss": round(stop_loss, 2), "take_profit": round(take_profit, 2), "rr_ratio": round(rr_ratio, 2), "passes": rr_ratio >= config.MIN_RR_RATIO}
 
 # ===========================================================================
-# Signal dataclass + describe()（沿用策略1模式）
+# Signal dataclass + describe()
 # ===========================================================================
-
 
 @dataclass
 class Signal:
-    """单只股票的完整选股信号，涵盖4层信息。"""
-
     code: str
     name: str
     date: str
@@ -1174,28 +655,24 @@ class Signal:
     take_profit: float
     rr_ratio: float
     market_env: str
+    has_divergence: bool
 
     def to_dict(self) -> dict:
         return asdict(self)
 
-
 def _grade_from_score(score: float, config: StrategyConfig) -> str:
-    """评分 → 信号等级映射。"""
-    if score >= config.GRADE_A:
-        return "A"
-    elif score >= config.GRADE_B:
-        return "B"
-    elif score >= config.GRADE_C:
-        return "C"
+    if score >= config.GRADE_A: return "A"
+    elif score >= config.GRADE_B: return "B"
+    elif score >= config.GRADE_C: return "C"
     return "D"
 
-
 def describe(r: dict) -> str:
-    """将 Signal.to_dict() 格式化为飞书 lark_md 逐条分析报告。"""
+    div_alert = "🔥 **触发 MACD/RSI 底背离！(强烈看涨)**\n" if r.get('has_divergence') else ""
     return "\n".join([
         f"**{r['name']} {r['code']}**  {r['date']}  收盘 {r['close']}",
         f"综合评分 **{r['score']}** ({r['grade']}级) ｜ 日线 {r['daily_score']}分",
         "",
+        div_alert,
         "**日线技术指标:**",
         f"- RSI7: {r['rsi7']}, RSI14: {r['rsi']}, RSI21: {r['rsi21']} ｜ 量比: {r['vol_ratio']}x",
         f"- 换手比: {r['turnover_ratio']}x ｜ 市场环境: {r['market_env']}",
@@ -1204,141 +681,59 @@ def describe(r: dict) -> str:
         f"- 止损: {r['stop_loss']} ｜ 止盈: {r['take_profit']} ｜ 风险收益比: {r['rr_ratio']}",
     ])
 
-
 # ===========================================================================
-# evaluate() — 单股4层评估入口（沿用策略1模式）
+# evaluate() & main()
 # ===========================================================================
 
-
-def evaluate(
-    daily_df: Optional[pd.DataFrame],
-    code: str = "",
-    name: str = "",
-    config: Optional[StrategyConfig] = None,
-    market_env: Optional[dict] = None,
-    fund_data: Optional[dict] = None,
-) -> Optional[Signal]:
-    """对单只股票执行完整4层评估，返回 Signal 或 None。
-
-    纯逻辑函数，不做任何数据获取。
-
-    Layer 1: 市场环境 → 熊市收紧等级阈值（BEAR_GRADE_BOOST）
-    Layer 2: 基本面防雷 → 否决制
-    Layer 3: 日线技术指标 → 评分
-    Layer 4: 风险收益比 → ATR 动态止损 + RR >= 1.5
-    """
-    if config is None:
-        config = StrategyConfig()
-
-    # Layer 1: 市场环境 → 调整等级阈值
+def evaluate(daily_df: Optional[pd.DataFrame], code: str = "", name: str = "", config: Optional[StrategyConfig] = None, market_env: Optional[dict] = None, fund_data: Optional[dict] = None) -> tuple[Optional[Signal], str]:
+    if config is None: config = StrategyConfig()
     regime = (market_env or {}).get("regime", "unknown")
-    if regime == "bear":
-        grade_boost = config.BEAR_GRADE_BOOST
-    else:
-        grade_boost = 0.0
+    grade_boost = config.BEAR_GRADE_BOOST if regime == "bear" else 0.0
 
-    # Layer 2: 基本面防雷
-    if not check_fundamentals(fund_data, config):
-        return None
+    if not check_fundamentals(fund_data, config): return None, "FAIL_FUND"
 
-    # Layer 3: 日线技术指标（评分）
     daily_out = compute_daily_signals(daily_df, config)
-    daily_score = 0.0
-    rsi_val = 50.0
-    if daily_out is not None and not daily_out.empty:
-        d_last = daily_out.iloc[-1]
-        daily_score = float(d_last.get("daily_score", 0))
-        rsi_val = float(d_last.get("rsi14", 50))
-    else:
-        return None
+    if daily_out is None or daily_out.empty: return None, "FAIL_DATA"
 
-    # 合并评分（熊市时等级阈值上浮，实质是要求更高分数才能通过）
-    total_score = daily_score
-    grade = _grade_from_score(total_score - grade_boost, config)
-    if grade == "D":
-        return None
+    d_last = daily_out.iloc[-1]
+    daily_score = float(d_last.get("daily_score", 0))
+    
+    grade = _grade_from_score(daily_score - grade_boost, config)
+    if grade == "D": return None, "FAIL_TECH"
 
-    # Layer 4: 风险收益比
-    last_close = float(daily_out.iloc[-1]["close"])
-    atr_val = daily_out.iloc[-1].get("atr")
+    last_close = float(d_last["close"])
+    atr_val = d_last.get("atr")
     atr_val = float(atr_val) if atr_val is not None and not pd.isna(atr_val) else None
 
-    rr = compute_risk_reward(
-        entry_price=last_close,
-        config=config,
-        atr=atr_val,
+    rr = compute_risk_reward(entry_price=last_close, config=config, atr=atr_val)
+    if not rr["passes"]: return None, "FAIL_RR"
+
+    sig = Signal(
+        code=code, name=name, date=pd.to_datetime(d_last["date"]).strftime("%Y-%m-%d"),
+        close=round(last_close, 2), score=round(daily_score, 1), grade=grade,
+        daily_score=round(daily_score, 1), rsi=round(float(d_last.get("rsi14", 50)), 1),
+        rsi7=round(float(d_last.get("rsi7", 50)), 1), rsi21=round(float(d_last.get("rsi21", 50)), 1),
+        vol_ratio=round(float(d_last.get("daily_vol_ratio", 0)), 2),
+        turnover_ratio=round(float(d_last.get("daily_turnover_ratio", 0)), 2),
+        stop_loss=rr["stop_loss"], take_profit=rr["take_profit"], rr_ratio=rr["rr_ratio"],
+        market_env=regime, has_divergence=bool(d_last.get("bottom_divergence", False))
     )
-    if not rr["passes"]:
-        return None
+    return sig, "PASS"
 
-    return Signal(
-        code=code,
-        name=name,
-        date=pd.to_datetime(daily_out.iloc[-1]["date"]).strftime("%Y-%m-%d"),
-        close=round(last_close, 2),
-        score=round(total_score, 1),
-        grade=grade,
-        daily_score=round(daily_score, 1),
-        rsi=round(rsi_val, 1),
-        rsi7=round(float(daily_out.iloc[-1].get("rsi7", 50)), 1),
-        rsi21=round(float(daily_out.iloc[-1].get("rsi21", 50)), 1),
-        vol_ratio=round(float(daily_out.iloc[-1].get("daily_vol_ratio", 0)), 2),
-        turnover_ratio=round(float(daily_out.iloc[-1].get("daily_turnover_ratio", 0)), 2),
-        stop_loss=rr["stop_loss"],
-        take_profit=rr["take_profit"],
-        rr_ratio=rr["rr_ratio"],
-        market_env=regime,
-    )
-
-
-# ===========================================================================
-# 编排函数（匹配 run.py 的导入接口）
-# ===========================================================================
-
-
-def get_market_environment(
-    config: StrategyConfig, cache: CacheManager,
-) -> dict:
-    """获取沪深300日线 → 计算市场环境 → 缓存。供 run.py 调用。"""
-    cached = cache.get("market_env")
-    if cached is not None:
-        return cached
-
-    df_index = get_index_daily(config, cache)  # 获取日线数据
-    if df_index is None or df_index.empty:
-        result = {
-            "regime": "unknown",
-            "description": "数据获取失败",
-            "ma20": 0, "slope": 0, "close": 0,
-        }
-    else:
-        result = compute_market_environment(df_index, config)
-
+def get_market_environment(config: StrategyConfig, cache: CacheManager) -> dict:
+    if (cached := cache.get("market_env")) is not None: return cached
+    df_index = get_index_daily(config, cache)
+    result = compute_market_environment(df_index, config) if df_index is not None and not df_index.empty else {"regime": "unknown", "description": "数据获取失败", "ma20": 0, "slope": 0, "close": 0}
     cache.set("market_env", result)
     return result
 
+def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] = None) -> Optional[pd.DataFrame]:
+    if config is None: config = StrategyConfig()
+    if cache is None: cache = CacheManager(expire_hours=config.CACHE_EXPIRE_HOURS)
 
-def main(
-    config: Optional[StrategyConfig] = None,
-    cache: Optional[CacheManager] = None,
-) -> Optional[pd.DataFrame]:
-    """完整选股流水线。run.py 的主入口。
-
-    接受外部传入的 config/cache 以复用 run.py 已创建的实例，避免重复数据请求。
-    不传参时自动创建默认实例（兼容直接命令行调用）。
-
-    流程: 市场环境 → 股票列表 → 并行筛选(基本面+日线+风控) → 排序输出
-    """
-    if config is None:
-        config = StrategyConfig()
-    if cache is None:
-        cache = CacheManager(expire_hours=config.CACHE_EXPIRE_HOURS)
-
-    # Layer 1: 市场环境
     market_env = get_market_environment(config, cache)
     print(f"[INFO] 市场环境: {market_env.get('description', 'unknown')}")
 
-    # 股票列表
     stock_list = get_stock_list(config, cache)
     if not stock_list:
         print("[WARN] 无法获取股票列表")
@@ -1346,64 +741,73 @@ def main(
     print(f"[INFO] 待筛选股票数: {len(stock_list)}")
 
     signals: list[dict] = []
-    processed = 0
-    total = len(stock_list)
+    processed, total = 0, len(stock_list)
+    
+    stats = {
+        "total": total, "error": 0, "fail_data": 0,
+        "fail_fund": 0, "fail_tech": 0, "fail_rr": 0, "pass": 0
+    }
 
-    def _screen_one(stock: dict) -> Optional[Signal]:
+    def _screen_one(stock: dict) -> tuple[Optional[Signal], str]:
         code, name = stock["code"], stock["name"]
         try:
             daily_df = get_daily_data(code, config, cache)
-            if daily_df is None:
-                return None
+            if daily_df is None: return None, "FAIL_DATA"
             fund_data = get_fundamentals(code, cache, config)
-            if config.FETCH_DELAY > 0:
-                time.sleep(config.FETCH_DELAY)
+            if config.FETCH_DELAY > 0: time.sleep(config.FETCH_DELAY)
             return evaluate(daily_df, code, name, config, market_env, fund_data)
         except Exception:
-            return None
+            return None, "ERROR"
 
     with ThreadPoolExecutor(max_workers=config.MAX_WORKERS) as pool:
         futures = {pool.submit(_screen_one, s): s for s in stock_list}
         for future in as_completed(futures):
             processed += 1
-            if processed % 500 == 0:
-                print(f"[INFO] 进度: {processed}/{total}")
-            sig = future.result()
-            if sig is not None:
+            if processed % 500 == 0: print(f"[INFO] 进度: {processed}/{total}")
+            
+            sig, reason = future.result()
+            
+            if reason == "PASS" and sig is not None:
+                stats["pass"] += 1
                 signals.append(sig.to_dict())
+            elif reason == "FAIL_FUND": stats["fail_fund"] += 1
+            elif reason == "FAIL_DATA": stats["fail_data"] += 1
+            elif reason == "FAIL_TECH": stats["fail_tech"] += 1
+            elif reason == "FAIL_RR": stats["fail_rr"] += 1
+            elif reason == "ERROR": stats["error"] += 1
+
+    pass_data = stats["total"] - stats["fail_data"] - stats["error"]
+    pass_fund = pass_data - stats["fail_fund"]
+    pass_tech = pass_fund - stats["fail_tech"]
+    pass_rr = pass_tech - stats["fail_rr"]
+
+    print("\n" + "="*50)
+    print("📊 选股漏斗数据分析 (Funnel Log)")
+    print("="*50)
+    print(f"1. 初始有效股票池: {stats['total']} 只")
+    print(f"2. 获取数据并达标: {pass_data} 只 (淘汰/缺失 {stats['fail_data'] + stats['error']} 只)")
+    if pass_data > 0: print(f"3. 基本面防雷通过: {pass_fund} 只 (淘汰 {stats['fail_fund']} 只，通过率 {pass_fund/pass_data*100:.1f}%)")
+    if pass_fund > 0: print(f"4. 日线技术面达标: {pass_tech} 只 (淘汰 {stats['fail_tech']} 只，通过率 {pass_tech/pass_fund*100:.1f}%)")
+    if pass_tech > 0: print(f"5. 盈亏风控比达标: {pass_rr} 只 (淘汰 {stats['fail_rr']} 只，通过率 {pass_rr/pass_tech*100:.1f}%)")
+    print("="*50 + "\n")
 
     if not signals:
         print("[INFO] 未发现符合条件的信号")
         return None
 
-    df = pd.DataFrame(signals)
-    df = df.sort_values(SORT_BY, ascending=SORT_ASC).reset_index(drop=True)
-    print(f"[INFO] 筛选完成，共 {len(df)} 只股票通过4层过滤")
+    df = pd.DataFrame(signals).sort_values(SORT_BY, ascending=SORT_ASC).reset_index(drop=True)
+    print(f"[INFO] 筛选完成，最终共 {len(df)} 只股票脱颖而出")
     return df
-
-
-# ===========================================================================
-# __main__ — 命令行入口
-# ===========================================================================
 
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else "full"
-
     if mode == "screen":
         result = main()
-        if result is not None:
-            print(result.to_string())
-        else:
-            print("未发现信号")
-
+        print(result.to_string() if result is not None else "未发现信号")
     elif mode == "track":
         print("跟踪功能已移除")
-
     elif mode == "full":
         result = main()
-        if result is not None:
-            print(f"共 {len(result)} 只信号")
-        print("回测和跟踪功能已移除")
-
+        if result is not None: print(f"共 {len(result)} 只信号")
     else:
-        print(f"未知模式: {mode}，可选: screen / track / full")
+        print(f"未知模式: {mode}，可选: screen / full")
