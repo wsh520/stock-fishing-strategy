@@ -24,25 +24,27 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      # 缓存 akshare 磁盘缓存目录。数据层按文件 mtime 判新鲜度，而 actions/cache
+      # 缓存 baostock 磁盘缓存目录。数据层按文件 mtime 判新鲜度，而 actions/cache
       # 基于 tar 会保留 mtime，因此恢复的「昨日行情」会被正确判定为过期并重新拉取，
       # 仍在 TTL 内的股票列表（6天）与基本面（7天）则直接复用，省下大量请求。
       - name: Resolve cache date
         id: cachedate
         run: echo "ymd=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
 
-      - name: Cache akshare data
+      - name: Cache baostock data
         uses: actions/cache@v4
         with:
           path: cache
-          key: akshare-cache-${{ steps.cachedate.outputs.ymd }}
+          key: baostock-cache-${{ steps.cachedate.outputs.ymd }}
           restore-keys: |
-            akshare-cache-
+            baostock-cache-
 
       - name: Run strategy
         env:
           FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
-
+          # Baostock 的 query_all_stock(day=...) 与缓存「当天」判断依赖本地日期；
+          # 用北京时间避免 UTC 时区在跨日边界产生偏差。
+          TZ: Asia/Shanghai
         run: python run.py
 
       - name: Upload artifacts
