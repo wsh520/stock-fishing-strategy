@@ -122,6 +122,15 @@ class StrategyConfig:
     MIN_AMOUNT: float = 5_000_000.0  # 近 20 日日均成交额下限（元），低于则判定流动性不足（僵尸股）
     MIN_DAYS: int = 60
 
+    # 防追高否决：当日涨幅超过该值（%）判定为追高——涨停股买不进、大阳线次日易回调，直接否决
+    MAX_ENTRY_PCT_CHG: float = 7.0
+    # 防跳空否决：开盘价相对前收跳空高开超过该比例（%），追买风险大，直接否决
+    MAX_GAP_UP_PCT: float = 3.0
+    # 下降通道过滤：MA20 近 N 日变化率低于该阈值判定为陡峭下降（接飞刀），当日趋势转折信号不认可
+    DAILY_MA20: int = 20
+    MA20_TREND_LOOKBACK: int = 5
+    MA20_TREND_MIN_SLOPE: float = -0.04
+
     # 趋势转折（MA5拐头 或 EMA金叉，同源信号合并计分，避免右侧拐点同日触发导致分数通胀）
     W_DAILY_TREND_TURN: float = 40.0
     W_DAILY_RSI_REBOUND: float = 25.0
@@ -860,8 +869,14 @@ def compute_daily_signals(df: pd.DataFrame, config: StrategyConfig) -> Optional[
     ma5_slope = out["ma5"] - out["ma5"].shift(1)
     out["ma5_turn"] = (ma5_slope > 0) & (ma5_slope.shift(1) <= 0)
     out["ema_golden_cross"] = (out["ema5"] > out["ema10"]) & (out["ema5"].shift(1) <= out["ema10"].shift(1))
+    # 下降通道过滤：MA20 近 N 日斜率低于阈值判定为陡峭下降，此时 MA5 拐头/EMA 金叉多为
+    # 下跌中继的假拐点（接飞刀），趋势转折信号不认可；底背离的右侧确认不受此限（抄底本身发生在下降中）
+    out["ma20"] = out["close"].rolling(config.DAILY_MA20).mean()
+    _ma20_prev = out["ma20"].shift(config.MA20_TREND_LOOKBACK)
+    out["ma20_slope"] = (out["ma20"] - _ma20_prev) / _ma20_prev.replace(0, np.nan)
+    ma20_trend_ok = (out["ma20_slope"] >= config.MA20_TREND_MIN_SLOPE).fillna(False)
     # MA5拐头与EMA金叉在右侧拐点经常同日触发（同一信息），合并为一个趋势转折信号
-    out["trend_turn"] = out["ma5_turn"] | out["ema_golden_cross"]
+    out["trend_turn"] = (out["ma5_turn"] | out["ema_golden_cross"]) & ma20_trend_ok
     out["macd_golden_cross"] = (out["macd_diff"] > out["macd_dea"]) & (out["macd_diff"].shift(1) <= out["macd_dea"].shift(1))
     rsi_was_oversold = (out["rsi14"].shift(1) < config.DAILY_RSI_OVERSOLD) | (out["rsi14"].shift(2) < config.DAILY_RSI_OVERSOLD)
     out["rsi_rebound"] = rsi_was_oversold & (out["rsi14"] >= config.DAILY_RSI_REBOUND_MIN)
@@ -933,6 +948,18 @@ def evaluate(daily_df: Optional[pd.DataFrame], code: str = "", name: str = "", c
     if daily_out is None or daily_out.empty: return None, "FAIL_DATA"
 
     d_last = daily_out.iloc[-1]
+
+    # 防追高否决：当日涨幅过大（涨停买不进、大阳线次日易回调），数据缺失时放行不误杀
+    pct_chg_today = d_last.get("pct_chg")
+    if pct_chg_today is not None and not pd.isna(pct_chg_today) and float(pct_chg_today) > config.MAX_ENTRY_PCT_CHG:
+        return None, "FAIL_CHASE"
+    # 防跳空否决：开盘相对前收跳空高开过多，追买风险大
+    open_today = d_last.get("open")
+    prev_close = float(daily_out.iloc[-2]["close"]) if len(daily_out) >= 2 else None
+    if (open_today is not None and not pd.isna(open_today) and prev_close and prev_close > 0
+            and (float(open_today) / prev_close - 1) * 100 > config.MAX_GAP_UP_PCT):
+        return None, "FAIL_GAP"
+
     daily_score = float(d_last.get("daily_score", 0))
     has_div = bool(d_last.get("bottom_divergence", False))
     # 准入门槛：按基础评级（分数扣除熊市加码后定级）判断，默认须达 B 级（≥60 分），
@@ -1026,7 +1053,8 @@ def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] 
                     signals.append(sig.to_dict())
                 elif reason == "FAIL_FUND": stats["fail_fund"] += 1
                 elif reason == "FAIL_DATA": stats["fail_data"] += 1
-                elif reason == "FAIL_TECH": stats["fail_tech"] += 1
+                # FAIL_CHASE（追高否决）/ FAIL_GAP（跳空否决）同属技术面入场质量层，并入 fail_tech 统计
+                elif reason in ("FAIL_TECH", "FAIL_CHASE", "FAIL_GAP"): stats["fail_tech"] += 1
                 elif reason == "FAIL_RR": stats["fail_rr"] += 1
                 elif reason == "ERROR": stats["error"] += 1
 
