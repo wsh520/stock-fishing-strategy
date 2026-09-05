@@ -99,5 +99,28 @@ df_e["pct_chg"] = np.nan
 df_e["open"] = np.nan
 results.append(run_case("E pct_chg/open缺失放行", df_e, "PASS"))
 
+
+def rebound_too_far_closes():
+    """底部后连续 4 天 +4%：RSI 已冲高（>65），不再是底部入场点"""
+    closes = base_closes()[:-1]
+    for _ in range(4):
+        closes = np.append(closes, closes[-1] * 1.04)
+    return closes
+
+
+results.append(run_case("F RSI过高(已反弹一段)", make_df(rebound_too_far_closes(), last_vol_mult=2.0), "FAIL_RSI_HIGH"))
+results.append(run_case("G 天量(量比6x)", make_df(base_closes(), last_vol_mult=6.0), "FAIL_CLIMAX_VOL"))
+
+
+def near_high_closes():
+    """一路上涨 10→20 后小幅回调再反弹：距高点回撤 <10%，不符合抄底定位"""
+    part1 = np.linspace(10.0, 20.0, 114)
+    part2 = np.array([19.5, 19.2, 19.0, 18.9, 18.9])
+    closes = np.concatenate([part1, part2])
+    return np.append(closes, closes[-1] * 1.015)
+
+
+results.append(run_case("H 非底部区域(距高点<10%)", make_df(near_high_closes(), last_vol_mult=2.0), "FAIL_NOT_BOTTOM"))
+
 print(f"\n{sum(results)}/{len(results)} 通过")
 sys.exit(0 if all(results) else 1)

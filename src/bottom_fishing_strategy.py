@@ -130,6 +130,15 @@ class StrategyConfig:
     DAILY_MA20: int = 20
     MA20_TREND_LOOKBACK: int = 5
     MA20_TREND_MIN_SLOPE: float = -0.04
+    # RSI 入场上限：RSI14 高于该值说明已反弹一段、不再是底部入场点，直接否决
+    DAILY_RSI_ENTRY_MAX: float = 65.0
+    # 天量否决：量比超过该值疑似主力出货/消息驱动，次日接力风险大，直接否决
+    MAX_VOL_RATIO: float = 5.0
+    # 底部区域过滤：现价距近 N 日最高价回撤不足该比例，不符合抄底定位（可能只是上涨中继回调），直接否决
+    DRAWDOWN_LOOKBACK: int = 60
+    MIN_DRAWDOWN_FROM_HIGH: float = 0.10
+    # 最终推荐数量上限：评分降序截取前 N 只（目标每日推荐 3~5 只）
+    MAX_PICKS: int = 5
 
     # 趋势转折（MA5拐头 或 EMA金叉，同源信号合并计分，避免右侧拐点同日触发导致分数通胀）
     W_DAILY_TREND_TURN: float = 40.0
@@ -960,6 +969,20 @@ def evaluate(daily_df: Optional[pd.DataFrame], code: str = "", name: str = "", c
             and (float(open_today) / prev_close - 1) * 100 > config.MAX_GAP_UP_PCT):
         return None, "FAIL_GAP"
 
+    # RSI 入场上限否决：RSI14 过高说明已反弹一段，不再是底部入场点
+    rsi_today = d_last.get("rsi14")
+    if rsi_today is not None and not pd.isna(rsi_today) and float(rsi_today) > config.DAILY_RSI_ENTRY_MAX:
+        return None, "FAIL_RSI_HIGH"
+    # 天量否决：量比异常放大疑似出货/消息驱动，次日接力风险大
+    vol_ratio_today = d_last.get("daily_vol_ratio")
+    if vol_ratio_today is not None and not pd.isna(vol_ratio_today) and float(vol_ratio_today) > config.MAX_VOL_RATIO:
+        return None, "FAIL_CLIMAX_VOL"
+    # 底部区域过滤：距近 N 日高点回撤不足，不符合抄底定位（上涨中继回调不买）
+    high_n = float(daily_out["high"].tail(config.DRAWDOWN_LOOKBACK).max())
+    last_close = float(d_last["close"])
+    if high_n > 0 and (high_n - last_close) / high_n < config.MIN_DRAWDOWN_FROM_HIGH:
+        return None, "FAIL_NOT_BOTTOM"
+
     daily_score = float(d_last.get("daily_score", 0))
     has_div = bool(d_last.get("bottom_divergence", False))
     # 准入门槛：按基础评级（分数扣除熊市加码后定级）判断，默认须达 B 级（≥60 分），
@@ -971,7 +994,7 @@ def evaluate(daily_df: Optional[pd.DataFrame], code: str = "", name: str = "", c
     # 底背离：通过准入后评级提升一档（与基础分脱钩），仅用于展示/排序，不能绕过准入门槛
     grade = _lift_grade(base_grade, config.DIVERGENCE_GRADE_LIFT) if has_div and config.DIVERGENCE_GRADE_LIFT > 0 else base_grade
 
-    last_close, atr_val = float(d_last["close"]), d_last.get("atr")
+    atr_val = d_last.get("atr")
     atr_val = float(atr_val) if atr_val is not None and not pd.isna(atr_val) else None
 
     rr = compute_risk_reward(entry_price=last_close, config=config, atr=atr_val)
@@ -1053,8 +1076,9 @@ def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] 
                     signals.append(sig.to_dict())
                 elif reason == "FAIL_FUND": stats["fail_fund"] += 1
                 elif reason == "FAIL_DATA": stats["fail_data"] += 1
-                # FAIL_CHASE（追高否决）/ FAIL_GAP（跳空否决）同属技术面入场质量层，并入 fail_tech 统计
-                elif reason in ("FAIL_TECH", "FAIL_CHASE", "FAIL_GAP"): stats["fail_tech"] += 1
+                # FAIL_CHASE（追高）/ FAIL_GAP（跳空）/ FAIL_RSI_HIGH（RSI过高）/ FAIL_CLIMAX_VOL（天量）/ FAIL_NOT_BOTTOM（非底部区域）
+                # 均属技术面入场质量层，并入 fail_tech 统计
+                elif reason in ("FAIL_TECH", "FAIL_CHASE", "FAIL_GAP", "FAIL_RSI_HIGH", "FAIL_CLIMAX_VOL", "FAIL_NOT_BOTTOM"): stats["fail_tech"] += 1
                 elif reason == "FAIL_RR": stats["fail_rr"] += 1
                 elif reason == "ERROR": stats["error"] += 1
 
@@ -1078,7 +1102,11 @@ def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] 
             return None
 
         df = pd.DataFrame(signals).sort_values(SORT_BY, ascending=SORT_ASC).reset_index(drop=True)
-        print(f"[INFO] 筛选完成，最终共 {len(df)} 只股票脱颖而出")
+        # 推荐数量上限：评分降序截取前 MAX_PICKS 只（目标每日 3~5 只精推，其余评分靠后的不推荐）
+        if len(df) > config.MAX_PICKS:
+            print(f"[INFO] 通过 {len(df)} 只，按评分截取前 {config.MAX_PICKS} 只（淘汰 {len(df) - config.MAX_PICKS} 只低分信号）")
+            df = df.head(config.MAX_PICKS).reset_index(drop=True)
+        print(f"[INFO] 筛选完成，最终推荐 {len(df)} 只股票")
         return df
 
     finally:
