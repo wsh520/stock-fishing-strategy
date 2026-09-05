@@ -192,6 +192,11 @@ class StrategyConfig:
     EXCLUDE_BSE: bool = True
     EXCLUDE_CHINEXT: bool = False
     EXCLUDE_STAR: bool = False
+    # 仅保留普通 A 股账户可直接交易的沪深主板（60/00 开头）：创业板开户需 10 万资产、
+    # 科创板/北交所/港股通需 50 万资产，对个人资金有门槛的板块全部排除；
+    # 开启后上面 EXCLUDE_CHINEXT / EXCLUDE_STAR / EXCLUDE_BSE 三个开关冗余，
+    # 关闭本项则退回由各开关组合控制
+    MAIN_BOARD_ONLY: bool = True
 
 # ===========================================================================
 # CacheManager
@@ -566,11 +571,18 @@ def _fetch_stock_pool_bs(config: Optional[StrategyConfig] = None) -> list[dict]:
 def _apply_pool_filters(df: pd.DataFrame, config: StrategyConfig) -> pd.DataFrame:
     """股票池过滤（Baostock / AkShare 共用），入参需含 code/name 列"""
     out = df.copy()
-    out["code"] = out["code"].astype(str).str.zfill(6)
+    out["code"] = out["code"].astype(str).str.strip()
+    # A 股代码固定 6 位；港股（5 位，如 00700）等非 A 股代码直接排除，
+    # 避免 zfill 补零后伪装成深市主板代码
+    out = out[out["code"].str.fullmatch(r"\d{6}", na=False)]
     out["name"] = out["name"].astype(str)
-    if config.EXCLUDE_BSE: out = out[~out["code"].str.startswith(("8", "4"))]
-    if config.EXCLUDE_CHINEXT: out = out[~out["code"].str.startswith(("300", "301"))]
-    if config.EXCLUDE_STAR: out = out[~out["code"].str.startswith(("688", "689"))]
+    if config.MAIN_BOARD_ONLY:
+        # 白名单仅保留沪深主板：60=沪主板(600/601/603/605)，00=深主板(000/001/002/003)；
+        # 创业板(30)/科创板(68)/北交所(4/8/92)/B股(200/900)等开户有资金门槛的板块全部排除
+        out = out[out["code"].str.startswith(("60", "00"))]
+    if config.EXCLUDE_BSE: out = out[~out["code"].str.startswith(("8", "4", "92"))]
+    if config.EXCLUDE_CHINEXT: out = out[~out["code"].str.startswith("30")]
+    if config.EXCLUDE_STAR: out = out[~out["code"].str.startswith("68")]
     if config.FILTER_ST: out = out[~out["name"].str.contains("ST", case=False, na=False)]
     if config.EXCLUDE_DELISTING: out = out[~out["name"].str.contains("退", na=False)]
     return out.reset_index(drop=True)

@@ -138,7 +138,7 @@ python src/bottom_fishing_strategy.py full
   - 股票列表按 `CACHE_TTL_DAYS=6` 天失效，基本面按 `FUND_CACHE_TTL_DAYS=7` 天失效
   - 磁盘只缓存未过滤的原始列表，过滤在返回时应用，改 config 即时生效无需清缓存
   - 两个数据源的缓存文件命名天然隔离（Baostock 带 `sh.` 前缀、AkShare 为纯 6 位数字），互不污染
-- **股票池过滤**：由 `StrategyConfig` 开关驱动（`FILTER_ST` / `EXCLUDE_DELISTING` / `EXCLUDE_BSE` 默认开启；`EXCLUDE_CHINEXT` / `EXCLUDE_STAR` 默认关闭）
+- **股票池过滤**：`MAIN_BOARD_ONLY` 默认开启——白名单仅保留普通 A 股账户可直接交易的沪深主板（60/00 开头）；创业板（开户需 10 万资产）、科创板/北交所/港股通（需 50 万资产）等对个人资金有门槛的板块，以及港股/B 股等非 A 股证券全部排除。关闭该项则退回由 `FILTER_ST` / `EXCLUDE_DELISTING` / `EXCLUDE_BSE`（默认开启）与 `EXCLUDE_CHINEXT` / `EXCLUDE_STAR`（默认关闭）组合控制
 
 ## 免责声明
 
