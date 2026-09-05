@@ -196,6 +196,8 @@ _BS_CIRCUIT_THRESHOLD = 8  # 连续失败达到该次数后熔断（单次取数
 
 def _bs_login(max_retry: int = 5) -> bool:
     """Baostock 登录。bs.login 失败时也返回对象，必须检查 error_code 才算真正重试。"""
+    if _bs_state["logged_in"]:
+        return True  # 幂等：已登录直接返回，避免 run.py 预取市场环境后 main() 重复登录
     for attempt in range(max_retry):
         try:
             with bs_lock:
@@ -510,7 +512,11 @@ def _fetch_stock_pool_bs(config: Optional[StrategyConfig] = None) -> list[dict]:
         
         raw = _fetch_with_retry(fetch_list, config.LIST_MAX_RETRY, "bs_all_stock")
         if raw is None or raw.empty: return []
-        
+
+        # 仅保留 A 股股票（沪 60/68、深 00/30、北 4/8），剔除指数/基金/债券。
+        # query_all_stock 返回全部证券（7171 行中约 1700 只非股票），非股票代码
+        # 后续查询会报"股票代码应为9位"，并污染熔断计数导致误切 AkShare
+        raw = raw[raw["code"].str.match(r"^(sh\.(60|68)|sz\.(00|30)|bj\.(4|8))", na=False)]
         # 过滤处于交易状态的股票
         raw = raw[raw['tradeStatus'] == '1'].copy()
         raw = raw.rename(columns={"code_name": "name"})
