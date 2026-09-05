@@ -122,5 +122,50 @@ def near_high_closes():
 
 results.append(run_case("H 非底部区域(距高点<10%)", make_df(near_high_closes(), last_vol_mult=2.0), "FAIL_NOT_BOTTOM"))
 
+
+def rally_back_closes():
+    """跌到15后已在20日内反弹至16附近：60日回撤够（19%），但现价位于20日区间顶部"""
+    part1 = np.linspace(20.0, 17.0, 90)
+    part2 = np.linspace(17.0, 15.0, 10)[1:]
+    part3 = np.linspace(15.0, 15.9, 19)[1:]
+    closes = np.concatenate([part1, part2, part3])
+    return np.append(closes, closes[-1] * 1.01)
+
+
+results.append(run_case("I 区间位置偏高(已反弹至区间顶部)", make_df(rally_back_closes(), last_vol_mult=2.0), "FAIL_POSITION"))
+
+# ===== 判定函数隔离单测 =====
+cfg = m.StrategyConfig()
+out_a = m.compute_daily_signals(df_a, cfg)
+checks = []
+checks.append(("_range_position_ok 基准放行", m._range_position_ok(out_a, cfg) is True))
+checks.append(("_range_position_ok 区间顶部否决", m._range_position_ok(m.compute_daily_signals(make_df(rally_back_closes()), cfg), cfg) is False))
+checks.append(("_macd_momentum_ok 基准放行", m._macd_momentum_ok(out_a, cfg) is True))
+checks.append(("_kdj_ok 基准放行", m._kdj_ok(out_a, cfg) is True))
+
+# MACD 动能恶化：反弹后再次大跌，MACD 柱当日走低
+_md = np.concatenate([np.linspace(20.0, 15.0, 110), [15.6, 15.6, 15.3]])
+out_md = m.compute_daily_signals(make_df(_md), cfg)
+checks.append(("_macd_momentum_ok 恶化否决", m._macd_momentum_ok(out_md, cfg) is False))
+
+# KDJ 高位：持续上涨后在高位运行（K>60）
+_kd = np.concatenate([np.linspace(10.0, 20.0, 118), [19.9, 19.8]])
+out_kd = m.compute_daily_signals(make_df(_kd), cfg)
+checks.append(("_kdj_ok 高位否决", m._kdj_ok(out_kd, cfg) is False))
+
+# 周线趋势确认
+_w_up = pd.DataFrame({"date": pd.date_range("2025-01-01", periods=30, freq="W").strftime("%Y-%m-%d"),
+                      "close": np.linspace(10.0, 15.0, 30)})
+_w_down = pd.DataFrame({"date": pd.date_range("2025-01-01", periods=30, freq="W").strftime("%Y-%m-%d"),
+                        "close": np.linspace(10.0, 6.0, 30)})
+checks.append(("周线站上MA10放行", m.check_weekly_trend(_w_up, cfg) is True))
+checks.append(("周线主跌否决", m.check_weekly_trend(_w_down, cfg) is False))
+checks.append(("周线数据不足放行", m.check_weekly_trend(_w_up.head(5), cfg) is True))
+checks.append(("周线None放行", m.check_weekly_trend(None, cfg) is True))
+
+for label, ok in checks:
+    print(f"[{'OK' if ok else 'FAIL'}] {label}")
+results.extend(checks and [ok for _, ok in checks])
+
 print(f"\n{sum(results)}/{len(results)} 通过")
 sys.exit(0 if all(results) else 1)

@@ -140,6 +140,21 @@ class StrategyConfig:
     # 最终推荐数量上限：评分降序截取前 N 只（目标每日推荐 3~5 只）
     MAX_PICKS: int = 5
 
+    # ===== 严格确认指标（提高胜率，进一步压缩低质量信号）=====
+    # 区间位置过滤：现价在近 N 日价格区间（最低~最高）中的位置超过该比例，判定不够低位，否决
+    RANGE_LOOKBACK: int = 20
+    POSITION_IN_RANGE_MAX: float = 0.40
+    # MACD 动能确认：要求 MACD 柱当日较昨日改善（绿柱缩短或红柱放大）
+    REQUIRE_MACD_MOMENTUM: bool = True
+    # KDJ 确认：要求 KDJ 处于金叉状态（K>D）且 K 值不高于该上限（避免高位接力）
+    REQUIRE_KDJ_GOLDEN: bool = True
+    KDJ_K_MAX: float = 60.0
+    # 周线趋势确认：仅对通过全部日线筛选的决赛圈股票拉取周线，要求站上周线 MA10（容忍 2%）或 MA10 在上行
+    REQUIRE_WEEKLY_TREND: bool = True
+    WEEKLY_MA_PERIOD: int = 10
+    WEEKLY_SLOPE_LOOKBACK: int = 3
+    WEEKLY_TOLERANCE: float = 0.02
+
     # 趋势转折（MA5拐头 或 EMA金叉，同源信号合并计分，避免右侧拐点同日触发导致分数通胀）
     W_DAILY_TREND_TURN: float = 40.0
     W_DAILY_RSI_REBOUND: float = 25.0
@@ -750,6 +765,21 @@ def _fetch_daily_dual(code: str, days: int, config: StrategyConfig) -> Optional[
         if df is not None: return df
     return _fetch_daily_ak(code, days=days, config=config)
 
+def _fetch_weekly_dual(code: str, config: StrategyConfig) -> Optional[pd.DataFrame]:
+    """周线双源拉取（仅决赛圈周线趋势确认使用）：Baostock 优先，失败降级 AkShare"""
+    if _bs_available():
+        df = _fetch_weekly_bs(code, weeks=config.WEEKLY_BARS, config=config)
+        if df is not None: return df
+    if not _AK_AVAILABLE: return None
+    symbol = _ak_symbol(code)
+    start = (datetime.now() - timedelta(weeks=config.WEEKLY_BARS)).strftime("%Y%m%d")
+    end = datetime.now().strftime("%Y%m%d")
+    raw = _fetch_with_retry(
+        lambda: ak.stock_zh_a_hist(symbol=symbol, period="weekly", start_date=start, end_date=end, adjust=config.ADJUST),
+        config.MAX_RETRY, f"ak_weekly({symbol})"
+    )
+    return _normalize_ak_hist(raw)
+
 def _fetch_index_daily_dual(symbol: str, config: StrategyConfig) -> Optional[pd.DataFrame]:
     if _bs_available():
         df = _fetch_index_daily_bs(symbol, config)
@@ -860,6 +890,13 @@ def compute_daily_signals(df: pd.DataFrame, config: StrategyConfig) -> Optional[
     out["macd_dea"] = out["macd_diff"].ewm(span=config.DAILY_MACD_SIGNAL, adjust=False).mean()
     out["macd_histogram"] = out["macd_diff"] - out["macd_dea"]
 
+    # KDJ(9,3,3)：SMA(X,3,1) 等价于 ewm(com=2)
+    _low9 = out["low"].rolling(9).min()
+    _high9 = out["high"].rolling(9).max()
+    _rsv = (out["close"] - _low9) / (_high9 - _low9).replace(0, np.nan) * 100
+    out["kdj_k"] = _rsv.ewm(com=2, adjust=False).mean()
+    out["kdj_d"] = out["kdj_k"].ewm(com=2, adjust=False).mean()
+
     if {"high", "low"}.issubset(out.columns):
         prev_close = out["close"].shift(1)
         tr = pd.concat([out["high"] - out["low"], (out["high"] - prev_close).abs(), (out["low"] - prev_close).abs()], axis=1).max(axis=1)
@@ -946,6 +983,40 @@ def _lift_grade(grade: str, levels: int = 1) -> str:
     idx = _GRADE_ORDER.index(grade) if grade in _GRADE_ORDER else 0
     return _GRADE_ORDER[min(idx + levels, len(_GRADE_ORDER) - 1)]
 
+# ===== 严格确认指标判定（纯函数，数据缺失一律放行不误杀）=====
+
+def _range_position_ok(daily_out: pd.DataFrame, config: StrategyConfig) -> bool:
+    """现价须处于近 RANGE_LOOKBACK 日价格区间的下半部（位置 ≤ POSITION_IN_RANGE_MAX），确保买在低位"""
+    win = daily_out.tail(config.RANGE_LOOKBACK)
+    lo, hi = float(win["low"].min()), float(win["high"].max())
+    if hi <= lo: return True
+    return (float(daily_out.iloc[-1]["close"]) - lo) / (hi - lo) <= config.POSITION_IN_RANGE_MAX
+
+def _macd_momentum_ok(daily_out: pd.DataFrame, config: StrategyConfig) -> bool:
+    """MACD 柱当日较昨日改善（绿柱缩短或红柱放大）"""
+    if len(daily_out) < 2: return True
+    h, hp = daily_out.iloc[-1]["macd_histogram"], daily_out.iloc[-2]["macd_histogram"]
+    if pd.isna(h) or pd.isna(hp): return True
+    return float(h) > float(hp)
+
+def _kdj_ok(daily_out: pd.DataFrame, config: StrategyConfig) -> bool:
+    """KDJ 处于金叉状态（K>D）且 K 值不在高位（≤ KDJ_K_MAX）"""
+    k, d = daily_out.iloc[-1]["kdj_k"], daily_out.iloc[-1]["kdj_d"]
+    if pd.isna(k) or pd.isna(d): return True
+    return float(k) > float(d) and float(k) <= config.KDJ_K_MAX
+
+def check_weekly_trend(weekly_df: Optional[pd.DataFrame], config: StrategyConfig) -> bool:
+    """周线趋势确认：收盘价站上周线 MA10（容忍 WEEKLY_TOLERANCE）或周线 MA10 本身在上行；数据不足放行"""
+    if weekly_df is None or weekly_df.empty or "close" not in weekly_df.columns: return True
+    if len(weekly_df) < config.WEEKLY_MA_PERIOD + config.WEEKLY_SLOPE_LOOKBACK: return True
+    w = weekly_df.sort_values("date").reset_index(drop=True) if "date" in weekly_df.columns else weekly_df.reset_index(drop=True)
+    wma = w["close"].rolling(config.WEEKLY_MA_PERIOD).mean()
+    ma_now, ma_prev = float(wma.iloc[-1]), float(wma.iloc[-(1 + config.WEEKLY_SLOPE_LOOKBACK)])
+    close = float(w["close"].iloc[-1])
+    if close >= ma_now * (1 - config.WEEKLY_TOLERANCE): return True
+    if ma_now > ma_prev: return True
+    return False
+
 def evaluate(daily_df: Optional[pd.DataFrame], code: str = "", name: str = "", config: Optional[StrategyConfig] = None, market_env: Optional[dict] = None, fund_data: Optional[dict] = None) -> tuple[Optional[Signal], str]:
     if config is None: config = StrategyConfig()
     regime = (market_env or {}).get("regime", "unknown")
@@ -982,6 +1053,11 @@ def evaluate(daily_df: Optional[pd.DataFrame], code: str = "", name: str = "", c
     last_close = float(d_last["close"])
     if high_n > 0 and (high_n - last_close) / high_n < config.MIN_DRAWDOWN_FROM_HIGH:
         return None, "FAIL_NOT_BOTTOM"
+
+    # 严格确认指标：低位/动能/KDJ 三重确认，任一不过即否决
+    if not _range_position_ok(daily_out, config): return None, "FAIL_POSITION"
+    if config.REQUIRE_MACD_MOMENTUM and not _macd_momentum_ok(daily_out, config): return None, "FAIL_MACD_MOM"
+    if config.REQUIRE_KDJ_GOLDEN and not _kdj_ok(daily_out, config): return None, "FAIL_KDJ"
 
     daily_score = float(d_last.get("daily_score", 0))
     has_div = bool(d_last.get("bottom_divergence", False))
@@ -1077,8 +1153,9 @@ def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] 
                 elif reason == "FAIL_FUND": stats["fail_fund"] += 1
                 elif reason == "FAIL_DATA": stats["fail_data"] += 1
                 # FAIL_CHASE（追高）/ FAIL_GAP（跳空）/ FAIL_RSI_HIGH（RSI过高）/ FAIL_CLIMAX_VOL（天量）/ FAIL_NOT_BOTTOM（非底部区域）
-                # 均属技术面入场质量层，并入 fail_tech 统计
-                elif reason in ("FAIL_TECH", "FAIL_CHASE", "FAIL_GAP", "FAIL_RSI_HIGH", "FAIL_CLIMAX_VOL", "FAIL_NOT_BOTTOM"): stats["fail_tech"] += 1
+                # / FAIL_POSITION（区间位置偏高）/ FAIL_MACD_MOM（动能未改善）/ FAIL_KDJ（KDJ未金叉）均属技术面入场质量层
+                elif reason in ("FAIL_TECH", "FAIL_CHASE", "FAIL_GAP", "FAIL_RSI_HIGH", "FAIL_CLIMAX_VOL",
+                                "FAIL_NOT_BOTTOM", "FAIL_POSITION", "FAIL_MACD_MOM", "FAIL_KDJ"): stats["fail_tech"] += 1
                 elif reason == "FAIL_RR": stats["fail_rr"] += 1
                 elif reason == "ERROR": stats["error"] += 1
 
@@ -1102,6 +1179,23 @@ def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] 
             return None
 
         df = pd.DataFrame(signals).sort_values(SORT_BY, ascending=SORT_ASC).reset_index(drop=True)
+
+        # 决赛圈周线趋势确认：按评分降序逐个拉周线确认，取满 MAX_PICKS 即止（只对决赛圈拉取，成本可控）
+        if config.REQUIRE_WEEKLY_TREND and not df.empty:
+            confirmed = []
+            weekly_checked = 0
+            for _, row in df.iterrows():
+                if len(confirmed) >= config.MAX_PICKS: break
+                weekly_checked += 1
+                wk = _fetch_weekly_dual(row["code"], config)
+                if check_weekly_trend(wk, config):
+                    confirmed.append(row)
+                time.sleep(config.FETCH_DELAY)
+            weekly_dropped = weekly_checked - len(confirmed)
+            if weekly_dropped > 0:
+                print(f"[INFO] 周线趋势确认：检查 {weekly_checked} 只，淘汰 {weekly_dropped} 只（未站上周线MA{config.WEEKLY_MA_PERIOD}且均线下行）")
+            df = pd.DataFrame(confirmed).reset_index(drop=True) if confirmed else df.iloc[0:0]
+
         # 推荐数量上限：评分降序截取前 MAX_PICKS 只（目标每日 3~5 只精推，其余评分靠后的不推荐）
         if len(df) > config.MAX_PICKS:
             print(f"[INFO] 通过 {len(df)} 只，按评分截取前 {config.MAX_PICKS} 只（淘汰 {len(df) - config.MAX_PICKS} 只低分信号）")
