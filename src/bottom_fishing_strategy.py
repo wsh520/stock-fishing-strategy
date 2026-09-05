@@ -149,11 +149,20 @@ class StrategyConfig:
     # KDJ 确认：要求 KDJ 处于金叉状态（K>D）且 K 值不高于该上限（避免高位接力）
     REQUIRE_KDJ_GOLDEN: bool = True
     KDJ_K_MAX: float = 60.0
-    # 周线趋势确认：仅对通过全部日线筛选的决赛圈股票拉取周线，要求站上周线 MA10（容忍 2%）或 MA10 在上行
+    # 周线趋势确认：仅对通过全部日线筛选的决赛圈股票拉取周线；
+    # WEEKLY_MA_BOTH_REQUIRED=True 时须同时满足「收盘站上周线 MA10（容忍 2%）」和「MA10 在上行」，
+    # 设为 False 退回旧行为（两条件满足其一即可）
     REQUIRE_WEEKLY_TREND: bool = True
     WEEKLY_MA_PERIOD: int = 10
     WEEKLY_SLOPE_LOOKBACK: int = 3
     WEEKLY_TOLERANCE: float = 0.02
+    WEEKLY_MA_BOTH_REQUIRED: bool = True
+    # 周线 MACD 企稳确认：周线 MACD 柱翻红（含金叉后）或绿柱连续 2 周收窄，
+    # 确认周线级别动能拐头，避免周线仍在加速下跌时抄底；设为 False 关闭
+    REQUIRE_WEEKLY_MACD_STABLE: bool = True
+    WEEKLY_MACD_FAST: int = 12
+    WEEKLY_MACD_SLOW: int = 26
+    WEEKLY_MACD_SIGNAL: int = 9
 
     # 趋势转折（MA5拐头 或 EMA金叉，同源信号合并计分，避免右侧拐点同日触发导致分数通胀）
     W_DAILY_TREND_TURN: float = 40.0
@@ -1018,16 +1027,30 @@ def _kdj_ok(daily_out: pd.DataFrame, config: StrategyConfig) -> bool:
     return float(k) > float(d) and float(k) <= config.KDJ_K_MAX
 
 def check_weekly_trend(weekly_df: Optional[pd.DataFrame], config: StrategyConfig) -> bool:
-    """周线趋势确认：收盘价站上周线 MA10（容忍 WEEKLY_TOLERANCE）或周线 MA10 本身在上行；数据不足放行"""
+    """周线趋势确认：收盘价站上周线 MA10（容忍 WEEKLY_TOLERANCE）且 MA10 在上行；
+    WEEKLY_MA_BOTH_REQUIRED=False 退回旧行为（两条件满足其一即可）；数据不足放行"""
     if weekly_df is None or weekly_df.empty or "close" not in weekly_df.columns: return True
     if len(weekly_df) < config.WEEKLY_MA_PERIOD + config.WEEKLY_SLOPE_LOOKBACK: return True
     w = weekly_df.sort_values("date").reset_index(drop=True) if "date" in weekly_df.columns else weekly_df.reset_index(drop=True)
     wma = w["close"].rolling(config.WEEKLY_MA_PERIOD).mean()
     ma_now, ma_prev = float(wma.iloc[-1]), float(wma.iloc[-(1 + config.WEEKLY_SLOPE_LOOKBACK)])
     close = float(w["close"].iloc[-1])
-    if close >= ma_now * (1 - config.WEEKLY_TOLERANCE): return True
-    if ma_now > ma_prev: return True
-    return False
+    above = close >= ma_now * (1 - config.WEEKLY_TOLERANCE)
+    rising = ma_now > ma_prev
+    return (above and rising) if config.WEEKLY_MA_BOTH_REQUIRED else (above or rising)
+
+def check_weekly_macd(weekly_df: Optional[pd.DataFrame], config: StrategyConfig) -> bool:
+    """周线 MACD 企稳确认：柱值翻红（含金叉当周及之后的红柱状态，动能占优），
+    或绿柱连续 2 周收窄（柱值连续两周改善，下跌动能衰减企稳）；数据不足或 NaN 放行不误杀"""
+    if weekly_df is None or weekly_df.empty or "close" not in weekly_df.columns: return True
+    if len(weekly_df) < config.WEEKLY_MACD_SLOW + config.WEEKLY_MACD_SIGNAL: return True
+    w = weekly_df.sort_values("date").reset_index(drop=True) if "date" in weekly_df.columns else weekly_df.reset_index(drop=True)
+    dif = w["close"].ewm(span=config.WEEKLY_MACD_FAST, adjust=False).mean() - w["close"].ewm(span=config.WEEKLY_MACD_SLOW, adjust=False).mean()
+    hist = dif - dif.ewm(span=config.WEEKLY_MACD_SIGNAL, adjust=False).mean()
+    h1, h2, h3 = hist.iloc[-1], hist.iloc[-2], hist.iloc[-3]
+    if pd.isna(h1) or pd.isna(h2) or pd.isna(h3): return True
+    if float(h1) > 0: return True                 # 红柱（含金叉翻红），周线动能已占优
+    return float(h1) > float(h2) > float(h3)      # 绿柱连续 2 周收窄，企稳确认
 
 def evaluate(daily_df: Optional[pd.DataFrame], code: str = "", name: str = "", config: Optional[StrategyConfig] = None, market_env: Optional[dict] = None, fund_data: Optional[dict] = None) -> tuple[Optional[Signal], str]:
     if config is None: config = StrategyConfig()
@@ -1192,7 +1215,7 @@ def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] 
 
         df = pd.DataFrame(signals).sort_values(SORT_BY, ascending=SORT_ASC).reset_index(drop=True)
 
-        # 决赛圈周线趋势确认：按评分降序逐个拉周线确认，取满 MAX_PICKS 即止（只对决赛圈拉取，成本可控）
+        # 决赛圈周线确认：按评分降序逐个拉周线确认，取满 MAX_PICKS 即止（只对决赛圈拉取，成本可控）
         if config.REQUIRE_WEEKLY_TREND and not df.empty:
             confirmed = []
             weekly_checked = 0
@@ -1200,12 +1223,17 @@ def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] 
                 if len(confirmed) >= config.MAX_PICKS: break
                 weekly_checked += 1
                 wk = _fetch_weekly_dual(row["code"], config)
-                if check_weekly_trend(wk, config):
+                weekly_ok = check_weekly_trend(wk, config)
+                if weekly_ok and config.REQUIRE_WEEKLY_MACD_STABLE:
+                    weekly_ok = check_weekly_macd(wk, config)
+                if weekly_ok:
                     confirmed.append(row)
                 time.sleep(config.FETCH_DELAY)
             weekly_dropped = weekly_checked - len(confirmed)
             if weekly_dropped > 0:
-                print(f"[INFO] 周线趋势确认：检查 {weekly_checked} 只，淘汰 {weekly_dropped} 只（未站上周线MA{config.WEEKLY_MA_PERIOD}且均线下行）")
+                conds = [f"周线MA{config.WEEKLY_MA_PERIOD}" + ("站上且上行" if config.WEEKLY_MA_BOTH_REQUIRED else "站上或上行")]
+                if config.REQUIRE_WEEKLY_MACD_STABLE: conds.append("周线MACD企稳")
+                print(f"[INFO] 周线确认：检查 {weekly_checked} 只，淘汰 {weekly_dropped} 只（未满足 {' + '.join(conds)}）")
             df = pd.DataFrame(confirmed).reset_index(drop=True) if confirmed else df.iloc[0:0]
 
         # 推荐数量上限：评分降序截取前 MAX_PICKS 只（目标每日 3~5 只精推，其余评分靠后的不推荐）
