@@ -1,7 +1,12 @@
-# Data source (only one, hard dependency). Baostock is a pure-Python package
+# Primary data source. Baostock is a pure-Python package
 # (py3-none-any wheel, no native build) served by its own data server;
 # its only declared dependency is pandas.
 baostock>=0.9.0,<1.0.0
+
+# Fallback data source: AkShare (auto-switched when Baostock fails or is
+# circuit-broken). Optional at runtime — code degrades gracefully if missing,
+# but recommended so the strategy keeps working when Baostock is down.
+akshare>=1.12.0,<2.0.0
 
 # Calculation and data structures. Add major version upper limits: CI uses pip install -r
 # without constraints to pull latest, pandas 3.x has breaking changes compared to 2.x
@@ -11,4 +16,4 @@ numpy>=1.24.0,<3.0.0
 pandas>=2.0.0,<4.0.0
 
 # Feishu Webhook notification
-requests>=2.28.0,<3.0.0
+requests>=2.32.4,<3.0.0

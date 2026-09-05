@@ -29,3 +29,6 @@ cache/
 
 # 保留 data 目录（其中的 csv 产物需要作为 artifact 上传）
 !data/
+
+.cleanup_backup
+.workbuddy

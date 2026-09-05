@@ -1,13 +1,16 @@
 """
-精简版日线选股策略（Baostock 稳定数据源 + 底背离 + 漏斗日志版）
+精简版日线选股策略（Baostock 主数据源 + AkShare 备用数据源 + 底背离 + 漏斗日志版）
 
 仅使用日线数据进行选股，简化策略逻辑：
 1. 市场环境过滤（沪深300日线MA20斜率）
-2. 基本面防雷（ROE/负债率否决，Baostock暂不支持商誉与扣非净利润）
+2. 基本面防雷（ROE/负债率否决；Baostock 无商誉/扣非数据，切 AkShare 时自动补齐）
 3. 日线技术指标筛选（底背离 + MA5拐头 + EMA金叉 + RSI超卖反弹 + 量价配合）
 4. 风险收益比过滤（固定止损止盈）
 
-数据层：切换至 Baostock 数据源，包含自动重试、线程安全锁以及磁盘缓存。
+数据层：Baostock 为主、AkShare 为备的双数据源架构。
+- Baostock 连接管理：登录真实重试（检查 error_code）、查询失败自动重连、线程安全锁
+- 熔断机制：Baostock 连续失败达阈值后熔断，本次运行后续请求直接走 AkShare
+- 单条取数失败（返回空或异常）自动降级 AkShare 兜底
 """
 
 from __future__ import annotations
@@ -26,8 +29,24 @@ from typing import Any, Callable, Optional
 import numpy as np
 import pandas as pd
 
-# 替换为 baostock
 import baostock as bs
+
+# Baostock (0.9.0, 已停更) 的 ResultData.get_data() 翻页时内部使用 DataFrame.append，
+# 该方法在 pandas 2.0 中被移除。数据量小（个股日线/指数/基本面，单页装下）时不触发，
+# 但 query_all_stock 返回 2000+ 行必须翻页，会抛 AttributeError 导致股票列表拉取失败。
+# 兼容补丁：用 pd.concat 补回 append（仅影响本进程，赋值语义与 baostock 内部用法一致）。
+if not hasattr(pd.DataFrame, "append"):
+    pd.DataFrame.append = lambda self, other, ignore_index=False, **kw: pd.concat(  # type: ignore[attr-defined]
+        [self, other], ignore_index=ignore_index, **kw
+    )
+
+# AkShare 备用数据源（可选依赖，未安装时自动跳过 fallback）
+try:
+    import akshare as ak
+    _AK_AVAILABLE = True
+except ImportError:
+    ak = None
+    _AK_AVAILABLE = False
 
 _MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(_MODULE_DIR)
@@ -69,6 +88,10 @@ class StrategyConfig:
     MAX_DEBT_RATIO: float = 70.0
     MAX_GOODWILL_RATIO: float = 20.0
     MIN_DEDUCTED_PROFIT_RATIO: float = 0.5
+    # 金融业（银行/保险/券商等）负债率天然 80%+，通用阈值会全行业误杀，单独放宽兜底
+    FINANCE_NAME_KEYWORDS: tuple = ("银行", "保险", "证券", "信托", "期货")
+    FINANCE_EXEMPT_CODES: tuple = ("601318", "601336", "601601", "601628", "601319", "300059")  # 平安/新华/太保/人寿/人保/东方财富
+    FINANCE_MAX_DEBT_RATIO: float = 97.0
 
     DAILY_MA5: int = 5
     DAILY_MA10: int = 10
@@ -96,16 +119,17 @@ class StrategyConfig:
     ATR_STOP_MULT: float = 2.0
     USE_ATR_STOP: bool = True
 
-    MIN_AMOUNT: float = 5_000_000.0
+    MIN_AMOUNT: float = 5_000_000.0  # 近 20 日日均成交额下限（元），低于则判定流动性不足（僵尸股）
     MIN_DAYS: int = 60
 
-    W_DAILY_MA_TURN: float = 25.0
-    W_DAILY_EMA_CROSS: float = 25.0
+    # 趋势转折（MA5拐头 或 EMA金叉，同源信号合并计分，避免右侧拐点同日触发导致分数通胀）
+    W_DAILY_TREND_TURN: float = 40.0
     W_DAILY_RSI_REBOUND: float = 25.0
     W_DAILY_VOL_PRICE: float = 25.0
     DAILY_MULTI_RESONANCE_BONUS: float = 10.0
     DAILY_RSI_OVERBOUGHT_PENALTY: float = 3.0
-    W_DIVERGENCE_BONUS: float = 30.0
+    # 底背离不再直接加分，改为评级提升档数（与基础分脱钩，避免底背离股必然 A 级）
+    DIVERGENCE_GRADE_LIFT: int = 1
 
     GRADE_A: float = 80.0
     GRADE_B: float = 60.0
@@ -156,8 +180,72 @@ class CacheManager:
         self._store.clear()
 
 # ===========================================================================
-# 数据提供层 — Baostock 封装
+# 数据源一：Baostock（主）— 连接管理
 # ===========================================================================
+
+class _BsCircuitOpen(Exception):
+    """Baostock 熔断中，查询直接放弃（重试无意义，应立即降级 AkShare）"""
+
+# Baostock 全局连接状态（多线程下简单赋值/自增在 GIL 保护下安全）
+_bs_state = {
+    "logged_in": False,
+    "consecutive_failures": 0,
+    "circuit_open": False,
+}
+_BS_CIRCUIT_THRESHOLD = 8  # 连续失败达到该次数后熔断（单次取数最多计 MAX_RETRY+1 次）
+
+def _bs_login(max_retry: int = 5) -> bool:
+    """Baostock 登录。bs.login 失败时也返回对象，必须检查 error_code 才算真正重试。"""
+    for attempt in range(max_retry):
+        try:
+            with bs_lock:
+                lg = bs.login()
+            if getattr(lg, "error_code", None) == "0":
+                _bs_state["logged_in"] = True
+                _bs_state["consecutive_failures"] = 0
+                _bs_state["circuit_open"] = False
+                return True
+            logging.warning("Baostock 登录失败(%d/%d): %s", attempt + 1, max_retry, getattr(lg, "error_msg", "未知错误"))
+        except Exception as e:
+            logging.warning("Baostock 登录异常(%d/%d): %s", attempt + 1, max_retry, e)
+        _bs_state["logged_in"] = False
+        if attempt < max_retry - 1:
+            time.sleep(1.0 * (attempt + 1))
+    return False
+
+def _bs_logout() -> None:
+    """安全登出（仅在曾登录成功时调用）。"""
+    if not _bs_state["logged_in"]:
+        return
+    try:
+        with bs_lock:
+            bs.logout()
+    except Exception:
+        pass
+    _bs_state["logged_in"] = False
+
+def _bs_mark_success() -> None:
+    _bs_state["consecutive_failures"] = 0
+
+def _bs_mark_failure() -> None:
+    """记录一次查询失败：标记连接断开（下次查询前自动重连），连续失败达阈值则熔断。"""
+    _bs_state["consecutive_failures"] += 1
+    _bs_state["logged_in"] = False  # 可能连接已断开，下次查询前触发重新登录
+    if _bs_state["consecutive_failures"] >= _BS_CIRCUIT_THRESHOLD and not _bs_state["circuit_open"]:
+        _bs_state["circuit_open"] = True
+        print(f"[WARN] Baostock 连续失败 {_BS_CIRCUIT_THRESHOLD} 次，已熔断，本次运行后续请求切换至 AkShare 备用数据源")
+
+def _bs_available() -> bool:
+    return not _bs_state["circuit_open"]
+
+def _bs_guard(label: str) -> None:
+    """查询前置守卫：熔断检查 + 断线自动重连。不可用时抛异常由重试层捕获。"""
+    if _bs_state["circuit_open"]:
+        raise _BsCircuitOpen(f"{label}: Baostock 熔断中")
+    if not _bs_state["logged_in"]:
+        if not _bs_login(max_retry=2):
+            _bs_mark_failure()
+            raise ConnectionError(f"{label}: Baostock 连接不可用")
 
 def _format_bs_code(code: str) -> str:
     """将标准6位代码或Akshare格式转为Baostock格式 (如 sh.600000)"""
@@ -191,6 +279,8 @@ def _fetch_with_retry(fetcher: Callable[[], Any], max_retry: int, label: str, re
                 return None
             else:
                 last_err = RuntimeError(f"{label} 返回空")
+        except _BsCircuitOpen:
+            return None  # 熔断中，不再重试，立即返回让上层降级 AkShare
         except Exception as e:
             last_err = e
         if attempt < max_retry:
@@ -269,11 +359,14 @@ def _fetch_hist_bs(code: str, period: str, start: str, end: str, config: Strateg
     fields = "date,open,high,low,close,volume,amount,pctChg,turn"
 
     def fetch_data():
+        _bs_guard(f"bs_hist({bs_code},{period})")
         with bs_lock:
             rs = bs.query_history_k_data_plus(bs_code, fields, start_date=start, end_date=end, frequency=freq, adjustflag=adj)
-            if rs.error_code == '0' and len(rs.data) > 0:
-                return rs.get_data()
-        return None
+        if rs.error_code == '0':
+            _bs_mark_success()
+            return rs.get_data() if len(rs.data) > 0 else None  # 空 = 该标的确实无数据
+        _bs_mark_failure()
+        raise RuntimeError(f"bs_hist({bs_code}) 查询失败: {rs.error_msg}")
 
     raw_df = _fetch_with_retry(fetch_data, config.MAX_RETRY, f"bs_hist({bs_code},{period})")
     df = _normalize_bs_hist(raw_df)
@@ -310,11 +403,14 @@ def _fetch_index_daily_bs(symbol: str, config: StrategyConfig) -> Optional[pd.Da
     fields = "date,open,high,low,close,volume,amount,pctChg" # 指数无 turn
 
     def fetch_index():
+        _bs_guard(f"bs_index({bs_code})")
         with bs_lock:
             rs = bs.query_history_k_data_plus(bs_code, fields, start_date=start, end_date=end, frequency="d")
-            if rs.error_code == '0' and len(rs.data) > 0:
-                return rs.get_data()
-        return None
+        if rs.error_code == '0':
+            _bs_mark_success()
+            return rs.get_data() if len(rs.data) > 0 else None
+        _bs_mark_failure()
+        raise RuntimeError(f"bs_index({bs_code}) 查询失败: {rs.error_msg}")
 
     raw_df = _fetch_with_retry(fetch_index, config.MAX_RETRY, f"bs_index({bs_code})")
     df = _normalize_bs_hist(raw_df)
@@ -354,23 +450,32 @@ def _fetch_fundamentals_bs(code: str, config: Optional[StrategyConfig] = None) -
     result: dict[str, Optional[float]] = {"roe": None, "debt_ratio": None, "goodwill_ratio": None, "deducted_profit_ratio": None}
 
     def fetch_fund():
+        _bs_guard(f"bs_fund({bs_code})")
         with bs_lock:
             p_rs = bs.query_profit_data(code=bs_code, year=year, quarter=quarter)
             b_rs = bs.query_balance_data(code=bs_code, year=year, quarter=quarter)
-        return p_rs, b_rs
+        if getattr(p_rs, "error_code", None) == "0" or getattr(b_rs, "error_code", None) == "0":
+            _bs_mark_success()
+            return p_rs, b_rs
+        _bs_mark_failure()
+        raise RuntimeError(f"bs_fund({bs_code}) 查询失败: {getattr(p_rs, 'error_msg', '')} / {getattr(b_rs, 'error_msg', '')}")
 
     rs = _fetch_with_retry(fetch_fund, config.MAX_RETRY, f"bs_fund({bs_code})")
     if rs:
         p_rs, b_rs = rs
         if p_rs.error_code == '0' and len(p_rs.data) > 0:
             df = p_rs.get_data()
-            roe = pd.to_numeric(df["roeAvg"].iloc[0], errors="coerce")
-            if not pd.isna(roe): result["roe"] = roe * 100 # Baostock 返回小数(如0.05)
-        
+            if "roeAvg" in df.columns:
+                roe = pd.to_numeric(df["roeAvg"].iloc[0], errors="coerce")
+                if not pd.isna(roe): result["roe"] = roe * 100 # Baostock 返回小数(如0.05)
+
         if b_rs.error_code == '0' and len(b_rs.data) > 0:
             df = b_rs.get_data()
-            debt = pd.to_numeric(df["liabRate"].iloc[0], errors="coerce")
-            if not pd.isna(debt): result["debt_ratio"] = debt * 100
+            # Baostock 资产负债率字段为 liabilityToAsset（小数形式，兼容其他可能的字段名）
+            debt_col = next((c for c in ("liabilityToAsset", "liabToAsset", "liabRate") if c in df.columns), None)
+            if debt_col:
+                debt = pd.to_numeric(df[debt_col].iloc[0], errors="coerce")
+                if not pd.isna(debt): result["debt_ratio"] = debt * 100
 
     if not any(v is not None for v in result.values()): return None
     if path: _write_cache_json(result, path)
@@ -386,12 +491,22 @@ def _fetch_stock_pool_bs(config: Optional[StrategyConfig] = None) -> list[dict]:
             df = _read_cache_csv(path, dtype={"code": str, "name": str})
 
     if df is None or "code" not in df.columns or "name" not in df.columns:
-        date = datetime.now().strftime("%Y-%m-%d")
         def fetch_list():
-            with bs_lock:
-                rs = bs.query_all_stock(day=date)
-                if rs.error_code == '0': return rs.get_data()
-            return None
+            _bs_guard("bs_all_stock")
+            # 非交易日（周末/节假日）query_all_stock 返回空，逐日前退找最近交易日
+            for i in range(10):
+                day = (datetime.now() - timedelta(days=i)).strftime("%Y-%m-%d")
+                with bs_lock:
+                    rs = bs.query_all_stock(day=day)
+                if rs.error_code != '0':
+                    _bs_mark_failure()
+                    raise RuntimeError(f"bs_all_stock({day}) 查询失败: {rs.error_msg}")
+                _bs_mark_success()
+                if len(rs.data) > 0:
+                    if i > 0:
+                        print(f"[INFO] 今日非交易日，股票列表回退至最近交易日 {day}")
+                    return rs.get_data()
+            return None  # 连续 10 天均为空（极端异常）
         
         raw = _fetch_with_retry(fetch_list, config.LIST_MAX_RETRY, "bs_all_stock")
         if raw is None or raw.empty: return []
@@ -403,14 +518,228 @@ def _fetch_stock_pool_bs(config: Optional[StrategyConfig] = None) -> list[dict]:
         df = raw[["code", "name"]]
         if path: _write_cache_csv(df, path)
 
+    return _apply_pool_filters(df, config).to_dict("records")
+
+
+def _apply_pool_filters(df: pd.DataFrame, config: StrategyConfig) -> pd.DataFrame:
+    """股票池过滤（Baostock / AkShare 共用），入参需含 code/name 列"""
     out = df.copy()
+    out["code"] = out["code"].astype(str).str.zfill(6)
+    out["name"] = out["name"].astype(str)
     if config.EXCLUDE_BSE: out = out[~out["code"].str.startswith(("8", "4"))]
     if config.EXCLUDE_CHINEXT: out = out[~out["code"].str.startswith(("300", "301"))]
     if config.EXCLUDE_STAR: out = out[~out["code"].str.startswith(("688", "689"))]
     if config.FILTER_ST: out = out[~out["name"].str.contains("ST", case=False, na=False)]
     if config.EXCLUDE_DELISTING: out = out[~out["name"].str.contains("退", na=False)]
-    
-    return out.reset_index(drop=True).to_dict("records")
+    return out.reset_index(drop=True)
+
+
+# ===========================================================================
+# 数据源二：AkShare（备用，Baostock 失败/熔断时自动切换）
+# ===========================================================================
+
+_AK_COLUMN_MAP = {
+    "日期": "date", "开盘": "open", "收盘": "close", "最高": "high",
+    "最低": "low", "成交量": "volume", "成交额": "amount",
+    "涨跌幅": "pct_chg", "换手率": "turnover",
+}
+_AK_INDEX_NUMERIC_COLS = ("open", "high", "low", "close", "volume")
+
+def _ak_symbol(code: str) -> str:
+    """转为 AkShare 6 位数字代码（如 sh.600000 / 600000 -> 600000）"""
+    return code.replace("sh.", "").replace("sz.", "").replace("bj.", "").zfill(6)
+
+def _normalize_ak_hist(raw: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
+    """AkShare 个股行情标准化：中文列名映射为统一英文列名"""
+    if raw is None or raw.empty: return None
+    df = raw.rename(columns=_AK_COLUMN_MAP)
+    keep = [c for c in _AK_COLUMN_MAP.values() if c in df.columns]
+    if "date" not in keep or "close" not in keep: return None
+    df = df[keep].copy()
+    df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.strftime(_DATE_FMT)
+    for col in _NUMERIC_COLS:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=["date", "close"])
+    return df.sort_values("date").reset_index(drop=True) if not df.empty else None
+
+def _ak_sina_symbol(code: str) -> str:
+    """转为新浪格式（如 sh600000 / sz000001）"""
+    c = _ak_symbol(code)
+    return f"sh{c}" if c.startswith("6") else f"sz{c}"
+
+def _fetch_daily_ak_sina(code: str, days: int, config: StrategyConfig) -> Optional[pd.DataFrame]:
+    """新浪通道兜底：东财接口不可达时使用。返回全量历史需截窗；无 pct_chg 列，用收盘价自算。"""
+    symbol = _ak_sina_symbol(code)
+    raw = _fetch_with_retry(
+        lambda: ak.stock_zh_a_daily(symbol=symbol, adjust=config.ADJUST),
+        config.MAX_RETRY, f"ak_sina({symbol})"
+    )
+    if raw is None or raw.empty or "date" not in raw.columns or "close" not in raw.columns: return None
+    keep = [c for c in ("date", "open", "high", "low", "close", "volume", "amount", "turnover") if c in raw.columns]
+    df = raw[keep].copy()
+    df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.strftime(_DATE_FMT)
+    for col in _NUMERIC_COLS:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=["date", "close"]).sort_values("date")
+    df["pct_chg"] = df["close"].pct_change() * 100
+    df = df.tail(days + 30).reset_index(drop=True)
+    return df if not df.empty else None
+
+def _fetch_daily_ak(code: str, days: int = 120, config: Optional[StrategyConfig] = None) -> Optional[pd.DataFrame]:
+    if not _AK_AVAILABLE: return None
+    config = config or StrategyConfig()
+    symbol = _ak_symbol(code)
+    path = ""
+    if config.USE_CACHE:
+        # 纯数字命名，与 Baostock 缓存（带 sh. 前缀）天然隔离
+        path = _cache_path(config, _window_cache_name("daily", symbol, days, config))
+        if _cache_fresh_today(path):
+            if (cached := _read_cache_csv(path)) is not None: return cached
+    start, end = _window_dates(days, "days")
+    # 通道 1：东方财富
+    raw = _fetch_with_retry(
+        lambda: ak.stock_zh_a_hist(symbol=symbol, period="daily",
+                                   start_date=start.replace("-", ""), end_date=end.replace("-", ""),
+                                   adjust=config.ADJUST),
+        config.MAX_RETRY, f"ak_hist({symbol})"
+    )
+    df = _normalize_ak_hist(raw)
+    # 通道 2：新浪（东财不可达时兜底）
+    if df is None:
+        df = _fetch_daily_ak_sina(code, days, config)
+    if df is not None and path: _write_cache_csv(df, path)
+    return df
+
+def _fetch_index_daily_ak(symbol: str, config: StrategyConfig) -> Optional[pd.DataFrame]:
+    if not _AK_AVAILABLE: return None
+    ak_symbol = symbol.replace(".", "")  # sh000300 格式
+    path = ""
+    if config.USE_CACHE:
+        path = _cache_path(config, f"index_daily_{ak_symbol}.csv")
+        if _cache_fresh_today(path):
+            if (cached := _read_cache_csv(path)) is not None: return cached
+    raw = _fetch_with_retry(
+        lambda: ak.stock_zh_index_daily(symbol=ak_symbol),
+        config.MAX_RETRY, f"ak_index({ak_symbol})", retry_on_empty=True
+    )
+    if raw is None or "date" not in raw.columns or "close" not in raw.columns: return None
+    df = raw.copy()
+    df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.strftime(_DATE_FMT)
+    for col in _AK_INDEX_NUMERIC_COLS:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=["date", "close"])
+    if df.empty: return None
+    # 接口返回全量历史，截取与 Baostock 对齐的窗口
+    df = df.sort_values("date").tail(config.DAILY_BARS + 30).reset_index(drop=True)
+    if path: _write_cache_csv(df, path)
+    return df
+
+def _fetch_fundamentals_ak(code: str, config: Optional[StrategyConfig] = None) -> Optional[dict]:
+    """AkShare 基本面：相比 Baostock 额外补齐商誉占比与扣非利润占比"""
+    if not _AK_AVAILABLE: return None
+    config = config or StrategyConfig()
+    symbol = _ak_symbol(code)
+    path = ""
+    if config.USE_CACHE:
+        path = _cache_path(config, f"fund_{symbol}.json")
+        if _cache_fresh(path, config.FUND_CACHE_TTL_DAYS):
+            if (cached := _read_cache_json(path)) is not None: return cached
+
+    result: dict[str, Optional[float]] = {"roe": None, "debt_ratio": None, "goodwill_ratio": None, "deducted_profit_ratio": None}
+
+    df_fin = _fetch_with_retry(lambda: ak.stock_financial_analysis_indicator(symbol=symbol, start_year=config.FUND_START_YEAR), config.MAX_RETRY, f"ak_fund({symbol})")
+    if df_fin is not None and not df_fin.empty:
+        row = df_fin.iloc[0]
+        for col in df_fin.columns:
+            col_str, col_lower = str(col), str(col).lower()
+            if "净资产收益率" in col_str or "roe" in col_lower:
+                val = pd.to_numeric(row[col], errors="coerce")
+                if not pd.isna(val): result["roe"] = float(val)
+            if "资产负债率" in col_str or "debt" in col_lower:
+                val = pd.to_numeric(row[col], errors="coerce")
+                if not pd.isna(val): result["debt_ratio"] = float(val)
+
+    df_bs = _fetch_with_retry(lambda: ak.stock_balance_sheet_by_report_em(symbol=symbol), config.MAX_RETRY, f"ak_bs({symbol})")
+    if df_bs is not None and not df_bs.empty:
+        row = df_bs.iloc[0]
+        goodwill, net_assets = 0.0, 0.0
+        for col in df_bs.columns:
+            if "商誉" in str(col):
+                val = pd.to_numeric(row.get(col), errors="coerce")
+                if not pd.isna(val): goodwill = float(val)
+            if "股东权益合计" in str(col) or "净资产" in str(col):
+                val = pd.to_numeric(row.get(col), errors="coerce")
+                if not pd.isna(val) and val > 0: net_assets = float(val)
+        if net_assets > 0: result["goodwill_ratio"] = goodwill / net_assets * 100
+
+    df_income = _fetch_with_retry(lambda: ak.stock_profit_sheet_by_report_em(symbol=symbol), config.MAX_RETRY, f"ak_income({symbol})")
+    if df_income is not None and not df_income.empty:
+        row = df_income.iloc[0]
+        net_profit, deducted_profit = 0.0, 0.0
+        for col in df_income.columns:
+            col_str = str(col)
+            if "净利润" in col_str and "扣" not in col_str and "归" not in col_str:
+                val = pd.to_numeric(row.get(col), errors="coerce")
+                if not pd.isna(val): net_profit = float(val)
+            if "扣非" in col_str or "扣除非经常" in col_str:
+                val = pd.to_numeric(row.get(col), errors="coerce")
+                if not pd.isna(val): deducted_profit = float(val)
+        if net_profit > 0: result["deducted_profit_ratio"] = deducted_profit / net_profit
+
+    if not any(v is not None for v in result.values()): return None
+    if path: _write_cache_json(result, path)
+    return result
+
+def _fetch_stock_pool_ak(config: Optional[StrategyConfig] = None) -> list[dict]:
+    if not _AK_AVAILABLE: return []
+    config = config or StrategyConfig()
+    path = ""
+    df: Optional[pd.DataFrame] = None
+    if config.USE_CACHE:
+        path = _cache_path(config, "stock_list.csv")
+        if _cache_fresh(path, config.CACHE_TTL_DAYS):
+            df = _read_cache_csv(path, dtype={"code": str, "name": str})
+            if df is not None and ("code" not in df.columns or "name" not in df.columns): df = None
+    if df is None:
+        raw = _fetch_with_retry(lambda: ak.stock_info_a_code_name(), config.LIST_MAX_RETRY, "ak_stock_info", retry_on_empty=True)
+        if raw is None or "code" not in raw.columns or "name" not in raw.columns: return []
+        df = raw[["code", "name"]].copy()
+        df["code"] = df["code"].astype(str).str.zfill(6)
+        df["name"] = df["name"].astype(str)
+        if path: _write_cache_csv(df, path)
+    return _apply_pool_filters(df, config).to_dict("records")
+
+
+# ===========================================================================
+# 主备数据源路由（Baostock 优先，失败/熔断自动降级 AkShare）
+# ===========================================================================
+
+def _fetch_daily_dual(code: str, days: int, config: StrategyConfig) -> Optional[pd.DataFrame]:
+    if _bs_available():
+        df = _fetch_daily_bs(code, days=days, config=config)
+        if df is not None: return df
+    return _fetch_daily_ak(code, days=days, config=config)
+
+def _fetch_index_daily_dual(symbol: str, config: StrategyConfig) -> Optional[pd.DataFrame]:
+    if _bs_available():
+        df = _fetch_index_daily_bs(symbol, config)
+        if df is not None: return df
+    return _fetch_index_daily_ak(symbol, config)
+
+def _fetch_fundamentals_dual(code: str, config: Optional[StrategyConfig] = None) -> Optional[dict]:
+    if _bs_available():
+        data = _fetch_fundamentals_bs(code, config)
+        if data is not None: return data
+    return _fetch_fundamentals_ak(code, config)
+
+def _fetch_stock_pool_dual(config: StrategyConfig) -> list[dict]:
+    if _bs_available():
+        stocks = _fetch_stock_pool_bs(config)
+        if stocks: return stocks
+    return _fetch_stock_pool_ak(config)
 
 
 # ===========================================================================
@@ -420,28 +749,28 @@ def _fetch_stock_pool_bs(config: Optional[StrategyConfig] = None) -> list[dict]:
 def get_daily_data(code: str, config: StrategyConfig, cache: Optional[CacheManager] = None) -> Optional[pd.DataFrame]:
     cache_key = f"daily_{code}"
     if cache and (cached := cache.get(cache_key)) is not None: return cached
-    df = _fetch_daily_bs(code, days=config.DAILY_BARS, config=config)
+    df = _fetch_daily_dual(code, days=config.DAILY_BARS, config=config)
     if cache and df is not None: cache.set(cache_key, df)
     return df
 
 def get_index_daily(config: StrategyConfig, cache: Optional[CacheManager] = None) -> Optional[pd.DataFrame]:
     cache_key = "index_daily_csi300"
     if cache and (cached := cache.get(cache_key)) is not None: return cached
-    df = _fetch_index_daily_bs(config.CSI300_AK_SYMBOL, config)
+    df = _fetch_index_daily_dual(config.CSI300_AK_SYMBOL, config)
     if cache and df is not None: cache.set(cache_key, df)
     return df
 
 def get_fundamentals(code: str, cache: Optional[CacheManager] = None, config: Optional[StrategyConfig] = None) -> Optional[dict]:
     cache_key = f"fund_{code}"
     if cache and (cached := cache.get(cache_key)) is not None: return cached
-    data = _fetch_fundamentals_bs(code, config)
+    data = _fetch_fundamentals_dual(code, config)
     if cache and data is not None: cache.set(cache_key, data)
     return data
 
 def get_stock_list(config: StrategyConfig, cache: Optional[CacheManager] = None) -> list[dict]:
     cache_key = "stock_list"
     if cache and (cached := cache.get(cache_key)) is not None: return cached
-    stocks = _fetch_stock_pool_bs(config)
+    stocks = _fetch_stock_pool_dual(config)
     if cache and stocks: cache.set(cache_key, stocks)
     return stocks
 
@@ -463,19 +792,28 @@ def compute_market_environment(df_index: pd.DataFrame, config: StrategyConfig) -
     else: regime, desc = "neutral", f"中性（MA20斜率 {slope:.4f}，沪深300收于 {close_now:.0f}）"
     return {"regime": regime, "description": desc, "ma20": round(ma_now, 2), "slope": round(slope, 6), "close": round(close_now, 2)}
 
-def check_fundamentals(fund_data: Optional[dict], config: StrategyConfig) -> bool:
+def _is_financial_stock(code: str, name: str, config: StrategyConfig) -> bool:
+    """金融业（银行/保险/券商/信托/期货）识别：名称关键词 + 代码白名单（覆盖无关键词的知名金融股）"""
+    if code and code in config.FINANCE_EXEMPT_CODES: return True
+    return any(k in (name or "") for k in config.FINANCE_NAME_KEYWORDS)
+
+def check_fundamentals(fund_data: Optional[dict], config: StrategyConfig, code: str = "", name: str = "") -> bool:
     if fund_data is None: return True
     if (roe := fund_data.get("roe")) is not None and roe < config.MIN_ROE: return False
-    if (debt := fund_data.get("debt_ratio")) is not None and debt > config.MAX_DEBT_RATIO: return False
+    # 金融业负债率天然 80%+（如银行约 90%），使用放宽阈值避免全行业误杀；极端值仍否决
+    debt_limit = config.FINANCE_MAX_DEBT_RATIO if _is_financial_stock(code, name, config) else config.MAX_DEBT_RATIO
+    if (debt := fund_data.get("debt_ratio")) is not None and debt > debt_limit: return False
     # Baostock 缺失时为 None，自动放行，逻辑保持不变
     if (goodwill := fund_data.get("goodwill_ratio")) is not None and goodwill > config.MAX_GOODWILL_RATIO: return False
     if (deducted := fund_data.get("deducted_profit_ratio")) is not None and deducted < config.MIN_DEDUCTED_PROFIT_RATIO: return False
     return True
 
-_DAILY_NEED_COLS = {"close", "volume", "date", "high", "low", "pct_chg", "turnover"}
+_DAILY_NEED_COLS = {"close", "volume", "amount", "date", "high", "low", "pct_chg"}
 
 def compute_daily_signals(df: pd.DataFrame, config: StrategyConfig) -> Optional[pd.DataFrame]:
     if df is None or df.empty or not _DAILY_NEED_COLS.issubset(df.columns) or len(df) < config.MIN_DAYS: return None
+    # 流动性过滤：近 20 日日均成交额低于下限，判定为僵尸股直接否决
+    if df["amount"].tail(20).mean() < config.MIN_AMOUNT: return None
     out = df.copy().reset_index(drop=True)
     out["ma5"] = out["close"].rolling(config.DAILY_MA5).mean()
     out["ma10"] = out["close"].rolling(config.DAILY_MA10).mean()
@@ -503,12 +841,18 @@ def compute_daily_signals(df: pd.DataFrame, config: StrategyConfig) -> Optional[
 
     out["daily_vol_base"] = out["volume"].shift(1).rolling(20).mean()
     out["daily_vol_ratio"] = out["volume"] / out["daily_vol_base"].replace(0, np.nan)
-    out["daily_to_base"] = out["turnover"].shift(1).rolling(config.DAILY_TURNOVER_LOOKBACK).mean()
-    out["daily_turnover_ratio"] = out["turnover"] / out["daily_to_base"].replace(0, np.nan)
+    # 换手比仅用于展示，不参与过滤（与量比同源：流通股短期不变，二者比值数学上几乎相等）
+    if "turnover" in out.columns:
+        out["daily_to_base"] = out["turnover"].shift(1).rolling(config.DAILY_TURNOVER_LOOKBACK).mean()
+        out["daily_turnover_ratio"] = out["turnover"] / out["daily_to_base"].replace(0, np.nan)
+    else:
+        out["daily_turnover_ratio"] = np.nan
 
     ma5_slope = out["ma5"] - out["ma5"].shift(1)
     out["ma5_turn"] = (ma5_slope > 0) & (ma5_slope.shift(1) <= 0)
     out["ema_golden_cross"] = (out["ema5"] > out["ema10"]) & (out["ema5"].shift(1) <= out["ema10"].shift(1))
+    # MA5拐头与EMA金叉在右侧拐点经常同日触发（同一信息），合并为一个趋势转折信号
+    out["trend_turn"] = out["ma5_turn"] | out["ema_golden_cross"]
     out["macd_golden_cross"] = (out["macd_diff"] > out["macd_dea"]) & (out["macd_diff"].shift(1) <= out["macd_dea"].shift(1))
     rsi_was_oversold = (out["rsi14"].shift(1) < config.DAILY_RSI_OVERSOLD) | (out["rsi14"].shift(2) < config.DAILY_RSI_OVERSOLD)
     out["rsi_rebound"] = rsi_was_oversold & (out["rsi14"] >= config.DAILY_RSI_REBOUND_MIN)
@@ -526,18 +870,15 @@ def compute_daily_signals(df: pd.DataFrame, config: StrategyConfig) -> Optional[
 
     price_up = out["close"] > out["close"].shift(1)
     vol_expand = out["daily_vol_ratio"] >= config.DAILY_VOL_EXPAND
-    turnover_expand = out["daily_turnover_ratio"] >= config.DAILY_VOL_EXPAND
-    out["vol_price_coord"] = price_up & vol_expand & turnover_expand
+    out["vol_price_coord"] = price_up & vol_expand
     out["multi_resonance"] = out["rsi_multi_res"] & out["macd_golden_cross"] & out["vol_price_coord"]
 
     out["daily_score"] = (
-        out["ma5_turn"].astype(float) * config.W_DAILY_MA_TURN +
-        out["ema_golden_cross"].astype(float) * config.W_DAILY_EMA_CROSS +
+        out["trend_turn"].astype(float) * config.W_DAILY_TREND_TURN +
         out["rsi_rebound"].astype(float) * config.W_DAILY_RSI_REBOUND +
         out["vol_price_coord"].astype(float) * config.W_DAILY_VOL_PRICE +
         out["multi_resonance"].astype(float) * config.DAILY_MULTI_RESONANCE_BONUS +
-        (out["rsi14"] >= config.DAILY_RSI_OVERBOUGHT).astype(float) * (-config.DAILY_RSI_OVERBOUGHT_PENALTY) +
-        out["bottom_divergence"].astype(float) * config.W_DIVERGENCE_BONUS
+        (out["rsi14"] >= config.DAILY_RSI_OVERBOUGHT).astype(float) * (-config.DAILY_RSI_OVERBOUGHT_PENALTY)
     ).fillna(0).clip(0, 100).round(1)
 
     return out
@@ -565,12 +906,19 @@ def _grade_from_score(score: float, config: StrategyConfig) -> str:
     elif score >= config.GRADE_C: return "C"
     return "D"
 
+_GRADE_ORDER = ("D", "C", "B", "A")
+
+def _lift_grade(grade: str, levels: int = 1) -> str:
+    """评级提升（底背离奖励），A 级封顶"""
+    idx = _GRADE_ORDER.index(grade) if grade in _GRADE_ORDER else 0
+    return _GRADE_ORDER[min(idx + levels, len(_GRADE_ORDER) - 1)]
+
 def evaluate(daily_df: Optional[pd.DataFrame], code: str = "", name: str = "", config: Optional[StrategyConfig] = None, market_env: Optional[dict] = None, fund_data: Optional[dict] = None) -> tuple[Optional[Signal], str]:
     if config is None: config = StrategyConfig()
     regime = (market_env or {}).get("regime", "unknown")
     grade_boost = config.BEAR_GRADE_BOOST if regime == "bear" else 0.0
 
-    if not check_fundamentals(fund_data, config): return None, "FAIL_FUND"
+    if not check_fundamentals(fund_data, config, code=code, name=name): return None, "FAIL_FUND"
 
     daily_out = compute_daily_signals(daily_df, config)
     if daily_out is None or daily_out.empty: return None, "FAIL_DATA"
@@ -578,6 +926,10 @@ def evaluate(daily_df: Optional[pd.DataFrame], code: str = "", name: str = "", c
     d_last = daily_out.iloc[-1]
     daily_score = float(d_last.get("daily_score", 0))
     grade = _grade_from_score(daily_score - grade_boost, config)
+    # 底背离：评级提升一档（与基础分脱钩），D 级因此可被挽救为 C
+    has_div = bool(d_last.get("bottom_divergence", False))
+    if has_div and config.DIVERGENCE_GRADE_LIFT > 0:
+        grade = _lift_grade(grade, config.DIVERGENCE_GRADE_LIFT)
     if grade == "D": return None, "FAIL_TECH"
 
     last_close, atr_val = float(d_last["close"]), d_last.get("atr")
@@ -594,7 +946,7 @@ def evaluate(daily_df: Optional[pd.DataFrame], code: str = "", name: str = "", c
         vol_ratio=round(float(d_last.get("daily_vol_ratio", 0)), 2),
         turnover_ratio=round(float(d_last.get("daily_turnover_ratio", 0)), 2),
         stop_loss=rr["stop_loss"], take_profit=rr["take_profit"], rr_ratio=rr["rr_ratio"],
-        market_env=regime, has_divergence=bool(d_last.get("bottom_divergence", False))
+        market_env=regime, has_divergence=has_div
     )
     return sig, "PASS"
 
@@ -614,12 +966,17 @@ def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] 
     if cache is None: cache = CacheManager(expire_hours=config.CACHE_EXPIRE_HOURS)
 
     # ==========================
-    # 初始化 Baostock 连接
+    # 初始化数据源：Baostock 优先，登录失败降级 AkShare
     # ==========================
-    lg = bs.login()
-    if lg.error_code != '0':
-        print(f"[ERROR] Baostock 登录失败: {lg.error_msg}")
-        return None
+    if not _bs_login(max_retry=5):
+        if _AK_AVAILABLE:
+            print("[WARN] Baostock 登录失败（已重试 5 次），本次运行降级为 AkShare 备用数据源")
+            _bs_state["circuit_open"] = True
+        else:
+            print("[ERROR] Baostock 登录失败，且未安装 AkShare（pip install akshare），无可用数据源")
+            return None
+    else:
+        print(f"[INFO] 数据源: Baostock（备用: {'AkShare' if _AK_AVAILABLE else '未安装 akshare，无备用'}）")
 
     try:
         market_env = get_market_environment(config, cache)
@@ -685,8 +1042,8 @@ def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] 
         return df
 
     finally:
-        # 无论发生什么异常，确保安全退出 Baostock
-        bs.logout()
+        # 无论发生什么异常，确保安全退出 Baostock（未登录时自动跳过）
+        _bs_logout()
 
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else "full"
