@@ -135,6 +135,9 @@ class StrategyConfig:
     GRADE_B: float = 60.0
     GRADE_C: float = 40.0
     BEAR_GRADE_BOOST: float = 10.0
+    # 准入等级门槛：基础评级（按分数，不含底背离提升）须不低于该等级，默认 B（≥60 分）。
+    # C 级仅为单一趋势转折信号（40 分），噪音过大不再推荐；设为 "C" 可恢复旧行为。
+    MIN_PASS_GRADE: str = "B"
 
     CACHE_EXPIRE_HOURS: float = 4.0
     MAX_WORKERS: int = 4
@@ -931,12 +934,15 @@ def evaluate(daily_df: Optional[pd.DataFrame], code: str = "", name: str = "", c
 
     d_last = daily_out.iloc[-1]
     daily_score = float(d_last.get("daily_score", 0))
-    grade = _grade_from_score(daily_score - grade_boost, config)
-    # 底背离：评级提升一档（与基础分脱钩），D 级因此可被挽救为 C
     has_div = bool(d_last.get("bottom_divergence", False))
-    if has_div and config.DIVERGENCE_GRADE_LIFT > 0:
-        grade = _lift_grade(grade, config.DIVERGENCE_GRADE_LIFT)
-    if grade == "D": return None, "FAIL_TECH"
+    # 准入门槛：按基础评级（分数扣除熊市加码后定级）判断，默认须达 B 级（≥60 分），
+    # 即趋势转折之外还需至少一个确认信号；设为 "C" 可恢复旧行为
+    base_grade = _grade_from_score(daily_score - grade_boost, config)
+    min_grade = config.MIN_PASS_GRADE if config.MIN_PASS_GRADE in _GRADE_ORDER else "B"
+    if _GRADE_ORDER.index(base_grade) < _GRADE_ORDER.index(min_grade):
+        return None, "FAIL_TECH"
+    # 底背离：通过准入后评级提升一档（与基础分脱钩），仅用于展示/排序，不能绕过准入门槛
+    grade = _lift_grade(base_grade, config.DIVERGENCE_GRADE_LIFT) if has_div and config.DIVERGENCE_GRADE_LIFT > 0 else base_grade
 
     last_close, atr_val = float(d_last["close"]), d_last.get("atr")
     atr_val = float(atr_val) if atr_val is not None and not pd.isna(atr_val) else None
