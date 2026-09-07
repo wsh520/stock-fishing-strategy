@@ -18,6 +18,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
 from notify.feishu import (
     notify_screening_result,
 )
+from store.mysql_store import save_recommendations
 
 def run():
     """主执行流程"""
@@ -50,6 +51,9 @@ def run():
             print(f"[INFO] 本次推荐 {len(output_df)} 只股票")
         else:
             print("[INFO] 本次无推荐信号")
+
+        # Step 3: 推荐结果落库 MySQL（未配置环境变量时静默跳过，不影响主流程）
+        save_recommendations(output_df)
 
         # Step 4: 发送选股结果通知
         notify_screening_result(output_df, market_env=market_env_desc)

@@ -17,7 +17,8 @@
 
 | 工作流 | 触发时间 | 说明 |
 |--------|----------|------|
-| **Daily Stock Screening** | 交易日 15:10 (北京) | 每日选股 + 飞书通知 |
+| **Daily Stock Screening** | 交易日 15:10 (北京) | 每日选股 + 推荐落库 MySQL + 飞书通知 |
+| **Weekly Recommendation Tracking** | 每周五 15:25 (北京) | 推荐个股周度表现追踪（收益值/收益率落库）+ 飞书汇总 |
 
 支持手动触发 (`workflow_dispatch`)。
 
@@ -43,6 +44,11 @@
 | Name | Value | 必填 |
 |------|-------|------|
 | `FEISHU_WEBHOOK_URL` | 飞书 Webhook 地址 | 推荐（不配则跳过通知） |
+| `MYSQL_HOST` | MySQL 主机地址 | 可选（不配则跳过落库与追踪） |
+| `MYSQL_PORT` | MySQL 端口，默认 3306 | 可选 |
+| `MYSQL_USER` | MySQL 用户名 | 可选 |
+| `MYSQL_PASSWORD` | MySQL 密码 | 可选 |
+| `MYSQL_DATABASE` | MySQL 数据库名 | 可选 |
 
 ### 4. 启用 GitHub Actions
 
@@ -60,18 +66,23 @@
 
 ```
 ├── .github/workflows/
-│   └── daily_screen.yml              # 每日选股工作流
+│   ├── daily_screen.yml              # 每日选股工作流
+│   └── weekly_tracking.yml           # 周度追踪工作流
 ├── src/
 │   ├── bottom_fishing_strategy.py          # 核心策略（Baostock 数据源，4层过滤 + 评分）
 │   ├── bottom_fishing_strategy_akshare.py  # 旧版策略备份（AkShare 数据源，未被引用）
 │   └── bottom_fishing_strategy_old.py      # 更早期版本备份（未被引用）
 ├── notify/
 │   └── feishu.py                     # 飞书通知模块
+├── store/
+│   └── mysql_store.py                # MySQL 持久化模块（推荐落库 + 周度追踪读写）
+├── schema.sql                        # MySQL 建表脚本（表结构文档，首次连接也会自动幂等建表）
 ├── cache/                            # 自动生成的磁盘缓存（已 gitignore）
 │   ├── 个股/指数行情（按交易日失效）
 │   ├── 股票列表（按 CACHE_TTL_DAYS=6 天失效）
 │   └── 基本面（按 FUND_CACHE_TTL_DAYS=7 天失效）
 ├── run.py                            # 每日选股入口（GitHub Actions 调用）
+├── run_weekly_tracking.py            # 周度追踪入口（GitHub Actions 调用）
 ├── requirements.txt                  # Python 依赖
 └── README.md
 ```
@@ -105,6 +116,32 @@ python src/bottom_fishing_strategy.py full
 - 市场环境判断
 - 推荐股票列表（代码/名称/评分/信号等级）
 - 交易计划（止损价/止盈价/风险收益比）
+
+## MySQL 持久化与周度追踪（可选）
+
+配置 `MYSQL_*` Secrets 后自动启用，未配置则跳过且不影响选股主流程。首次连接自动幂等建表（表结构见 `schema.sql`）。
+
+**表结构**：
+
+| 表 | 说明 | 关键约束 |
+|----|------|----------|
+| `stock_recommendation` | 每日推荐记录（代码/名称/推荐收盘价/评分/等级/止损止盈/RR/底背离等全字段） | `(rec_date, code)` 唯一，重复推荐自动忽略 |
+| `stock_tracking` | 周度表现追踪（第几周/最新收盘价/收益值/收益率） | `(rec_id, week_no)` 唯一，外键关联推荐记录 |
+
+**追踪口径**（`run_weekly_tracking.py`，每周五 15:25 执行）：
+
+- 每条推荐自推荐日起**最多追踪一个月**（最多 4 次周度记录，且 31 天后强制退出，双保险）；
+- 每次记录当时最新收盘价：**收益值 = 最新收盘价 − 推荐时收盘价，收益率 = 收益值 ÷ 推荐时收盘价 × 100%**；
+- 若最新收盘价仍为推荐日当天（如周五新推荐），跳过且不计入追踪次数，保证 4 次都是有效观测；
+- 同一股票在不同日期被重复推荐的，视为不同推荐记录各自独立追踪；
+- 追踪完成后飞书推送汇总（数量/胜率/平均收益/明细）。
+
+本地手动执行：
+
+```bash
+export MYSQL_HOST=... MYSQL_USER=... MYSQL_PASSWORD=... MYSQL_DATABASE=...
+python run_weekly_tracking.py
+```
 
 ## 技术指标
 
