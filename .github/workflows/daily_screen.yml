@@ -42,6 +42,11 @@ jobs:
       - name: Run strategy
         env:
           FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+          MYSQL_HOST: ${{ secrets.MYSQL_HOST }}
+          MYSQL_PORT: ${{ secrets.MYSQL_PORT }}
+          MYSQL_USER: ${{ secrets.MYSQL_USER }}
+          MYSQL_PASSWORD: ${{ secrets.MYSQL_PASSWORD }}
+          MYSQL_DATABASE: ${{ secrets.MYSQL_DATABASE }}
           # Baostock 的 query_all_stock(day=...) 与缓存「当天」判断依赖本地日期；
           # 用北京时间避免 UTC 时区在跨日边界产生偏差。
           TZ: Asia/Shanghai
