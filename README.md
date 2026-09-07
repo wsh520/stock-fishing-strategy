@@ -90,6 +90,13 @@
 ## 本地运行
 
 ```bash
+# 创建并启用项目虚拟环境（已 gitignore）
+python -m venv .venv
+# Windows Git Bash:
+source .venv/Scripts/activate
+# Windows PowerShell: .venv\Scripts\Activate.ps1
+# macOS/Linux: source .venv/bin/activate
+
 # 安装依赖
 pip install -r requirements.txt
 
@@ -98,6 +105,9 @@ export FEISHU_WEBHOOK_URL="https://open.feishu.cn/open-apis/bot/v2/hook/your-web
 
 # 运行每日选股（含通知）
 python run.py
+
+# 手动执行周度追踪（需先配置 MYSQL_* 环境变量，见上文）
+python run_weekly_tracking.py
 ```
 
 直接运行策略脚本（不发送通知）：
