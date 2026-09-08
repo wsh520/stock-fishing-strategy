@@ -2,9 +2,9 @@ name: Weekly Recommendation Tracking
 
 on:
   schedule:
-    # UTC 07:25 = 北京时间 15:25（周五收盘后，与每日选股 15:10 错开，
-    # 使周五新推荐先落库，再由本工作流决定首期追踪）
-    - cron: "25 7 * * 5"
+    # UTC 13:20 = 北京时间 21:20（周五每日选股 21:00 起跑后 20 分钟，
+    # 确保当日新推荐已落库 MySQL，再由本工作流决定首期追踪）
+    - cron: "20 13 * * 5"
   workflow_dispatch:
     inputs:
       no_cache:

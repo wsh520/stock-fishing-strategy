@@ -17,8 +17,10 @@
 
 | 工作流 | 触发时间 | 说明 |
 |--------|----------|------|
-| **Daily Stock Screening** | 交易日 15:10 (北京) | 每日选股 + 推荐落库 MySQL + 飞书通知 |
-| **Weekly Recommendation Tracking** | 每周五 15:25 (北京) | 推荐个股周度表现追踪（收益值/收益率落库）+ 飞书汇总 |
+| **Daily Stock Screening** | 交易日 21:00 (北京) | 每日选股 + 推荐落库 MySQL + 飞书通知 |
+| **Weekly Recommendation Tracking** | 每周五 21:20 (北京) | 推荐个股周度表现追踪（收益值/收益率落库）+ 飞书汇总 |
+
+> 定时设在 21:00 而非收盘后立刻执行，是因为 Baostock 当日数据一般 17:30 起陆续入库、20:00 前后才完整；过早触发会静默回退到昨日数据。
 
 支持手动触发 (`workflow_dispatch`)。
 
@@ -54,7 +56,7 @@
 
 1. 进入仓库的 **Actions** 页面
 2. 如果有提示，点击 **I understand my workflows, go ahead and enable them**
-3. 策略将在每个交易日 15:10 自动执行
+3. 策略将在每个交易日 21:00 自动执行
 
 ### 5. 手动测试
 
@@ -145,7 +147,7 @@ python src/bottom_fishing_strategy.py full
 | `stock_recommendation` | 每日推荐记录（代码/名称/推荐收盘价/评分/等级/止损止盈/RR/底背离等全字段） | `(rec_date, code)` 唯一，重复推荐自动忽略 |
 | `stock_tracking` | 周度表现追踪（第几周/最新收盘价/收益值/收益率） | `(rec_id, week_no)` 唯一，外键关联推荐记录 |
 
-**追踪口径**（`run_weekly_tracking.py`，每周五 15:25 执行）：
+**追踪口径**（`run_weekly_tracking.py`，每周五 21:20 执行）：
 
 - 每条推荐自推荐日起**最多追踪一个月**（最多 4 次周度记录，且 31 天后强制退出，双保险）；
 - 每次记录当时最新收盘价：**收益值 = 最新收盘价 − 推荐时收盘价，收益率 = 收益值 ÷ 推荐时收盘价 × 100%**；
