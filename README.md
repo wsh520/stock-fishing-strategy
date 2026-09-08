@@ -108,7 +108,14 @@ python run.py
 
 # 手动执行周度追踪（需先配置 MYSQL_* 环境变量，见上文）
 python run_weekly_tracking.py
+
+# 同一天二次执行默认命中 cache/ 磁盘缓存（K线/指数按当日 mtime 判定，
+# 股票列表 6 天、基本面 7 天）。如需强制拉最新数据，加 --no-cache：
+python run.py --no-cache
+python run_weekly_tracking.py --no-cache
 ```
+
+GitHub Actions 手动触发（workflow_dispatch）时也提供 `no_cache` 布尔输入，勾选后等效于本地 `--no-cache`。
 
 直接运行策略脚本（不发送通知）：
 

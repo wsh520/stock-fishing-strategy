@@ -8,6 +8,7 @@
 4. 通过飞书 Webhook 发送结果通知
 """
 
+import argparse
 import logging
 import sys
 import os
@@ -36,9 +37,28 @@ def _setup_logging() -> None:
     )
 
 
-def run():
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """命令行参数解析。
+
+    --no-cache：跳过磁盘缓存读写（cache/ 目录），强制从 Baostock/AkShare 拉最新数据。
+    同一天多次执行、或怀疑缓存被污染时使用。内存 TTL 缓存仍生效（同一次进程内复用）。
+    """
+    parser = argparse.ArgumentParser(
+        prog="run.py",
+        description="日线选股策略入口脚本",
+    )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="禁用 cache/ 磁盘缓存读写，强制从数据源拉最新数据",
+    )
+    return parser.parse_args(argv)
+
+
+def run(argv: list[str] | None = None):
     """主执行流程"""
     _setup_logging()
+    args = _parse_args(argv)
     # 延迟导入策略模块（确保路径已设置）
     from src.bottom_fishing_strategy import (
         StrategyConfig,
@@ -52,6 +72,9 @@ def run():
     logger.info("每日选股任务启动")
 
     config = StrategyConfig()
+    if args.no_cache:
+        config.USE_CACHE = False
+        logger.info("已启用 --no-cache：跳过 cache/ 磁盘缓存读写，本次全部从数据源拉取")
     cache = CacheManager(expire_hours=config.CACHE_EXPIRE_HOURS)
     market_env_desc = "unknown"
 

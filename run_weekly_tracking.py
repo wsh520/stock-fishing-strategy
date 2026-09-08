@@ -9,8 +9,10 @@
 
 由 GitHub Actions 每周五收盘后执行（weekly_tracking.yml），也可本地手动：
     python run_weekly_tracking.py
+    python run_weekly_tracking.py --no-cache   # 跳过磁盘缓存，强制拉最新行情
 """
 
+import argparse
 import logging
 import os
 import sys
@@ -36,8 +38,27 @@ def _setup_logging() -> None:
     )
 
 
-def run():
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """命令行参数解析。
+
+    --no-cache：跳过磁盘缓存读写（cache/ 目录），强制从 Baostock/AkShare 拉最新行情。
+    同一天与日任务同时执行、或怀疑缓存被污染时使用。内存 TTL 缓存仍生效。
+    """
+    parser = argparse.ArgumentParser(
+        prog="run_weekly_tracking.py",
+        description="周度追踪脚本：统计推荐个股最新表现并落库/通知",
+    )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="禁用 cache/ 磁盘缓存读写，强制从数据源拉最新行情",
+    )
+    return parser.parse_args(argv)
+
+
+def run(argv: list[str] | None = None):
     _setup_logging()
+    args = _parse_args(argv)
     t_start = time.time()
     logger.info("=" * 60)
     logger.info("周度追踪任务启动")
@@ -84,6 +105,9 @@ def run():
     logger.info("Step 2/4 完成：数据源就绪（Baostock %s）", "在线" if not _bs_state["circuit_open"] else "熔断，走 AkShare")
 
     config = StrategyConfig()
+    if args.no_cache:
+        config.USE_CACHE = False
+        logger.info("已启用 --no-cache：跳过 cache/ 磁盘缓存读写，本次全部从数据源拉取")
     cache = CacheManager(expire_hours=config.CACHE_EXPIRE_HOURS)
 
     def _fetch_close(rec: dict) -> tuple[dict, float | None, str | None]:

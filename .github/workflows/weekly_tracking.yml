@@ -6,6 +6,11 @@ on:
     # 使周五新推荐先落库，再由本工作流决定首期追踪）
     - cron: "25 7 * * 5"
   workflow_dispatch:
+    inputs:
+      no_cache:
+        description: "跳过 cache/ 磁盘缓存，强制拉最新行情"
+        type: boolean
+        default: false
 
 jobs:
   track:
@@ -50,4 +55,11 @@ jobs:
           TZ: Asia/Shanghai
           # 关闭 stdout 缓冲：否则 Python 输出按块缓冲，任务超时/取消后缓冲的日志全部丢失
           PYTHONUNBUFFERED: "1"
-        run: python -u run_weekly_tracking.py
+          NO_CACHE: ${{ inputs.no_cache }}
+        run: |
+          if [ "$NO_CACHE" = "true" ]; then
+            echo "::notice::手动触发已勾选 no_cache，本次跳过 cache/ 磁盘缓存"
+            python -u run_weekly_tracking.py --no-cache
+          else
+            python -u run_weekly_tracking.py
+          fi

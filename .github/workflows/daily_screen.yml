@@ -5,6 +5,11 @@ on:
     # UTC 07:10 = 北京时间 15:10（交易日收盘后）
     - cron: "10 7 * * 1-5"
   workflow_dispatch:
+    inputs:
+      no_cache:
+        description: "跳过 cache/ 磁盘缓存，强制拉最新数据"
+        type: boolean
+        default: false
 
 jobs:
   screen:
@@ -52,7 +57,14 @@ jobs:
           TZ: Asia/Shanghai
           # 关闭 stdout 缓冲：否则 Python 输出按块缓冲，任务超时/取消后缓冲的日志全部丢失
           PYTHONUNBUFFERED: "1"
-        run: python -u run.py
+          NO_CACHE: ${{ inputs.no_cache }}
+        run: |
+          if [ "$NO_CACHE" = "true" ]; then
+            echo "::notice::手动触发已勾选 no_cache，本次跳过 cache/ 磁盘缓存"
+            python -u run.py --no-cache
+          else
+            python -u run.py
+          fi
 
       - name: Upload artifacts
         if: always()
