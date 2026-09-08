@@ -15,11 +15,14 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from datetime import date, datetime
 from typing import Any, Optional
 
 import pandas as pd
+
+logger = logging.getLogger("mysql")
 
 try:
     import pymysql
@@ -131,7 +134,7 @@ def save_recommendations(df: Optional[pd.DataFrame]) -> int:
     if df is None or df.empty:
         return 0
     if not is_configured():
-        print("[INFO] MySQL 未配置（MYSQL_HOST/USER/PASSWORD/DATABASE），跳过推荐结果落库")
+        logger.info("MySQL 未配置（MYSQL_HOST/USER/PASSWORD/DATABASE），跳过推荐结果落库")
         return 0
 
     rows = []
@@ -158,13 +161,13 @@ def save_recommendations(df: Optional[pd.DataFrame]) -> int:
             _ensure_tables(conn)
             with conn.cursor() as cur:
                 inserted = cur.executemany(sql, rows)
-            print(f"[INFO] 推荐结果已落库：新增 {inserted} 条（共提交 {len(rows)} 条，重复自动忽略）")
+            logger.info("推荐结果已落库：新增 %d 条（共提交 %d 条，重复自动忽略）", inserted or 0, len(rows))
             return int(inserted or 0)
         finally:
             conn.close()
     except Exception as e:
         # 落库失败不应让选股主流程失败
-        print(f"[WARN] 推荐结果落库失败（不影响选股流程）: {e}")
+        logger.warning("推荐结果落库失败（不影响选股流程）: %s", e)
         return 0
 
 
@@ -172,7 +175,7 @@ def get_active_recommendations(max_age_days: int = TRACK_MAX_AGE_DAYS,
                                max_weeks: int = TRACK_MAX_WEEKS) -> list[dict]:
     """查询仍在追踪期内的推荐记录：推荐日起 max_age_days 天内，且已追踪次数 < max_weeks。"""
     if not is_configured():
-        print("[INFO] MySQL 未配置，无法执行周度追踪")
+        logger.info("MySQL 未配置，无法执行周度追踪")
         return []
 
     sql = """
@@ -196,7 +199,7 @@ def get_active_recommendations(max_age_days: int = TRACK_MAX_AGE_DAYS,
         finally:
             conn.close()
     except Exception as e:
-        print(f"[WARN] 查询追踪期推荐记录失败: {e}")
+        logger.warning("查询追踪期推荐记录失败: %s", e)
         return []
 
 
@@ -231,5 +234,5 @@ def save_tracking(rec_id: int, rec_date: Any, code: str, week_no: int,
         finally:
             conn.close()
     except Exception as e:
-        print(f"[WARN] 追踪记录落库失败({code} 第{week_no}周): {e}")
+        logger.warning("追踪记录落库失败(%s 第%d周): %s", code, week_no, e)
         return False

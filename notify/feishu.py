@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from datetime import datetime
 from typing import Optional
@@ -15,13 +16,15 @@ from typing import Optional
 import pandas as pd
 import requests
 
+logger = logging.getLogger("feishu")
+
 WEBHOOK_URL = os.environ.get("FEISHU_WEBHOOK_URL", "")
 
 
 def _send_feishu(card: dict) -> bool:
     """发送飞书消息卡片，返回是否成功。"""
     if not WEBHOOK_URL:
-        print("[INFO] FEISHU_WEBHOOK_URL 未配置，跳过飞书通知")
+        logger.info("FEISHU_WEBHOOK_URL 未配置，跳过飞书通知")
         return False
     try:
         payload = {"msg_type": "interactive", "card": card}
@@ -33,13 +36,13 @@ def _send_feishu(card: dict) -> bool:
         )
         data = resp.json()
         if data.get("code") == 0 or data.get("StatusCode") == 0:
-            print("[INFO] 飞书通知发送成功")
+            logger.info("飞书通知发送成功")
             return True
         else:
-            print(f"[WARN] 飞书通知返回异常: {data}")
+            logger.warning("飞书通知返回异常: %s", data)
             return False
     except Exception as e:
-        print(f"[WARN] 飞书通知发送失败: {e}")
+        logger.warning("飞书通知发送失败: %s", e)
         return False
 
 

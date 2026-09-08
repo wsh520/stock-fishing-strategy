@@ -50,7 +50,9 @@ jobs:
           # Baostock 的 query_all_stock(day=...) 与缓存「当天」判断依赖本地日期；
           # 用北京时间避免 UTC 时区在跨日边界产生偏差。
           TZ: Asia/Shanghai
-        run: python run.py
+          # 关闭 stdout 缓冲：否则 Python 输出按块缓冲，任务超时/取消后缓冲的日志全部丢失
+          PYTHONUNBUFFERED: "1"
+        run: python -u run.py
 
       - name: Upload artifacts
         if: always()

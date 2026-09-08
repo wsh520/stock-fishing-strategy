@@ -11,8 +11,10 @@
     python run_weekly_tracking.py
 """
 
+import logging
 import os
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # 将 src 目录加入 Python 路径
@@ -20,8 +22,26 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
 
 import pandas as pd
 
+logger = logging.getLogger("weekly")
+
+
+def _setup_logging() -> None:
+    """统一日志格式：时间戳 + 级别 + 模块名，与 run.py 保持一致。"""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        stream=sys.stdout,
+        force=True,
+    )
+
 
 def run():
+    _setup_logging()
+    t_start = time.time()
+    logger.info("=" * 60)
+    logger.info("周度追踪任务启动")
+
     # 延迟导入策略模块（确保路径已设置）
     from src.bottom_fishing_strategy import (
         StrategyConfig,
@@ -41,24 +61,27 @@ def run():
     from notify.feishu import notify_tracking_result
 
     if not is_configured():
-        print("[INFO] MySQL 未配置（MYSQL_HOST/USER/PASSWORD/DATABASE），周度追踪退出")
+        logger.info("MySQL 未配置（MYSQL_HOST/USER/PASSWORD/DATABASE），周度追踪退出")
         return
 
     # Step 1: 查询仍在追踪期内的推荐记录（一个月内、未达 4 次追踪）
+    logger.info("Step 1/4 查询追踪期内的推荐记录...")
     recs = get_active_recommendations()
     if not recs:
-        print("[INFO] 无追踪期内的推荐记录")
+        logger.info("无追踪期内的推荐记录，任务结束")
         return
-    print(f"[INFO] 待追踪推荐记录: {len(recs)} 条")
+    logger.info("Step 1/4 完成：待追踪推荐记录 %d 条", len(recs))
 
     # Step 2: 登录数据源（Baostock 主 / AkShare 备，与选股主流程同一套连接管理）
+    logger.info("Step 2/4 登录数据源（Baostock 主 / AkShare 备）...")
     if not _bs_login(max_retry=5):
         if _AK_AVAILABLE:
-            print("[WARN] Baostock 登录失败，本次降级 AkShare 拉取行情")
+            logger.warning("Baostock 登录失败，本次降级 AkShare 拉取行情")
             _bs_state["circuit_open"] = True
         else:
-            print("[ERROR] Baostock 登录失败且未安装 AkShare，无法拉取行情，追踪终止")
+            logger.error("Baostock 登录失败且未安装 AkShare，无法拉取行情，追踪终止")
             return
+    logger.info("Step 2/4 完成：数据源就绪（Baostock %s）", "在线" if not _bs_state["circuit_open"] else "熔断，走 AkShare")
 
     config = StrategyConfig()
     cache = CacheManager(expire_hours=config.CACHE_EXPIRE_HOURS)
@@ -72,10 +95,12 @@ def run():
                 return rec, None, None
             last = df.iloc[-1]
             return rec, float(last["close"]), str(last["date"])
-        except Exception:
+        except Exception as e:
+            logger.debug("%s(%s) 拉取行情异常: %s", rec["name"], code, e)
             return rec, None, None
 
     # Step 3: 并发拉行情（bs_lock 保护 Baostock），主线程逐条落库
+    logger.info("Step 3/4 并发拉取行情并逐条落库（%d 条，%d 线程）...", len(recs), config.MAX_WORKERS)
     report_rows: list[dict] = []
     tracked, failed = 0, 0
     try:
@@ -86,14 +111,14 @@ def run():
                 code, name = rec["code"], rec["name"]
                 if close_price is None:
                     failed += 1
-                    print(f"[WARN] {name}({code}) 行情获取失败，本次跳过")
+                    logger.warning("%s(%s) 行情获取失败，本次跳过", name, code)
                     continue
 
                 # 行情未走出推荐日（如周任务与日任务同日执行）：收益恒为 0，
                 # 跳过且不计入追踪次数，保证 4 次追踪都是有效观测
                 rec_date_str = rec["rec_date"].strftime("%Y-%m-%d") if hasattr(rec["rec_date"], "strftime") else str(rec["rec_date"])
                 if close_date <= rec_date_str:
-                    print(f"[INFO] {name}({code}) 收盘价仍为推荐日({rec_date_str})，本次不计追踪")
+                    logger.info("%s(%s) 收盘价仍为推荐日(%s)，本次不计追踪", name, code, rec_date_str)
                     continue
 
                 week_no = int(rec["tracked_weeks"]) + 1
@@ -109,7 +134,7 @@ def run():
                 if ok:
                     tracked += 1
                     ret_pct = (close_price - float(rec["rec_close"])) / float(rec["rec_close"]) * 100
-                    print(f"[INFO] {name}({code}) 第{week_no}周: {rec['rec_close']} -> {close_price} ({ret_pct:+.2f}%)")
+                    logger.info("%s(%s) 第%d周: %s -> %s (%+.2f%%)", name, code, rec["rec_close"], close_price, ret_pct)
                     report_rows.append({
                         "name": name,
                         "code": code,
@@ -121,11 +146,16 @@ def run():
     finally:
         _bs_logout()
 
-    print(f"[INFO] 周度追踪完成：成功 {tracked} 条，失败 {failed} 条")
+    logger.info("Step 3/4 完成：成功 %d 条，失败 %d 条", tracked, failed)
 
     # Step 4: 飞书汇总通知（复用现有追踪报告卡片）
     if report_rows:
+        logger.info("Step 4/4 发送飞书追踪汇总（%d 条）...", len(report_rows))
         notify_tracking_result(pd.DataFrame(report_rows))
+    else:
+        logger.info("Step 4/4 无有效追踪记录，跳过飞书通知")
+
+    logger.info("任务全部完成，总耗时 %.1f 秒", time.time() - t_start)
 
 
 if __name__ == "__main__":

@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import socket
 import sys
 import threading
 import time
@@ -53,6 +54,15 @@ _PROJECT_ROOT = os.path.dirname(_MODULE_DIR)
 
 # 全局 Baostock 线程锁，防止多线程下 C++ 底层 socket 崩溃
 bs_lock = threading.Lock()
+
+logger = logging.getLogger("strategy")
+
+# 网络兜底超时：baostock/akshare 底层 socket 默认无超时，服务端无响应时会永久阻塞；
+# 持有 bs_lock 的线程一旦卡住，其余线程全部堵在锁上 → 整个进程假死
+# （2026-09 GitHub Actions 曾因此跑满 6 小时被强制取消，且缓冲的 stdout 随取消全部丢失）。
+# 全局默认超时让单次网络收发最多阻塞 SOCKET_TIMEOUT 秒，超时异常进入重试/熔断/降级链路。
+SOCKET_TIMEOUT = 20
+socket.setdefaulttimeout(SOCKET_TIMEOUT)
 
 # ===========================================================================
 # 模块级元数据
@@ -187,6 +197,12 @@ class StrategyConfig:
     WEEKLY_BARS: int = 60
     FETCH_DELAY: float = 0.05
 
+    # 运行保障：筛选总时间预算（分钟）。超时后取消未开始的任务、基于已完成结果出报告，
+    # 防止数据源挂起导致 GitHub Actions 跑满 6 小时被强杀且无输出
+    SCREEN_TIME_BUDGET_MIN: float = 240.0
+    # 进度日志间隔：每处理 N 只打印一次进度与预计剩余时间
+    PROGRESS_LOG_EVERY: int = 200
+
     ADJUST: str = "qfq"
     USE_CACHE: bool = True
     CACHE_DIR: str = os.path.join(_PROJECT_ROOT, "cache")
@@ -256,10 +272,11 @@ def _bs_login(max_retry: int = 5) -> bool:
                 _bs_state["logged_in"] = True
                 _bs_state["consecutive_failures"] = 0
                 _bs_state["circuit_open"] = False
+                logger.info("Baostock 登录成功")
                 return True
-            logging.warning("Baostock 登录失败(%d/%d): %s", attempt + 1, max_retry, getattr(lg, "error_msg", "未知错误"))
+            logger.warning("Baostock 登录失败(%d/%d): %s", attempt + 1, max_retry, getattr(lg, "error_msg", "未知错误"))
         except Exception as e:
-            logging.warning("Baostock 登录异常(%d/%d): %s", attempt + 1, max_retry, e)
+            logger.warning("Baostock 登录异常(%d/%d): %s", attempt + 1, max_retry, e)
         _bs_state["logged_in"] = False
         if attempt < max_retry - 1:
             time.sleep(1.0 * (attempt + 1))
@@ -285,7 +302,7 @@ def _bs_mark_failure() -> None:
     _bs_state["logged_in"] = False  # 可能连接已断开，下次查询前触发重新登录
     if _bs_state["consecutive_failures"] >= _BS_CIRCUIT_THRESHOLD and not _bs_state["circuit_open"]:
         _bs_state["circuit_open"] = True
-        print(f"[WARN] Baostock 连续失败 {_BS_CIRCUIT_THRESHOLD} 次，已熔断，本次运行后续请求切换至 AkShare 备用数据源")
+        logger.warning("Baostock 连续失败 %d 次，已熔断，本次运行后续请求切换至 AkShare 备用数据源", _BS_CIRCUIT_THRESHOLD)
 
 def _bs_available() -> bool:
     return not _bs_state["circuit_open"]
@@ -337,7 +354,7 @@ def _fetch_with_retry(fetcher: Callable[[], Any], max_retry: int, label: str, re
             last_err = e
         if attempt < max_retry:
             time.sleep(0.5 * (attempt + 1))
-    logging.debug("%s 获取失败（已重试 %d 次）: %s", label, max_retry, last_err)
+    logger.debug("%s 获取失败（已重试 %d 次）: %s", label, max_retry, last_err)
     return None
 
 def _cache_path(config: StrategyConfig, name: str) -> str:
@@ -556,7 +573,7 @@ def _fetch_stock_pool_bs(config: Optional[StrategyConfig] = None) -> list[dict]:
                 _bs_mark_success()
                 if len(rs.data) > 0:
                     if i > 0:
-                        print(f"[INFO] 今日非交易日，股票列表回退至最近交易日 {day}")
+                        logger.info("今日非交易日，股票列表回退至最近交易日 %s", day)
                     return rs.get_data()
             return None  # 连续 10 天均为空（极端异常）
         
@@ -566,9 +583,12 @@ def _fetch_stock_pool_bs(config: Optional[StrategyConfig] = None) -> list[dict]:
         # 仅保留 A 股股票（沪 60/68、深 00/30、北 4/8），剔除指数/基金/债券。
         # query_all_stock 返回全部证券（7171 行中约 1700 只非股票），非股票代码
         # 后续查询会报"股票代码应为9位"，并污染熔断计数导致误切 AkShare
+        n_all = len(raw)
         raw = raw[raw["code"].str.match(r"^(sh\.(60|68)|sz\.(00|30)|bj\.(4|8))", na=False)]
+        n_a_share = len(raw)
         # 过滤处于交易状态的股票
         raw = raw[raw['tradeStatus'] == '1'].copy()
+        logger.info("股票列表(Baostock): 全量证券 %d 只 → A股 %d 只 → 在交易 %d 只", n_all, n_a_share, len(raw))
         raw = raw.rename(columns={"code_name": "name"})
         raw["code"] = raw["code"].apply(lambda x: x.split(".")[1] if "." in x else x)
         df = raw[["code", "name"]]
@@ -780,11 +800,19 @@ def _fetch_stock_pool_ak(config: Optional[StrategyConfig] = None) -> list[dict]:
 # 主备数据源路由（Baostock 优先，失败/熔断自动降级 AkShare）
 # ===========================================================================
 
+# 日线取数来源统计（主流程末尾汇总打印，用于判断数据源降级面）
+fetch_stats = {"bs_ok": 0, "ak_ok": 0, "fail": 0}
+
 def _fetch_daily_dual(code: str, days: int, config: StrategyConfig) -> Optional[pd.DataFrame]:
     if _bs_available():
         df = _fetch_daily_bs(code, days=days, config=config)
-        if df is not None: return df
-    return _fetch_daily_ak(code, days=days, config=config)
+        if df is not None:
+            fetch_stats["bs_ok"] += 1
+            return df
+        logger.debug("%s Baostock 日线无数据/失败，尝试 AkShare 兜底", code)
+    df = _fetch_daily_ak(code, days=days, config=config)
+    fetch_stats["ak_ok" if df is not None else "fail"] += 1
+    return df
 
 def _fetch_weekly_dual(code: str, config: StrategyConfig) -> Optional[pd.DataFrame]:
     """周线双源拉取（仅决赛圈周线趋势确认使用）：Baostock 优先，失败降级 AkShare"""
@@ -816,8 +844,14 @@ def _fetch_fundamentals_dual(code: str, config: Optional[StrategyConfig] = None)
 def _fetch_stock_pool_dual(config: StrategyConfig) -> list[dict]:
     if _bs_available():
         stocks = _fetch_stock_pool_bs(config)
-        if stocks: return stocks
-    return _fetch_stock_pool_ak(config)
+        if stocks:
+            logger.info("股票列表来源: Baostock，过滤后共 %d 只", len(stocks))
+            return stocks
+        logger.warning("Baostock 股票列表为空，尝试 AkShare 备用源")
+    stocks = _fetch_stock_pool_ak(config)
+    if stocks:
+        logger.info("股票列表来源: AkShare，过滤后共 %d 只", len(stocks))
+    return stocks
 
 
 # ===========================================================================
@@ -1141,25 +1175,30 @@ def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] 
     # ==========================
     # 初始化数据源：Baostock 优先，登录失败降级 AkShare
     # ==========================
+    logger.info("策略启动 | Python %s | AkShare备用: %s | 缓存目录: %s",
+                sys.version.split()[0], "可用" if _AK_AVAILABLE else "未安装", config.CACHE_DIR)
+    _proxy = os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")
+    if _proxy:
+        logger.info("检测到代理环境变量 HTTP_PROXY=%s（部分数据源经代理不可达，排障参考）", _proxy)
     if not _bs_login(max_retry=5):
         if _AK_AVAILABLE:
-            print("[WARN] Baostock 登录失败（已重试 5 次），本次运行降级为 AkShare 备用数据源")
+            logger.warning("Baostock 登录失败（已重试 5 次），本次运行降级为 AkShare 备用数据源")
             _bs_state["circuit_open"] = True
         else:
-            print("[ERROR] Baostock 登录失败，且未安装 AkShare（pip install akshare），无可用数据源")
+            logger.error("Baostock 登录失败，且未安装 AkShare（pip install akshare），无可用数据源")
             return None
     else:
-        print(f"[INFO] 数据源: Baostock（备用: {'AkShare' if _AK_AVAILABLE else '未安装 akshare，无备用'}）")
+        logger.info("数据源: Baostock（备用: %s）", "AkShare" if _AK_AVAILABLE else "未安装 akshare，无备用")
 
     try:
         market_env = get_market_environment(config, cache)
-        print(f"[INFO] 市场环境: {market_env.get('description', 'unknown')}")
+        logger.info("市场环境: %s", market_env.get("description", "unknown"))
 
         stock_list = get_stock_list(config, cache)
         if not stock_list:
-            print("[WARN] 无法获取股票列表")
+            logger.warning("无法获取股票列表，本次运行终止")
             return None
-        print(f"[INFO] 待筛选股票数: {len(stock_list)}")
+        logger.info("待筛选股票数: %d", len(stock_list))
 
         signals: list[dict] = []
         processed, total = 0, len(stock_list)
@@ -1172,19 +1211,46 @@ def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] 
                 if daily_df is None: return None, "FAIL_DATA"
                 fund_data = get_fundamentals(code, cache, config)
                 return evaluate(daily_df, code, name, config, market_env, fund_data)
-            except Exception:
+            except Exception as e:
+                logger.debug("%s(%s) 筛选异常: %s", name, code, e)
                 return None, "ERROR"
 
+        screen_start = time.time()
+        budget_sec = config.SCREEN_TIME_BUDGET_MIN * 60
+        progress = {"done": 0, "t": screen_start}
+        stop_watch = threading.Event()
+
+        def _watchdog() -> None:
+            # 心跳：正常每 3 分钟报一次进度；连续 4 分钟无任何任务完成时打印在途
+            # 股票代码——数据源挂起时这是定位卡点的关键信息
+            while not stop_watch.wait(180):
+                idle = time.time() - progress["t"]
+                if idle >= 240:
+                    hanging = [futures[f]["code"] for f in futures if not f.done()][:8]
+                    logger.warning("已 %d 秒无任务完成，疑似数据源卡住：%d/%d 完成，在途代码: %s",
+                                   int(idle), progress["done"], total, ",".join(hanging) or "-")
+                else:
+                    logger.info("心跳：%d/%d 完成，已运行 %.1f 分钟，当前通过 %d 只",
+                                progress["done"], total, (time.time() - screen_start) / 60, stats["pass"])
+
         # 并发执行 (依靠 bs_lock 保证 Baostock 查询不会互相踩踏)
-        with ThreadPoolExecutor(max_workers=config.MAX_WORKERS) as pool:
-            futures = {pool.submit(_screen_one, s): s for s in stock_list}
+        logger.info("开始并发筛选：%d 只股票，%d 线程，时间预算 %.0f 分钟",
+                    total, config.MAX_WORKERS, config.SCREEN_TIME_BUDGET_MIN)
+        pool = ThreadPoolExecutor(max_workers=config.MAX_WORKERS)
+        futures = {pool.submit(_screen_one, s): s for s in stock_list}
+        watchdog = threading.Thread(target=_watchdog, daemon=True)
+        watchdog.start()
+        time_budget_hit = False
+        try:
             for future in as_completed(futures):
                 processed += 1
-                if processed % 500 == 0: print(f"[INFO] 进度: {processed}/{total}")
+                progress["done"] = processed
+                progress["t"] = time.time()
                 sig, reason = future.result()
                 if reason == "PASS" and sig is not None:
                     stats["pass"] += 1
                     signals.append(sig.to_dict())
+                    logger.info("[通过] %s(%s) 评分 %.1f，%s 级", sig.name, sig.code, sig.score, sig.grade)
                 elif reason == "FAIL_FUND": stats["fail_fund"] += 1
                 elif reason == "FAIL_DATA": stats["fail_data"] += 1
                 # FAIL_CHASE（追高）/ FAIL_GAP（跳空）/ FAIL_RSI_HIGH（RSI过高）/ FAIL_CLIMAX_VOL（天量）/ FAIL_NOT_BOTTOM（非底部区域）
@@ -1193,54 +1259,81 @@ def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] 
                                 "FAIL_NOT_BOTTOM", "FAIL_POSITION", "FAIL_MACD_MOM", "FAIL_KDJ"): stats["fail_tech"] += 1
                 elif reason == "FAIL_RR": stats["fail_rr"] += 1
                 elif reason == "ERROR": stats["error"] += 1
+                if processed % config.PROGRESS_LOG_EVERY == 0 or processed == total:
+                    elapsed = time.time() - screen_start
+                    rate = processed / elapsed if elapsed > 0 else 0
+                    eta_min = (total - processed) / rate / 60 if rate > 0 else 0
+                    logger.info("进度: %d/%d (%.0f%%)，已用 %.1f 分钟，预计剩余 %.1f 分钟",
+                                processed, total, processed / total * 100, elapsed / 60, eta_min)
+                if time.time() - screen_start > budget_sec:
+                    time_budget_hit = True
+                    remaining = sum(1 for f in futures if not f.done())
+                    logger.warning("已达筛选时间预算 %.0f 分钟，取消剩余 %d 只未完成任务，基于已完成 %d/%d 只出结果",
+                                   config.SCREEN_TIME_BUDGET_MIN, remaining, processed, total)
+                    break
+        finally:
+            stop_watch.set()
+            # cancel_futures 取消未开始的任务；运行中的任务受 socket 超时约束，会在有限时间内结束
+            pool.shutdown(wait=True, cancel_futures=True)
 
-        pass_data = stats["total"] - stats["fail_data"] - stats["error"]
+        screen_minutes = (time.time() - screen_start) / 60
+        pass_data = processed - stats["fail_data"] - stats["error"]
         pass_fund = pass_data - stats["fail_fund"]
         pass_tech = pass_fund - stats["fail_tech"]
         pass_rr = pass_tech - stats["fail_rr"]
 
-        print("\n" + "="*50)
-        print("📊 选股漏斗数据分析 (Funnel Log)")
-        print("="*50)
-        print(f"1. 初始有效股票池: {stats['total']} 只")
-        print(f"2. 获取数据并达标: {pass_data} 只 (淘汰/缺失 {stats['fail_data'] + stats['error']} 只)")
-        if pass_data > 0: print(f"3. 基本面防雷通过: {pass_fund} 只 (淘汰 {stats['fail_fund']} 只，通过率 {pass_fund/pass_data*100:.1f}%)")
-        if pass_fund > 0: print(f"4. 日线技术面达标: {pass_tech} 只 (淘汰 {stats['fail_tech']} 只，通过率 {pass_tech/pass_fund*100:.1f}%)")
-        if pass_tech > 0: print(f"5. 盈亏风控比达标: {pass_rr} 只 (淘汰 {stats['fail_rr']} 只，通过率 {pass_rr/pass_tech*100:.1f}%)")
-        print("="*50 + "\n")
+        logger.info("=" * 50)
+        logger.info("📊 选股漏斗数据分析 (Funnel Log)   筛选耗时 %.1f 分钟", screen_minutes)
+        logger.info("=" * 50)
+        if time_budget_hit:
+            logger.warning("⚠️ 因达到时间预算，以下漏斗仅统计已完成的 %d/%d 只", processed, total)
+        logger.info("1. 初始有效股票池: %d 只 (完成处理 %d 只)", stats["total"], processed)
+        logger.info("2. 获取数据并达标: %d 只 (淘汰/缺失 %d 只)", pass_data, stats["fail_data"] + stats["error"])
+        if pass_data > 0: logger.info("3. 基本面防雷通过: %d 只 (淘汰 %d 只，通过率 %.1f%%)", pass_fund, stats["fail_fund"], pass_fund / pass_data * 100)
+        if pass_fund > 0: logger.info("4. 日线技术面达标: %d 只 (淘汰 %d 只，通过率 %.1f%%)", pass_tech, stats["fail_tech"], pass_tech / pass_fund * 100)
+        if pass_tech > 0: logger.info("5. 盈亏风控比达标: %d 只 (淘汰 %d 只，通过率 %.1f%%)", pass_rr, stats["fail_rr"], pass_rr / pass_tech * 100)
+        logger.info("日线取数来源: Baostock %d 只，AkShare 兜底 %d 只，双源均失败 %d 只",
+                    fetch_stats["bs_ok"], fetch_stats["ak_ok"], fetch_stats["fail"])
+        logger.info("=" * 50)
 
         if not signals:
-            print("[INFO] 未发现符合条件的信号")
+            logger.info("未发现符合条件的信号")
             return None
 
         df = pd.DataFrame(signals).sort_values(SORT_BY, ascending=SORT_ASC).reset_index(drop=True)
 
         # 决赛圈周线确认：按评分降序逐个拉周线确认，取满 MAX_PICKS 即止（只对决赛圈拉取，成本可控）
         if config.REQUIRE_WEEKLY_TREND and not df.empty:
+            logger.info("进入周线确认：%d 只候选，逐只确认最多取 %d 只", len(df), config.MAX_PICKS)
             confirmed = []
             weekly_checked = 0
             for _, row in df.iterrows():
                 if len(confirmed) >= config.MAX_PICKS: break
                 weekly_checked += 1
                 wk = _fetch_weekly_dual(row["code"], config)
-                weekly_ok = check_weekly_trend(wk, config)
-                if weekly_ok and config.REQUIRE_WEEKLY_MACD_STABLE:
-                    weekly_ok = check_weekly_macd(wk, config)
-                if weekly_ok:
+                trend_ok = check_weekly_trend(wk, config)
+                macd_ok = check_weekly_macd(wk, config) if trend_ok and config.REQUIRE_WEEKLY_MACD_STABLE else True
+                if trend_ok and macd_ok:
                     confirmed.append(row)
+                    logger.info("周线确认 %s(%s) 评分 %.1f: 通过（第 %d/%d 只）",
+                                row["name"], row["code"], row["score"], len(confirmed), config.MAX_PICKS)
+                else:
+                    logger.info("周线确认 %s(%s) 评分 %.1f: 淘汰（%s）",
+                                row["name"], row["code"], row["score"],
+                                "周线趋势未过" if not trend_ok else "周线MACD未企稳")
                 time.sleep(config.FETCH_DELAY)
             weekly_dropped = weekly_checked - len(confirmed)
             if weekly_dropped > 0:
                 conds = [f"周线MA{config.WEEKLY_MA_PERIOD}" + ("站上且上行" if config.WEEKLY_MA_BOTH_REQUIRED else "站上或上行")]
                 if config.REQUIRE_WEEKLY_MACD_STABLE: conds.append("周线MACD企稳")
-                print(f"[INFO] 周线确认：检查 {weekly_checked} 只，淘汰 {weekly_dropped} 只（未满足 {' + '.join(conds)}）")
+                logger.info("周线确认汇总：检查 %d 只，淘汰 %d 只（未满足 %s）", weekly_checked, weekly_dropped, " + ".join(conds))
             df = pd.DataFrame(confirmed).reset_index(drop=True) if confirmed else df.iloc[0:0]
 
         # 推荐数量上限：评分降序截取前 MAX_PICKS 只（目标每日 3~5 只精推，其余评分靠后的不推荐）
         if len(df) > config.MAX_PICKS:
-            print(f"[INFO] 通过 {len(df)} 只，按评分截取前 {config.MAX_PICKS} 只（淘汰 {len(df) - config.MAX_PICKS} 只低分信号）")
+            logger.info("通过 %d 只，按评分截取前 %d 只（淘汰 %d 只低分信号）", len(df), config.MAX_PICKS, len(df) - config.MAX_PICKS)
             df = df.head(config.MAX_PICKS).reset_index(drop=True)
-        print(f"[INFO] 筛选完成，最终推荐 {len(df)} 只股票")
+        logger.info("筛选完成，最终推荐 %d 只股票", len(df))
         return df
 
     finally:
@@ -1248,6 +1341,8 @@ def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] 
         _bs_logout()
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+                        datefmt="%Y-%m-%d %H:%M:%S", stream=sys.stdout, force=True)
     mode = sys.argv[1] if len(sys.argv) > 1 else "full"
     if mode == "screen":
         result = main()
