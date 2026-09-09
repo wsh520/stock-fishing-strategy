@@ -96,11 +96,29 @@ def is_configured() -> bool:
     return _PYMYSQL_AVAILABLE and all(os.environ.get(k) for k in _ENV_KEYS)
 
 
+def _parse_port() -> int:
+    """解析 MYSQL_PORT：未设置或为空字符串时回退默认 3306。
+
+    注意：GitHub Actions 引用不存在的 secret（${{ secrets.MYSQL_PORT }}）会注入
+    空字符串而非缺失该变量，os.environ.get(key, default) 此时返回 ""，
+    int("") 直接抛 ValueError —— 这正是线上日志
+    "invalid literal for int() with base 10: ''" 的根因。
+    """
+    raw = (os.environ.get("MYSQL_PORT") or "").strip()
+    if not raw:
+        return 3306
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("MYSQL_PORT=%r 无法解析为整数，回退默认端口 3306", raw)
+        return 3306
+
+
 def _connect():
     """建立连接（autocommit）。调用前需确保 is_configured()。"""
     return pymysql.connect(
         host=os.environ["MYSQL_HOST"],
-        port=int(os.environ.get("MYSQL_PORT", "3306")),
+        port=_parse_port(),
         user=os.environ["MYSQL_USER"],
         password=os.environ["MYSQL_PASSWORD"],
         database=os.environ["MYSQL_DATABASE"],
