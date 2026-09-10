@@ -7,6 +7,10 @@ C 与 A 相同但开盘跳空高开 4% → 期望 FAIL_GAP
 D 陡峭下降通道中的拐头（MA20 近5日斜率 < -4%）→ 期望 FAIL_TECH（trend_turn 被门控）
 E 与 A 相同但 pct_chg/open 缺失 → 期望 PASS（数据缺失放行，不误杀）
 J 评分 ≥60 但 trend_turn=False（60 分无拐点旁路）→ 期望 FAIL_NO_TREND（REQUIRE_TREND_TURN 硬性拦截）
+K 僵尸股（20日均成交额 <500万）→ 期望 FAIL_LIQUIDITY（独立归因，不再混入 FAIL_DATA）
+L ATR >3.33% 现价（高波动）→ 期望 FAIL_VOLATILE（显式波动率上限，替代原 FAIL_RR）
+另含 2026-09-10 评审修复单测：regime=unknown 视同 bear、ROE 线性年化、基本面报告期回退序列、
+周线只用已收盘 bar（周内未收盘 bar 剔除）、确定性排序（评分→流动性→代码）
 """
 import os
 import sys
@@ -177,6 +181,85 @@ checks.append(("周线站上MA10放行", m.check_weekly_trend(_w_up, cfg) is Tru
 checks.append(("周线主跌否决", m.check_weekly_trend(_w_down, cfg) is False))
 checks.append(("周线数据不足放行", m.check_weekly_trend(_w_up.head(5), cfg) is True))
 checks.append(("周线None放行", m.check_weekly_trend(None, cfg) is True))
+
+# ===== 2026-09-10 评审修复验证 =====
+from datetime import datetime as _dt
+
+# K 流动性独立归因：成交额缩到千分之一（20日均额 <500万）→ FAIL_LIQUIDITY 而非 FAIL_DATA
+df_k = make_df(base_closes())
+df_k["amount"] = df_k["amount"] * 0.001
+results.append(run_case("K 僵尸股流动性独立归因", df_k, "FAIL_LIQUIDITY"))
+
+# L 波动率上限：末行 ATR 抬到现价 5%（> MAX_ATR_PCT=3.33）→ FAIL_VOLATILE
+_orig_cds2 = m.compute_daily_signals
+
+def _cds_high_atr(df, cfg):
+    out = _orig_cds2(df, cfg)
+    if out is not None and not out.empty:
+        out.loc[out.index[-1], "atr"] = float(out.iloc[-1]["close"]) * 0.05
+    return out
+
+m.compute_daily_signals = _cds_high_atr
+results.append(run_case("L 波动率上限否决(ATR=5%现价)", df_a, "FAIL_VOLATILE"))
+m.compute_daily_signals = _orig_cds2
+
+# M regime=unknown 保守视同 bear（UNKNOWN_AS_BEAR）：同数据同配置下结果应与 bear 一致；
+# 关闭开关则应与 neutral 一致；Signal.market_env 仍保留原始 unknown 口径
+_ev = lambda env, c: m.evaluate(df_a, code="600000", name="测试", config=c, market_env={"regime": env}, fund_data=None)
+cfg_open = m.StrategyConfig(); cfg_open.UNKNOWN_AS_BEAR = False
+_sig_unknown, r_unknown = _ev("unknown", m.StrategyConfig())
+_, r_bear = _ev("bear", m.StrategyConfig())
+_, r_unknown_open = _ev("unknown", cfg_open)
+_, r_neutral = _ev("neutral", cfg_open)
+checks.append(("unknown 与 bear 行为一致", r_unknown == r_bear))
+checks.append(("unknown+关闭开关与 neutral 一致", r_unknown_open == r_neutral))
+checks.append(("Signal.market_env 保留原始 unknown", (_sig_unknown is None) or (_sig_unknown.market_env == "unknown")))
+
+# N ROE 线性年化与基本面报告期回退序列
+checks.append(("ROE年化 Q1×4", abs(m._annualize_roe(5.0, 1) - 20.0) < 1e-9))
+checks.append(("ROE年化 Q2×2", abs(m._annualize_roe(5.0, 2) - 10.0) < 1e-9))
+checks.append(("ROE年化 Q3×4/3", abs(m._annualize_roe(5.0, 3) - 20.0 / 3) < 1e-9))
+checks.append(("ROE年化 Q4原值", abs(m._annualize_roe(5.0, 4) - 5.0) < 1e-9))
+checks.append(("ROE季度未知不年化", abs(m._annualize_roe(5.0, None) - 5.0) < 1e-9))
+_qc = m._bs_quarter_candidates(4)
+_ok_qc = (len(_qc) == 4 and all(q in (1, 2, 3, 4) for _, q in _qc)
+          and all(_qc[i + 1] == (_qc[i][0] - (1 if _qc[i][1] == 1 else 0), 4 if _qc[i][1] == 1 else _qc[i][1] - 1)
+                  for i in range(3)))
+checks.append(("报告期回退序列逐季向前", _ok_qc))
+
+# O 周线只用已收盘 bar：本自然周内非周五的末 bar 视为未收盘剔除；周五/周末运行保留周五 bar
+_now_thu = _dt(2026, 9, 10)  # 星期四
+_wk = pd.DataFrame({"date": ["2026-08-28", "2026-09-04", "2026-09-09"],  # 五、五(上周)、三(本周)
+                    "close": [10.0, 10.5, 11.0]})
+checks.append(("周内未收盘bar被剔除", list(m._drop_incomplete_weekly_bar(_wk, now=_now_thu)["date"]) == ["2026-08-28", "2026-09-04"]))
+_wk2 = pd.DataFrame({"date": ["2026-09-04", "2026-09-11"], "close": [10.0, 10.5]})
+checks.append(("周五当日bar保留", list(m._drop_incomplete_weekly_bar(_wk2, now=_dt(2026, 9, 11))["date"]) == ["2026-09-04", "2026-09-11"]))
+checks.append(("周末运行保留周五bar", list(m._drop_incomplete_weekly_bar(_wk2, now=_dt(2026, 9, 12))["date"]) == ["2026-09-04", "2026-09-11"]))
+
+# 周线确认对「周内暴跌的未收盘 bar」免疫：上升周线 + 本周中途暴跌 bar（动态取当前 ISO 周内
+# 非周五日期，保证任何一天运行测试该 bar 都落在本周）→ 剔除后仍应放行
+_today = pd.Timestamp(_dt.now().date())
+_wd = _today.weekday()
+_inc_date = (_today if _wd <= 3 else _today - pd.Timedelta(days=(_wd - 2) % 7)).strftime("%Y-%m-%d")
+_w_trend = pd.DataFrame({"date": pd.date_range("2025-01-03", periods=40, freq="W-FRI").strftime("%Y-%m-%d"),
+                         "close": np.linspace(10.0, 15.0, 40)})
+_w_trend = pd.concat([_w_trend, pd.DataFrame({"date": [_inc_date], "close": [5.0]})], ignore_index=True)
+checks.append(("周线确认忽略周内未收盘暴跌bar", m.check_weekly_trend(_w_trend, cfg) is True))
+
+# P 确定性排序：评分↓ → 20日均成交额↓ → 代码↑（并列分截取可复现）
+_sig_rows = [
+    {"code": "600002", "score": 65.0, "avg_amount": 8000.0},
+    {"code": "600001", "score": 65.0, "avg_amount": 9000.0},
+    {"code": "600003", "score": 90.0, "avg_amount": 1000.0},
+    {"code": "600000", "score": 65.0, "avg_amount": 9000.0},
+]
+_sorted = pd.DataFrame(_sig_rows).sort_values(m.SORT_BY, ascending=m.SORT_ASC).reset_index(drop=True)
+checks.append(("确定性排序: 评分→流动性→代码", list(_sorted["code"]) == ["600003", "600000", "600001", "600002"]))
+
+# PASS 信号携带 avg_amount（万元，排序次级键 + 飞书展示）
+_s_a, _ = m.evaluate(df_a, code="600000", name="测试", config=m.StrategyConfig(),
+                     market_env={"regime": "neutral"}, fund_data=None)
+checks.append(("PASS信号含20日均成交额(万)", _s_a is not None and _s_a.avg_amount > 0))
 
 for label, ok in checks:
     print(f"[{'OK' if ok else 'FAIL'}] {label}")

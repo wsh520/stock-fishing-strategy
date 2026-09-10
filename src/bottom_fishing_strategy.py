@@ -2,10 +2,11 @@
 精简版日线选股策略（Baostock 主数据源 + AkShare 备用数据源 + 底背离 + 漏斗日志版）
 
 仅使用日线数据进行选股，简化策略逻辑：
-1. 市场环境过滤（沪深300日线MA20斜率）
-2. 基本面防雷（ROE/负债率否决；Baostock 无商誉/扣非数据，切 AkShare 时自动补齐）
+1. 市场环境过滤（沪深300日线MA20斜率；regime=unknown 保守按 bear 处理）
+2. 基本面防雷（年化ROE/负债率否决，报告期未披露时回退最近已披露期；
+   Baostock 无商誉/扣非数据，切 AkShare 时自动补齐）
 3. 日线技术指标筛选（底背离 + MA5拐头 + EMA金叉 + RSI超卖反弹 + 量价配合）
-4. 风险收益比过滤（固定止损止盈）
+4. 波动率风控（ATR ≤ MAX_ATR_PCT% 现价，替代原 RR≥1.5 门槛）+ 交易计划输出（2×ATR止损/固定止盈）
 
 数据层：Baostock 为主、AkShare 为备的双数据源架构。
 - Baostock 连接管理：登录真实重试（检查 error_code）、查询失败自动重连、线程安全锁
@@ -72,15 +73,19 @@ DISPLAY_COLS = [
     ("code", "代码"), ("name", "名称"), ("date", "日期"), ("close", "收盘"),
     ("score", "评分"), ("grade", "等级"), ("daily_score", "日线分"),
     ("rsi", "RSI"), ("rsi7", "RSI7"), ("rsi21", "RSI21"),
-    ("vol_ratio", "量比"), ("turnover_ratio", "换手比"), ("stop_loss", "止损"),
+    ("vol_ratio", "量比"), ("turnover_ratio", "换手比"), ("avg_amount", "日均额(万)"),
+    ("stop_loss", "止损"),
     ("take_profit", "止盈"), ("rr_ratio", "收益比"), ("market_env", "市场"),
     ("has_divergence", "底背离"),
 ]
 
 TITLE = "日线技术指标选股结果"
 PREFIX = "bf"
-SORT_BY = ["score"]
-SORT_ASC = [False]
+# 确定性排序：评分↓ → 20日均成交额(万)↓ → 代码↑。通过分仅 65/75/90/100 四档、并列常见，
+# 而 signals 列表顺序受 as_completed 完成序影响——无次级键时并列内部顺序每次运行都可能不同，
+# 导致决赛圈截取与周线确认顺序不可复现
+SORT_BY = ["score", "avg_amount", "code"]
+SORT_ASC = [False, False, True]
 
 # ===========================================================================
 # StrategyConfig
@@ -93,14 +98,23 @@ class StrategyConfig:
     MARKET_SLOPE_LOOKBACK: int = 4
     MARKET_BULL_SLOPE: float = 0.01
     MARKET_BEAR_SLOPE: float = -0.01
+    # 指数数据缺失（regime=unknown）时保守按 bear 处理（等级门槛+BEAR_GRADE_BOOST、
+    # 推荐上限收缩为 BEAR_MAX_PICKS）：数据源故障日应收缩而非 fail-open 满额进攻；
+    # 展示/落库仍保留原始 unknown 口径
+    UNKNOWN_AS_BEAR: bool = True
 
+    # 年化 ROE 下限（%）：报告期累计 ROE 先按季度线性年化（Q1×4/Q2×2/Q3×4/3/Q4×1）再比较。
+    # 旧行为直接比较报告期原值：Q1 期的 5% ≈ 年化 20%+（极严）、年报期 5% 又很宽，
+    # 门槛松紧随财报日历漂移；年化后 MIN_ROE 语义全年一致
     MIN_ROE: float = 5.0
     MAX_DEBT_RATIO: float = 70.0
     MAX_GOODWILL_RATIO: float = 20.0
     MIN_DEDUCTED_PROFIT_RATIO: float = 0.5
     # 金融业（银行/保险/券商等）负债率天然 80%+，通用阈值会全行业误杀，单独放宽兜底
     FINANCE_NAME_KEYWORDS: tuple = ("银行", "保险", "证券", "信托", "期货")
-    FINANCE_EXEMPT_CODES: tuple = ("601318", "601336", "601601", "601628", "601319", "300059")  # 平安/新华/太保/人寿/人保/东方财富
+    # 平安/新华/太保/人寿/人保。东方财富(300059)已移除：MAIN_BOARD_ONLY 过滤 30 开头创业板后
+    # 该白名单条目不可达（死配置）；若关闭主板白名单且需豁免创业板金融股，再加回
+    FINANCE_EXEMPT_CODES: tuple = ("601318", "601336", "601601", "601628", "601319")
     FINANCE_MAX_DEBT_RATIO: float = 97.0
 
     DAILY_MA5: int = 5
@@ -124,10 +138,14 @@ class StrategyConfig:
 
     FIXED_STOP_LOSS_PCT: float = 5.0
     FIXED_TAKE_PROFIT_PCT: float = 10.0
-    MIN_RR_RATIO: float = 1.5
     ATR_PERIOD: int = 14
     ATR_STOP_MULT: float = 2.0
     USE_ATR_STOP: bool = True
+    # 波动率上限准入（%）：替代原 MIN_RR_RATIO=1.5 门槛。2×ATR 止损 + 固定 10% 止盈下，
+    # 「RR≥1.5」⇔ ATR ≤ 10/(2×1.5) ≈ 3.33% 现价——该层数学上是波动率过滤而非风险收益比过滤；
+    # 且旧实现在 ATR 缺失时 RR 恒为 2.0（永不否决）。改为显式波动率阈值使语义与行为一致，
+    # rr_ratio 仍随每条推荐计算输出（展示/落库）；ATR 缺失时无法判定波动率，放行
+    MAX_ATR_PCT: float = 3.33
 
     MIN_AMOUNT: float = 5_000_000.0  # 近 20 日日均成交额下限（元），低于则判定流动性不足（僵尸股）
     MIN_DAYS: int = 60
@@ -166,6 +184,11 @@ class StrategyConfig:
     # WEEKLY_MA_BOTH_REQUIRED=True 时须同时满足「收盘站上周线 MA10（容忍 2%）」和「MA10 在上行」，
     # 设为 False 退回旧行为（两条件满足其一即可）
     REQUIRE_WEEKLY_TREND: bool = True
+    # 周线只用已收盘 bar：周一至周四运行时最新周线 bar 是本周中途快照（数据源按「周内最新
+    # 交易日」标注日期），「站上MA10/MACD企稳」会随本周后续走势翻转（周内漂移），导致推荐
+    # 结果依赖"今天是周几"。开启后周线确认先剔除本周未收盘 bar；节假日把周内最后交易日
+    # 提前到周四时同样保守剔除（代价是确认滞后一周，方向安全）
+    WEEKLY_REQUIRE_CLOSED_BAR: bool = True
     WEEKLY_MA_PERIOD: int = 10
     WEEKLY_SLOPE_LOOKBACK: int = 3
     WEEKLY_TOLERANCE: float = 0.02
@@ -218,6 +241,9 @@ class StrategyConfig:
     CACHE_TTL_DAYS: float = 6.0
     FUND_CACHE_TTL_DAYS: float = 7.0
     FUND_START_YEAR: str = "2023"
+    # 基本面报告期回退深度：目标报告期尚未披露时逐季向前找最近已披露期（如 Q1→上年Q4→Q3），
+    # 避免每个季度初的披露空窗期防雷层因「查无数据→放行」被静默关闭
+    FUND_LOOKBACK_QUARTERS: int = 4
     MAX_RETRY: int = 2
     LIST_MAX_RETRY: int = 4
 
@@ -510,52 +536,85 @@ def _fetch_index_weekly_bs(symbol: str, weeks: int = 60, config: Optional[Strate
     weekly["date"] = weekly["_dt"].dt.strftime(_DATE_FMT)
     return weekly.drop(columns=["_dt"])
 
+_FUND_METRIC_KEYS = ("roe", "debt_ratio", "goodwill_ratio", "deducted_profit_ratio")
+
+def _bs_quarter_candidates(n: int) -> list[tuple[int, int]]:
+    """从最近的「应披露」报告期开始，按序向前回退 n 个 (year, quarter) 候选"""
+    now = datetime.now()
+    year, quarter = now.year, (now.month - 1) // 3
+    if quarter == 0: year -= 1; quarter = 4
+    out: list[tuple[int, int]] = []
+    for _ in range(max(1, n)):
+        out.append((year, quarter))
+        quarter -= 1
+        if quarter == 0: year -= 1; quarter = 4
+    return out
+
+def _annualize_roe(roe_period: float, quarter: Optional[int]) -> float:
+    """报告期累计 ROE 线性年化（Q1×4 / Q2×2 / Q3×4/3 / Q4×1；quarter 未知则不年化）。
+    忽略季节性，但保证 MIN_ROE 门槛语义不随财报日历漂移（旧行为：Q1 期的 5%
+    ≈ 年化 20%+ 极严、披露空窗期查无数据直接放行，一年中松紧摇摆）。"""
+    if quarter not in (1, 2, 3, 4): return roe_period
+    return roe_period * 4.0 / quarter
+
 def _fetch_fundamentals_bs(code: str, config: Optional[StrategyConfig] = None) -> Optional[dict]:
     config = config or StrategyConfig()
     bs_code = _format_bs_code(code)
     path = ""
     if config.USE_CACHE:
-        path = _cache_path(config, f"fund_{bs_code}.json")
+        # v2 命名：与旧缓存（未年化的原始 ROE、无报告期回退）隔离，避免 TTL 内旧语义混用
+        path = _cache_path(config, f"fund_v2_{bs_code}.json")
         if _cache_fresh(path, config.FUND_CACHE_TTL_DAYS):
             if (cached := _read_cache_json(path)) is not None: return cached
 
-    # 动态计算最近的已披露财报季度
-    now = datetime.now()
-    year, quarter = now.year, (now.month - 1) // 3
-    if quarter == 0: year -= 1; quarter = 4
+    # 商誉与扣非净利润在 Baostock 中缺失，置为 None；report_period 记录实际采用的报告期
+    result: dict[str, Any] = {"roe": None, "debt_ratio": None, "goodwill_ratio": None, "deducted_profit_ratio": None, "report_period": None}
 
-    # 商誉与扣非净利润在 Baostock 中缺失，置为 None
-    result: dict[str, Optional[float]] = {"roe": None, "debt_ratio": None, "goodwill_ratio": None, "deducted_profit_ratio": None}
+    # 目标报告期未披露（每个季度初的常态）不再视为「该股无基本面」，逐季向前回退找
+    # 最近已披露期，避免披露空窗期防雷层被静默关闭
+    found_period: Optional[tuple[int, int]] = None
+    for year, quarter in _bs_quarter_candidates(config.FUND_LOOKBACK_QUARTERS):
+        def fetch_fund(year: int = year, quarter: int = quarter):
+            _bs_guard(f"bs_fund({bs_code},{year}Q{quarter})")
+            with bs_lock:
+                p_rs = bs.query_profit_data(code=bs_code, year=year, quarter=quarter)
+                b_rs = bs.query_balance_data(code=bs_code, year=year, quarter=quarter)
+            if getattr(p_rs, "error_code", None) == "0" or getattr(b_rs, "error_code", None) == "0":
+                _bs_mark_success()
+                return p_rs, b_rs
+            _bs_mark_failure()
+            raise RuntimeError(f"bs_fund({bs_code},{year}Q{quarter}) 查询失败: {getattr(p_rs, 'error_msg', '')} / {getattr(b_rs, 'error_msg', '')}")
 
-    def fetch_fund():
-        _bs_guard(f"bs_fund({bs_code})")
-        with bs_lock:
-            p_rs = bs.query_profit_data(code=bs_code, year=year, quarter=quarter)
-            b_rs = bs.query_balance_data(code=bs_code, year=year, quarter=quarter)
-        if getattr(p_rs, "error_code", None) == "0" or getattr(b_rs, "error_code", None) == "0":
-            _bs_mark_success()
-            return p_rs, b_rs
-        _bs_mark_failure()
-        raise RuntimeError(f"bs_fund({bs_code}) 查询失败: {getattr(p_rs, 'error_msg', '')} / {getattr(b_rs, 'error_msg', '')}")
-
-    rs = _fetch_with_retry(fetch_fund, config.MAX_RETRY, f"bs_fund({bs_code})")
-    if rs:
+        rs = _fetch_with_retry(fetch_fund, config.MAX_RETRY, f"bs_fund({bs_code},{year}Q{quarter})")
+        if not rs: continue
         p_rs, b_rs = rs
+        got_data = False
         if p_rs.error_code == '0' and len(p_rs.data) > 0:
             df = p_rs.get_data()
             if "roeAvg" in df.columns:
                 roe = pd.to_numeric(df["roeAvg"].iloc[0], errors="coerce")
-                if not pd.isna(roe): result["roe"] = roe * 100 # Baostock 返回小数(如0.05)
+                if not pd.isna(roe):
+                    # Baostock 返回小数(如0.05)且为报告期累计值，×100 转百分数后线性年化
+                    result["roe"] = _annualize_roe(roe * 100, quarter)
+                    got_data = True
 
         if b_rs.error_code == '0' and len(b_rs.data) > 0:
             df = b_rs.get_data()
-            # Baostock 资产负债率字段为 liabilityToAsset（小数形式，兼容其他可能的字段名）
+            # Baostock 资产负债率字段为 liabilityToAsset（小数形式，兼容其他可能的字段名）；
+            # 负债率为时点比率，无需年化
             debt_col = next((c for c in ("liabilityToAsset", "liabToAsset", "liabRate") if c in df.columns), None)
             if debt_col:
                 debt = pd.to_numeric(df[debt_col].iloc[0], errors="coerce")
-                if not pd.isna(debt): result["debt_ratio"] = debt * 100
+                if not pd.isna(debt):
+                    result["debt_ratio"] = debt * 100
+                    got_data = True
 
-    if not any(v is not None for v in result.values()): return None
+        if got_data:
+            found_period = (year, quarter)
+            break
+
+    if not any(result.get(k) is not None for k in _FUND_METRIC_KEYS): return None
+    if found_period: result["report_period"] = f"{found_period[0]}Q{found_period[1]}"
     if path: _write_cache_json(result, path)
     return result
 
@@ -736,20 +795,38 @@ def _fetch_fundamentals_ak(code: str, config: Optional[StrategyConfig] = None) -
     symbol = _ak_symbol(code)
     path = ""
     if config.USE_CACHE:
-        path = _cache_path(config, f"fund_{symbol}.json")
+        # v2 命名：与旧缓存（未年化的原始 ROE）隔离，与 Baostock 路径语义对齐
+        path = _cache_path(config, f"fund_v2_{symbol}.json")
         if _cache_fresh(path, config.FUND_CACHE_TTL_DAYS):
             if (cached := _read_cache_json(path)) is not None: return cached
 
-    result: dict[str, Optional[float]] = {"roe": None, "debt_ratio": None, "goodwill_ratio": None, "deducted_profit_ratio": None}
+    result: dict[str, Any] = {"roe": None, "debt_ratio": None, "goodwill_ratio": None, "deducted_profit_ratio": None, "report_period": None}
 
     df_fin = _fetch_with_retry(lambda: ak.stock_financial_analysis_indicator(symbol=symbol, start_year=config.FUND_START_YEAR), config.MAX_RETRY, f"ak_fund({symbol})")
     if df_fin is not None and not df_fin.empty:
-        row = df_fin.iloc[0]
+        # 显式按报告期日期取最近已披露行（不再依赖 iloc[0] 的接口排序假设），
+        # 并按报告期月份推断季度做 ROE 线性年化，与 Baostock 路径语义一致
+        report_quarter: Optional[int] = None
+        date_col = next((c for c in df_fin.columns if "日期" in str(c)), None)
+        if date_col:
+            fin = df_fin.copy()
+            fin["_rd"] = pd.to_datetime(fin[date_col], errors="coerce")
+            fin = fin.dropna(subset=["_rd"]).sort_values("_rd")
+            if not fin.empty:
+                last_rd = fin["_rd"].iloc[-1]
+                report_quarter = {3: 1, 6: 2, 9: 3, 12: 4}.get(int(last_rd.month))
+                result["report_period"] = (f"{last_rd.year}Q{report_quarter}" if report_quarter
+                                           else last_rd.strftime("%Y-%m-%d"))
+                row = fin.iloc[-1]
+            else:
+                row = df_fin.iloc[0]
+        else:
+            row = df_fin.iloc[0]  # 无日期列时维持旧假设（接口首行为最近披露期），不年化
         for col in df_fin.columns:
             col_str, col_lower = str(col), str(col).lower()
             if "净资产收益率" in col_str or "roe" in col_lower:
                 val = pd.to_numeric(row[col], errors="coerce")
-                if not pd.isna(val): result["roe"] = float(val)
+                if not pd.isna(val): result["roe"] = _annualize_roe(float(val), report_quarter)
             if "资产负债率" in col_str or "debt" in col_lower:
                 val = pd.to_numeric(row[col], errors="coerce")
                 if not pd.isna(val): result["debt_ratio"] = float(val)
@@ -781,7 +858,7 @@ def _fetch_fundamentals_ak(code: str, config: Optional[StrategyConfig] = None) -
                 if not pd.isna(val): deducted_profit = float(val)
         if net_profit > 0: result["deducted_profit_ratio"] = deducted_profit / net_profit
 
-    if not any(v is not None for v in result.values()): return None
+    if not any(result.get(k) is not None for k in _FUND_METRIC_KEYS): return None
     if path: _write_cache_json(result, path)
     return result
 
@@ -933,8 +1010,8 @@ _DAILY_NEED_COLS = {"close", "volume", "amount", "date", "high", "low", "pct_chg
 
 def compute_daily_signals(df: pd.DataFrame, config: StrategyConfig) -> Optional[pd.DataFrame]:
     if df is None or df.empty or not _DAILY_NEED_COLS.issubset(df.columns) or len(df) < config.MIN_DAYS: return None
-    # 流动性过滤：近 20 日日均成交额低于下限，判定为僵尸股直接否决
-    if df["amount"].tail(20).mean() < config.MIN_AMOUNT: return None
+    # 流动性过滤（MIN_AMOUNT 僵尸股否决）已移至 evaluate，使用独立原因码 FAIL_LIQUIDITY，
+    # 漏斗归因不再与数据缺失（FAIL_DATA）混淆
     out = df.copy().reset_index(drop=True)
     out["ma5"] = out["close"].rolling(config.DAILY_MA5).mean()
     out["ma10"] = out["close"].rolling(config.DAILY_MA10).mean()
@@ -1017,18 +1094,23 @@ def compute_daily_signals(df: pd.DataFrame, config: StrategyConfig) -> Optional[
     return out
 
 def compute_risk_reward(entry_price: float, config: StrategyConfig, atr: Optional[float] = None) -> dict:
+    """交易计划输出：2×ATR 止损（ATR 缺失退回固定 FIXED_STOP_LOSS_PCT）+ 固定止盈；
+    rr_ratio 仅供展示/落库。准入门槛由 MAX_ATR_PCT 波动率上限显式承担（见 evaluate），
+    不再经 RR≥1.5 反推——旧实现在 ATR 存在时等价于 ATR≤3.33% 的波动率过滤，
+    ATR 缺失时 RR 恒为 2.0 永不否决，门槛名不副实。"""
     if config.USE_ATR_STOP and atr is not None and atr > 0: stop_loss = entry_price - config.ATR_STOP_MULT * atr
     else: stop_loss = entry_price * (1 - config.FIXED_STOP_LOSS_PCT / 100)
     take_profit = entry_price * (1 + config.FIXED_TAKE_PROFIT_PCT / 100)
     risk, reward = entry_price - stop_loss, take_profit - entry_price
     rr_ratio = reward / risk if risk > 0 else 0.0
-    return {"stop_loss": round(stop_loss, 2), "take_profit": round(take_profit, 2), "rr_ratio": round(rr_ratio, 2), "passes": rr_ratio >= config.MIN_RR_RATIO}
+    return {"stop_loss": round(stop_loss, 2), "take_profit": round(take_profit, 2), "rr_ratio": round(rr_ratio, 2)}
 
 @dataclass
 class Signal:
     code: str; name: str; date: str; close: float; score: float; grade: str
     daily_score: float; rsi: float; rsi7: float; rsi21: float; vol_ratio: float
-    turnover_ratio: float; stop_loss: float; take_profit: float; rr_ratio: float
+    turnover_ratio: float; avg_amount: float  # 近20日日均成交额（万元）：并列分确定性排序次级键 + 通知展示
+    stop_loss: float; take_profit: float; rr_ratio: float
     market_env: str; has_divergence: bool
 
     def to_dict(self) -> dict: return asdict(self)
@@ -1068,11 +1150,31 @@ def _kdj_ok(daily_out: pd.DataFrame, config: StrategyConfig) -> bool:
     if pd.isna(k) or pd.isna(d): return True
     return float(k) > float(d) and float(k) <= config.KDJ_K_MAX
 
+def _drop_incomplete_weekly_bar(weekly_df: Optional[pd.DataFrame], now: Optional[datetime] = None) -> Optional[pd.DataFrame]:
+    """剔除本周未收盘的周线 bar。
+
+    Baostock/东财周线按「周内最新交易日」标注日期：周一至周四运行时最后一根 bar 是本周
+    中途快照，会随本周后续走势变化——用它做「站上MA10/MACD企稳」确认存在周内漂移
+    （周二通过、周三翻脸），推荐结果依赖"今天是周几"。规则：最后一根周线日期落在本
+    自然周（ISO 周）且不是周五 → 视为未收盘，剔除；节假日把周内最后交易日提前到周四时
+    同样保守剔除，代价是确认滞后一周（方向安全）。"""
+    if weekly_df is None or weekly_df.empty or "date" not in weekly_df.columns: return weekly_df
+    now = now or datetime.now()
+    out = weekly_df.sort_values("date").reset_index(drop=True)
+    last = pd.to_datetime(out["date"].iloc[-1], errors="coerce")
+    if pd.isna(last): return out
+    today = pd.Timestamp(now.date())
+    if last.isocalendar()[:2] == today.isocalendar()[:2] and last.weekday() != 4:
+        out = out.iloc[:-1].reset_index(drop=True)
+    return out
+
 def check_weekly_trend(weekly_df: Optional[pd.DataFrame], config: StrategyConfig) -> bool:
     """周线趋势确认：收盘价站上周线 MA10（容忍 WEEKLY_TOLERANCE）且 MA10 在上行；
-    WEEKLY_MA_BOTH_REQUIRED=False 退回旧行为（两条件满足其一即可）；数据不足放行"""
+    WEEKLY_MA_BOTH_REQUIRED=False 退回旧行为（两条件满足其一即可）；数据不足放行；
+    WEEKLY_REQUIRE_CLOSED_BAR=True 时先剔除本周未收盘 bar，避免周内漂移"""
     if weekly_df is None or weekly_df.empty or "close" not in weekly_df.columns: return True
-    if len(weekly_df) < config.WEEKLY_MA_PERIOD + config.WEEKLY_SLOPE_LOOKBACK: return True
+    if config.WEEKLY_REQUIRE_CLOSED_BAR: weekly_df = _drop_incomplete_weekly_bar(weekly_df)
+    if weekly_df is None or weekly_df.empty or len(weekly_df) < config.WEEKLY_MA_PERIOD + config.WEEKLY_SLOPE_LOOKBACK: return True
     w = weekly_df.sort_values("date").reset_index(drop=True) if "date" in weekly_df.columns else weekly_df.reset_index(drop=True)
     wma = w["close"].rolling(config.WEEKLY_MA_PERIOD).mean()
     ma_now, ma_prev = float(wma.iloc[-1]), float(wma.iloc[-(1 + config.WEEKLY_SLOPE_LOOKBACK)])
@@ -1083,9 +1185,11 @@ def check_weekly_trend(weekly_df: Optional[pd.DataFrame], config: StrategyConfig
 
 def check_weekly_macd(weekly_df: Optional[pd.DataFrame], config: StrategyConfig) -> bool:
     """周线 MACD 企稳确认：柱值翻红（含金叉当周及之后的红柱状态，动能占优），
-    或绿柱连续 2 周收窄（柱值连续两周改善，下跌动能衰减企稳）；数据不足或 NaN 放行不误杀"""
+    或绿柱连续 2 周收窄（柱值连续两周改善，下跌动能衰减企稳）；数据不足或 NaN 放行不误杀；
+    WEEKLY_REQUIRE_CLOSED_BAR=True 时先剔除本周未收盘 bar"""
     if weekly_df is None or weekly_df.empty or "close" not in weekly_df.columns: return True
-    if len(weekly_df) < config.WEEKLY_MACD_SLOW + config.WEEKLY_MACD_SIGNAL: return True
+    if config.WEEKLY_REQUIRE_CLOSED_BAR: weekly_df = _drop_incomplete_weekly_bar(weekly_df)
+    if weekly_df is None or weekly_df.empty or len(weekly_df) < config.WEEKLY_MACD_SLOW + config.WEEKLY_MACD_SIGNAL: return True
     w = weekly_df.sort_values("date").reset_index(drop=True) if "date" in weekly_df.columns else weekly_df.reset_index(drop=True)
     dif = w["close"].ewm(span=config.WEEKLY_MACD_FAST, adjust=False).mean() - w["close"].ewm(span=config.WEEKLY_MACD_SLOW, adjust=False).mean()
     hist = dif - dif.ewm(span=config.WEEKLY_MACD_SIGNAL, adjust=False).mean()
@@ -1094,12 +1198,27 @@ def check_weekly_macd(weekly_df: Optional[pd.DataFrame], config: StrategyConfig)
     if float(h1) > 0: return True                 # 红柱（含金叉翻红），周线动能已占优
     return float(h1) > float(h2) > float(h3)      # 绿柱连续 2 周收窄，企稳确认
 
+def _effective_regime(regime: str, config: StrategyConfig) -> str:
+    """用于门槛/数量决策的市场环境：unknown（指数数据缺失）按 UNKNOWN_AS_BEAR 保守视同 bear，
+    数据源故障日应收缩而非 fail-open 满额进攻；展示/落库仍用原始 regime 口径"""
+    if regime == "unknown" and config.UNKNOWN_AS_BEAR: return "bear"
+    return regime
+
 def evaluate(daily_df: Optional[pd.DataFrame], code: str = "", name: str = "", config: Optional[StrategyConfig] = None, market_env: Optional[dict] = None, fund_data: Optional[dict] = None) -> tuple[Optional[Signal], str]:
     if config is None: config = StrategyConfig()
     regime = (market_env or {}).get("regime", "unknown")
-    grade_boost = config.BEAR_GRADE_BOOST if regime == "bear" else 0.0
+    eff_regime = _effective_regime(regime, config)
+    grade_boost = config.BEAR_GRADE_BOOST if eff_regime == "bear" else 0.0
 
     if not check_fundamentals(fund_data, config, code=code, name=name): return None, "FAIL_FUND"
+
+    if daily_df is None or daily_df.empty: return None, "FAIL_DATA"
+    # 流动性过滤：近 20 日日均成交额低于下限判定为僵尸股，独立原因码 FAIL_LIQUIDITY
+    #（原先藏在 compute_daily_signals 返回 None 里，与数据缺失 FAIL_DATA 混淆，漏斗归因失真）
+    if "amount" in daily_df.columns and len(daily_df) >= 20:
+        _avg_amt = pd.to_numeric(daily_df["amount"], errors="coerce").tail(20).mean()
+        if pd.notna(_avg_amt) and float(_avg_amt) < config.MIN_AMOUNT:
+            return None, "FAIL_LIQUIDITY"
 
     daily_out = compute_daily_signals(daily_df, config)
     if daily_out is None or daily_out.empty: return None, "FAIL_DATA"
@@ -1154,9 +1273,14 @@ def evaluate(daily_df: Optional[pd.DataFrame], code: str = "", name: str = "", c
     atr_val = d_last.get("atr")
     atr_val = float(atr_val) if atr_val is not None and not pd.isna(atr_val) else None
 
-    rr = compute_risk_reward(entry_price=last_close, config=config, atr=atr_val)
-    if not rr["passes"]: return None, "FAIL_RR"
+    # 波动率上限准入：ATR 超过现价 MAX_ATR_PCT% 的高波动股否决（替代原 RR≥1.5 门槛——
+    # 2×ATR 止损 + 10% 止盈下二者数学等价，见 MAX_ATR_PCT 注释）。ATR 缺失无法判定时放行
+    if atr_val is not None and last_close > 0 and (atr_val / last_close * 100) > config.MAX_ATR_PCT:
+        return None, "FAIL_VOLATILE"
 
+    rr = compute_risk_reward(entry_price=last_close, config=config, atr=atr_val)
+
+    _amt = pd.to_numeric(daily_out["amount"], errors="coerce").tail(20).mean() if "amount" in daily_out.columns else float("nan")
     sig = Signal(
         code=code, name=name, date=pd.to_datetime(d_last["date"]).strftime("%Y-%m-%d"),
         close=round(last_close, 2), score=round(daily_score, 1), grade=grade,
@@ -1164,6 +1288,7 @@ def evaluate(daily_df: Optional[pd.DataFrame], code: str = "", name: str = "", c
         rsi7=round(float(d_last.get("rsi7", 50)), 1), rsi21=round(float(d_last.get("rsi21", 50)), 1),
         vol_ratio=round(float(d_last.get("daily_vol_ratio", 0)), 2),
         turnover_ratio=round(float(d_last.get("daily_turnover_ratio", 0)), 2),
+        avg_amount=round(float(_amt) / 1e4, 1) if pd.notna(_amt) else 0.0,  # 万元
         stop_loss=rr["stop_loss"], take_profit=rr["take_profit"], rr_ratio=rr["rr_ratio"],
         market_env=regime, has_divergence=has_div
     )
@@ -1206,9 +1331,15 @@ def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] 
         market_env = get_market_environment(config, cache)
         logger.info("市场环境: %s", market_env.get("description", "unknown"))
 
-        # 熊市收缩推荐上限：熊市满额推送等于变相鼓励抄底，收缩为 BEAR_MAX_PICKS
-        max_picks = config.BEAR_MAX_PICKS if market_env.get("regime") == "bear" else config.MAX_PICKS
-        if market_env.get("regime") == "bear":
+        # 熊市收缩推荐上限：熊市满额推送等于变相鼓励抄底，收缩为 BEAR_MAX_PICKS；
+        # unknown（指数数据缺失）按 UNKNOWN_AS_BEAR 保守视同 bear，避免故障日满额进攻
+        regime_raw = market_env.get("regime", "unknown")
+        regime_eff = _effective_regime(regime_raw, config)
+        if regime_eff != regime_raw:
+            logger.warning("市场环境 unknown（指数数据缺失），按熊市保守处理：等级门槛 +%s 分、推荐上限收缩为 %d",
+                           config.BEAR_GRADE_BOOST, config.BEAR_MAX_PICKS)
+        max_picks = config.BEAR_MAX_PICKS if regime_eff == "bear" else config.MAX_PICKS
+        if regime_eff == "bear":
             logger.info("熊市环境：推荐数量上限由 %d 收缩为 %d（BEAR_MAX_PICKS）", config.MAX_PICKS, max_picks)
 
         stock_list = get_stock_list(config, cache)
@@ -1219,7 +1350,7 @@ def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] 
 
         signals: list[dict] = []
         processed, total = 0, len(stock_list)
-        stats = {"total": total, "error": 0, "fail_data": 0, "fail_fund": 0, "fail_tech": 0, "fail_rr": 0, "pass": 0}
+        stats = {"total": total, "error": 0, "fail_data": 0, "fail_liq": 0, "fail_fund": 0, "fail_tech": 0, "fail_vol": 0, "pass": 0}
 
         def _screen_one(stock: dict) -> tuple[Optional[Signal], str]:
             code, name = stock["code"], stock["name"]
@@ -1270,12 +1401,13 @@ def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] 
                     logger.info("[通过] %s(%s) 评分 %.1f，%s 级", sig.name, sig.code, sig.score, sig.grade)
                 elif reason == "FAIL_FUND": stats["fail_fund"] += 1
                 elif reason == "FAIL_DATA": stats["fail_data"] += 1
+                elif reason == "FAIL_LIQUIDITY": stats["fail_liq"] += 1  # 僵尸股淘汰（独立归因）
                 # FAIL_CHASE（追高）/ FAIL_GAP（跳空）/ FAIL_RSI_HIGH（RSI过高）/ FAIL_CLIMAX_VOL（天量）/ FAIL_NOT_BOTTOM（非底部区域）
                 # / FAIL_POSITION（区间位置偏高）/ FAIL_MACD_MOM（动能未改善）/ FAIL_KDJ（KDJ未金叉）/ FAIL_NO_TREND（无趋势转折旁路拦截）
                 # 均属技术面入场质量层
                 elif reason in ("FAIL_TECH", "FAIL_NO_TREND", "FAIL_CHASE", "FAIL_GAP", "FAIL_RSI_HIGH", "FAIL_CLIMAX_VOL",
                                 "FAIL_NOT_BOTTOM", "FAIL_POSITION", "FAIL_MACD_MOM", "FAIL_KDJ"): stats["fail_tech"] += 1
-                elif reason == "FAIL_RR": stats["fail_rr"] += 1
+                elif reason == "FAIL_VOLATILE": stats["fail_vol"] += 1  # 波动率上限（替代原 FAIL_RR）
                 elif reason == "ERROR": stats["error"] += 1
                 if processed % config.PROGRESS_LOG_EVERY == 0 or processed == total:
                     elapsed = time.time() - screen_start
@@ -1296,9 +1428,10 @@ def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] 
 
         screen_minutes = (time.time() - screen_start) / 60
         pass_data = processed - stats["fail_data"] - stats["error"]
-        pass_fund = pass_data - stats["fail_fund"]
+        pass_liq = pass_data - stats["fail_liq"]
+        pass_fund = pass_liq - stats["fail_fund"]
         pass_tech = pass_fund - stats["fail_tech"]
-        pass_rr = pass_tech - stats["fail_rr"]
+        pass_vol = pass_tech - stats["fail_vol"]
 
         logger.info("=" * 50)
         logger.info("📊 选股漏斗数据分析 (Funnel Log)   筛选耗时 %.1f 分钟", screen_minutes)
@@ -1307,9 +1440,10 @@ def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] 
             logger.warning("⚠️ 因达到时间预算，以下漏斗仅统计已完成的 %d/%d 只", processed, total)
         logger.info("1. 初始有效股票池: %d 只 (完成处理 %d 只)", stats["total"], processed)
         logger.info("2. 获取数据并达标: %d 只 (淘汰/缺失 %d 只)", pass_data, stats["fail_data"] + stats["error"])
-        if pass_data > 0: logger.info("3. 基本面防雷通过: %d 只 (淘汰 %d 只，通过率 %.1f%%)", pass_fund, stats["fail_fund"], pass_fund / pass_data * 100)
-        if pass_fund > 0: logger.info("4. 日线技术面达标: %d 只 (淘汰 %d 只，通过率 %.1f%%)", pass_tech, stats["fail_tech"], pass_tech / pass_fund * 100)
-        if pass_tech > 0: logger.info("5. 盈亏风控比达标: %d 只 (淘汰 %d 只，通过率 %.1f%%)", pass_rr, stats["fail_rr"], pass_rr / pass_tech * 100)
+        if pass_data > 0: logger.info("3. 流动性达标: %d 只 (僵尸股淘汰 %d 只，通过率 %.1f%%)", pass_liq, stats["fail_liq"], pass_liq / pass_data * 100)
+        if pass_liq > 0: logger.info("4. 基本面防雷通过: %d 只 (淘汰 %d 只，通过率 %.1f%%)", pass_fund, stats["fail_fund"], pass_fund / pass_liq * 100)
+        if pass_fund > 0: logger.info("5. 日线技术面达标: %d 只 (淘汰 %d 只，通过率 %.1f%%)", pass_tech, stats["fail_tech"], pass_tech / pass_fund * 100)
+        if pass_tech > 0: logger.info("6. 波动率风控达标 (ATR≤%.2f%%现价): %d 只 (淘汰 %d 只，通过率 %.1f%%)", config.MAX_ATR_PCT, pass_vol, stats["fail_vol"], pass_vol / pass_tech * 100)
         logger.info("日线取数来源: Baostock %d 只，AkShare 兜底 %d 只，双源均失败 %d 只",
                     fetch_stats["bs_ok"], fetch_stats["ak_ok"], fetch_stats["fail"])
         logger.info("=" * 50)
@@ -1318,6 +1452,7 @@ def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] 
             logger.info("未发现符合条件的信号")
             return None
 
+        # 确定性排序（评分↓ → 20日均成交额↓ → 代码↑）：并列分的截取与周线确认顺序可复现
         df = pd.DataFrame(signals).sort_values(SORT_BY, ascending=SORT_ASC).reset_index(drop=True)
 
         # 决赛圈周线确认：按评分降序逐个拉周线确认，取满 max_picks 即止（只对决赛圈拉取，成本可控）

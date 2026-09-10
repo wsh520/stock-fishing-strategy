@@ -123,7 +123,8 @@ def notify_screening_result(
                 f"| 收盘: {r.get('close', 0)} "
                 f"| 止损: {r.get('stop_loss', 0)} "
                 f"| 止盈: {r.get('take_profit', 0)} "
-                f"| RR: {r.get('rr_ratio', 0)}"
+                f"| RR: {r.get('rr_ratio', 0)} "
+                f"| 日均额: {r.get('avg_amount', '-')}万"
             )
         elements.append(_md_element(text))
         elements.append(_divider())
