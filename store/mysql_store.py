@@ -11,6 +11,10 @@
 - 每条推荐记录最多追踪 TRACK_MAX_WEEKS=4 周（约一个月），且推荐日起 TRACK_MAX_AGE_DAYS=31
   天后强制退出追踪（双保险，防止周任务中断导致超期）；
 - 收益值 = 最新收盘价 - 推荐时收盘价；收益率 = 收益值 / 推荐时收盘价 × 100%。
+
+信号归因：get_attribution_rows() 返回近 N 天推荐 × 周度追踪的明细，
+由 run_monthly_attribution.py 聚合为各信号维度（等级/底背离/市场环境/持有周次）的
+胜率与收益统计，飞书推送月报——用真实追踪数据反哺选股信号质量评估。
 """
 
 from __future__ import annotations
@@ -254,3 +258,38 @@ def save_tracking(rec_id: int, rec_date: Any, code: str, week_no: int,
     except Exception as e:
         logger.warning("追踪记录落库失败(%s 第%d周): %s", code, week_no, e)
         return False
+
+
+def get_attribution_rows(days: int = 90) -> list[dict]:
+    """查询近 N 天内全部推荐记录的周度追踪明细（含推荐侧信号字段），供信号归因分析。
+
+    返回逐条明细（一条 = 某推荐的第某周观测），字段：
+    rec_date / code / name / grade / has_divergence / market_env / score / daily_score
+    / week_no / return_pct；聚合（每条推荐的最新收益、峰值收益等）由调用方用 pandas 完成。
+    仅返回至少有一次追踪记录的推荐（尚未被追踪的新推荐不参与归因）。
+    """
+    if not is_configured():
+        logger.info("MySQL 未配置，无法执行信号归因查询")
+        return []
+
+    sql = """
+        SELECT r.id, r.rec_date, r.code, r.name, r.grade, r.has_divergence, r.market_env,
+               r.score, r.daily_score, t.week_no, t.return_pct
+        FROM stock_recommendation r
+        JOIN stock_tracking t ON t.rec_id = r.id
+        WHERE r.rec_date >= CURDATE() - INTERVAL %s DAY
+        ORDER BY r.id, t.week_no
+    """
+    try:
+        conn = _connect()
+        try:
+            _ensure_tables(conn)
+            with conn.cursor() as cur:
+                cur.execute(sql, (int(days),))
+                cols = [d[0] for d in cur.description]
+                return [dict(zip(cols, row)) for row in cur.fetchall()]
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.warning("信号归因数据查询失败: %s", e)
+        return []

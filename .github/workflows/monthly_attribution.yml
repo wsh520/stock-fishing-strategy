@@ -1,0 +1,47 @@
+name: Monthly Signal Attribution
+
+on:
+  schedule:
+    # UTC 01:00 = 北京时间 09:00（每月 1 日）：上月推荐已有周度追踪数据，归因统计正合适
+    - cron: "0 1 1 * *"
+  workflow_dispatch:
+    inputs:
+      days:
+        description: "统计窗口（天，默认 90）"
+        default: "90"
+
+jobs:
+  attribution:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run monthly attribution
+        env:
+          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+          MYSQL_HOST: ${{ secrets.MYSQL_HOST }}
+          MYSQL_PORT: ${{ secrets.MYSQL_PORT }}
+          MYSQL_USER: ${{ secrets.MYSQL_USER }}
+          MYSQL_PASSWORD: ${{ secrets.MYSQL_PASSWORD }}
+          MYSQL_DATABASE: ${{ secrets.MYSQL_DATABASE }}
+          TZ: Asia/Shanghai
+          PYTHONUNBUFFERED: "1"
+        run: |
+          DAYS="${{ github.event.inputs.days }}"
+          if [ -n "$DAYS" ]; then
+            python -u run_monthly_attribution.py --days "$DAYS"
+          else
+            python -u run_monthly_attribution.py
+          fi

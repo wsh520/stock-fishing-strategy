@@ -1,7 +1,7 @@
 """
 飞书 Webhook 通知模块
 
-通过飞书自定义机器人 Webhook 发送选股结果、追踪报告、月度绩效。
+通过飞书自定义机器人 Webhook 发送选股结果、追踪报告、信号归因月报、月度绩效。
 环境变量 FEISHU_WEBHOOK_URL 未配置时静默跳过。
 """
 
@@ -182,6 +182,72 @@ def notify_tracking_result(report: Optional[pd.DataFrame]) -> None:
 
     card = {
         "header": _build_header(f"周度追踪 - 胜率{win_rate:.0f}%", color="blue"),
+        "elements": elements,
+    }
+    _send_feishu(card)
+
+
+def notify_attribution_report(stats: Optional[dict]) -> None:
+    """发送信号归因月报。
+
+    由 run_monthly_attribution.py 调用，基于 stock_recommendation + stock_tracking
+    历史数据聚合的各信号维度胜率/收益统计。
+
+    stats 格式:
+        {"period": str, "tracked_recs": int, "win_rate": float, "avg_return": float,
+         "avg_peak": float, "by_grade": [...], "by_divergence": [...],
+         "by_market": [...], "by_week": [...]}
+        其中各分组列表元素: {"label": str, "n": int, "win_rate": float,
+                             "avg_return": float, "avg_peak": float}
+    """
+    if not stats or stats.get("tracked_recs", 0) == 0:
+        return
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    win_rate = stats.get("win_rate", 0)
+
+    def _group_lines(rows: list[dict]) -> list[str]:
+        lines = []
+        for g in rows:
+            ret = g.get("avg_return", 0)
+            peak = g.get("avg_peak", 0)
+            lines.append(
+                f"**{g.get('label', '')}**: {g.get('n', 0)} 只 | "
+                f"胜率 {g.get('win_rate', 0):.1f}% | "
+                f"平均收益 {'+' if ret >= 0 else ''}{ret:.2f}% | "
+                f"平均峰值 {'+' if peak >= 0 else ''}{peak:.2f}%"
+            )
+        return lines
+
+    elements = [
+        _md_element(
+            f"**时间:** {now}\n"
+            f"**统计周期:** {stats.get('period', '')}\n"
+            f"**已追踪推荐:** {stats.get('tracked_recs', 0)} 条\n"
+            f"**整体胜率:** {win_rate:.1f}%\n"
+            f"**平均收益:** {stats.get('avg_return', 0):.2f}%\n"
+            f"**平均峰值收益:** {stats.get('avg_peak', 0):.2f}%\n"
+            f"\n收益口径：每条推荐取最新一次周度追踪的收益率（31 天窗口）；峰值为追踪期内最高周度收益率。"
+        ),
+    ]
+
+    sections = [
+        ("按信号等级", stats.get("by_grade")),
+        ("按评分分档", stats.get("by_score")),
+        ("按底背离", stats.get("by_divergence")),
+        ("按市场环境", stats.get("by_market")),
+        ("按持有周次", stats.get("by_week")),
+    ]
+    for title, rows in sections:
+        if not rows:
+            continue
+        elements.append(_divider())
+        elements.append(_md_element(f"**{title}**"))
+        elements.append(_md_element("\n".join(_group_lines(rows))))
+
+    color = "green" if win_rate >= 50 else "red"
+    card = {
+        "header": _build_header(f"信号归因月报 - 胜率{win_rate:.0f}%", color=color),
         "elements": elements,
     }
     _send_feishu(card)

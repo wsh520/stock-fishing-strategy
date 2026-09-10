@@ -149,6 +149,9 @@ class StrategyConfig:
     MIN_DRAWDOWN_FROM_HIGH: float = 0.10
     # 最终推荐数量上限：评分降序截取前 N 只（目标每日推荐 3~5 只）
     MAX_PICKS: int = 5
+    # 熊市收缩：市场环境为 bear 时推荐上限收缩为该值（熊市满额推送 = 变相鼓励抄底）；
+    # 设为 0 可实现熊市空仓（不出任何推荐）
+    BEAR_MAX_PICKS: int = 2
 
     # ===== 严格确认指标（提高胜率，进一步压缩低质量信号）=====
     # 区间位置过滤：现价在近 N 日价格区间（最低~最高）中的位置超过该比例，判定不够低位，否决
@@ -179,7 +182,8 @@ class StrategyConfig:
     W_DAILY_RSI_REBOUND: float = 25.0
     W_DAILY_VOL_PRICE: float = 25.0
     DAILY_MULTI_RESONANCE_BONUS: float = 10.0
-    DAILY_RSI_OVERBOUGHT_PENALTY: float = 3.0
+    # 注：RSI 超买评分惩罚已移除——RSI>65 会被 DAILY_RSI_ENTRY_MAX 入场否决在前拦截，
+    # 评分内的超买惩罚永不触发（死代码），保留只会误导后续调参
     # 底背离不再直接加分，改为评级提升档数（与基础分脱钩，避免底背离股必然 A 级）
     DIVERGENCE_GRADE_LIFT: int = 1
 
@@ -190,6 +194,11 @@ class StrategyConfig:
     # 准入等级门槛：基础评级（按分数，不含底背离提升）须不低于该等级，默认 B（≥60 分）。
     # C 级仅为单一趋势转折信号（40 分），噪音过大不再推荐；设为 "C" 可恢复旧行为。
     MIN_PASS_GRADE: str = "B"
+    # 趋势转折硬性必要条件：评分体系存在「RSI反弹25 + 量价配合25 + 共振10 = 60」的
+    # 无拐点旁路，且该路径恰在 MA20 陡峭下降（接飞刀）场景下成立（趋势转折被门控时仍可凑满 60 分）。
+    # 开启后在任何准入等级下都额外要求 trend_turn 为真，兑现"趋势转折 + 至少一个确认信号"的准入语义；
+    # 设为 False 恢复旧版纯评分准入行为
+    REQUIRE_TREND_TURN: bool = True
 
     CACHE_EXPIRE_HOURS: float = 4.0
     MAX_WORKERS: int = 4
@@ -1002,8 +1011,7 @@ def compute_daily_signals(df: pd.DataFrame, config: StrategyConfig) -> Optional[
         out["trend_turn"].astype(float) * config.W_DAILY_TREND_TURN +
         out["rsi_rebound"].astype(float) * config.W_DAILY_RSI_REBOUND +
         out["vol_price_coord"].astype(float) * config.W_DAILY_VOL_PRICE +
-        out["multi_resonance"].astype(float) * config.DAILY_MULTI_RESONANCE_BONUS +
-        (out["rsi14"] >= config.DAILY_RSI_OVERBOUGHT).astype(float) * (-config.DAILY_RSI_OVERBOUGHT_PENALTY)
+        out["multi_resonance"].astype(float) * config.DAILY_MULTI_RESONANCE_BONUS
     ).fillna(0).clip(0, 100).round(1)
 
     return out
@@ -1136,6 +1144,10 @@ def evaluate(daily_df: Optional[pd.DataFrame], code: str = "", name: str = "", c
     min_grade = config.MIN_PASS_GRADE if config.MIN_PASS_GRADE in _GRADE_ORDER else "B"
     if _GRADE_ORDER.index(base_grade) < _GRADE_ORDER.index(min_grade):
         return None, "FAIL_TECH"
+    # 趋势转折硬性条件：堵住「RSI反弹25 + 量价配合25 + 共振10 = 60」的无拐点旁路
+    # （该路径恰在 MA20 陡峭下降的接飞刀场景成立），确保推荐必含趋势转折信号
+    if config.REQUIRE_TREND_TURN and not bool(d_last.get("trend_turn", False)):
+        return None, "FAIL_NO_TREND"
     # 底背离：通过准入后评级提升一档（与基础分脱钩），仅用于展示/排序，不能绕过准入门槛
     grade = _lift_grade(base_grade, config.DIVERGENCE_GRADE_LIFT) if has_div and config.DIVERGENCE_GRADE_LIFT > 0 else base_grade
 
@@ -1193,6 +1205,11 @@ def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] 
     try:
         market_env = get_market_environment(config, cache)
         logger.info("市场环境: %s", market_env.get("description", "unknown"))
+
+        # 熊市收缩推荐上限：熊市满额推送等于变相鼓励抄底，收缩为 BEAR_MAX_PICKS
+        max_picks = config.BEAR_MAX_PICKS if market_env.get("regime") == "bear" else config.MAX_PICKS
+        if market_env.get("regime") == "bear":
+            logger.info("熊市环境：推荐数量上限由 %d 收缩为 %d（BEAR_MAX_PICKS）", config.MAX_PICKS, max_picks)
 
         stock_list = get_stock_list(config, cache)
         if not stock_list:
@@ -1254,8 +1271,9 @@ def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] 
                 elif reason == "FAIL_FUND": stats["fail_fund"] += 1
                 elif reason == "FAIL_DATA": stats["fail_data"] += 1
                 # FAIL_CHASE（追高）/ FAIL_GAP（跳空）/ FAIL_RSI_HIGH（RSI过高）/ FAIL_CLIMAX_VOL（天量）/ FAIL_NOT_BOTTOM（非底部区域）
-                # / FAIL_POSITION（区间位置偏高）/ FAIL_MACD_MOM（动能未改善）/ FAIL_KDJ（KDJ未金叉）均属技术面入场质量层
-                elif reason in ("FAIL_TECH", "FAIL_CHASE", "FAIL_GAP", "FAIL_RSI_HIGH", "FAIL_CLIMAX_VOL",
+                # / FAIL_POSITION（区间位置偏高）/ FAIL_MACD_MOM（动能未改善）/ FAIL_KDJ（KDJ未金叉）/ FAIL_NO_TREND（无趋势转折旁路拦截）
+                # 均属技术面入场质量层
+                elif reason in ("FAIL_TECH", "FAIL_NO_TREND", "FAIL_CHASE", "FAIL_GAP", "FAIL_RSI_HIGH", "FAIL_CLIMAX_VOL",
                                 "FAIL_NOT_BOTTOM", "FAIL_POSITION", "FAIL_MACD_MOM", "FAIL_KDJ"): stats["fail_tech"] += 1
                 elif reason == "FAIL_RR": stats["fail_rr"] += 1
                 elif reason == "ERROR": stats["error"] += 1
@@ -1302,13 +1320,13 @@ def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] 
 
         df = pd.DataFrame(signals).sort_values(SORT_BY, ascending=SORT_ASC).reset_index(drop=True)
 
-        # 决赛圈周线确认：按评分降序逐个拉周线确认，取满 MAX_PICKS 即止（只对决赛圈拉取，成本可控）
+        # 决赛圈周线确认：按评分降序逐个拉周线确认，取满 max_picks 即止（只对决赛圈拉取，成本可控）
         if config.REQUIRE_WEEKLY_TREND and not df.empty:
-            logger.info("进入周线确认：%d 只候选，逐只确认最多取 %d 只", len(df), config.MAX_PICKS)
+            logger.info("进入周线确认：%d 只候选，逐只确认最多取 %d 只", len(df), max_picks)
             confirmed = []
             weekly_checked = 0
             for _, row in df.iterrows():
-                if len(confirmed) >= config.MAX_PICKS: break
+                if len(confirmed) >= max_picks: break
                 weekly_checked += 1
                 wk = _fetch_weekly_dual(row["code"], config)
                 trend_ok = check_weekly_trend(wk, config)
@@ -1316,7 +1334,7 @@ def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] 
                 if trend_ok and macd_ok:
                     confirmed.append(row)
                     logger.info("周线确认 %s(%s) 评分 %.1f: 通过（第 %d/%d 只）",
-                                row["name"], row["code"], row["score"], len(confirmed), config.MAX_PICKS)
+                                row["name"], row["code"], row["score"], len(confirmed), max_picks)
                 else:
                     logger.info("周线确认 %s(%s) 评分 %.1f: 淘汰（%s）",
                                 row["name"], row["code"], row["score"],
@@ -1329,10 +1347,10 @@ def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] 
                 logger.info("周线确认汇总：检查 %d 只，淘汰 %d 只（未满足 %s）", weekly_checked, weekly_dropped, " + ".join(conds))
             df = pd.DataFrame(confirmed).reset_index(drop=True) if confirmed else df.iloc[0:0]
 
-        # 推荐数量上限：评分降序截取前 MAX_PICKS 只（目标每日 3~5 只精推，其余评分靠后的不推荐）
-        if len(df) > config.MAX_PICKS:
-            logger.info("通过 %d 只，按评分截取前 %d 只（淘汰 %d 只低分信号）", len(df), config.MAX_PICKS, len(df) - config.MAX_PICKS)
-            df = df.head(config.MAX_PICKS).reset_index(drop=True)
+        # 推荐数量上限：评分降序截取前 max_picks 只（熊市已收缩为 BEAR_MAX_PICKS，其余评分靠后的不推荐）
+        if len(df) > max_picks:
+            logger.info("通过 %d 只，按评分截取前 %d 只（淘汰 %d 只低分信号）", len(df), max_picks, len(df) - max_picks)
+            df = df.head(max_picks).reset_index(drop=True)
         logger.info("筛选完成，最终推荐 %d 只股票", len(df))
         return df
 

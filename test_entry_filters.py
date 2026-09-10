@@ -6,6 +6,7 @@ B 与 A 相同但当日涨 8.5%（追高）→ 期望 FAIL_CHASE
 C 与 A 相同但开盘跳空高开 4% → 期望 FAIL_GAP
 D 陡峭下降通道中的拐头（MA20 近5日斜率 < -4%）→ 期望 FAIL_TECH（trend_turn 被门控）
 E 与 A 相同但 pct_chg/open 缺失 → 期望 PASS（数据缺失放行，不误杀）
+J 评分 ≥60 但 trend_turn=False（60 分无拐点旁路）→ 期望 FAIL_NO_TREND（REQUIRE_TREND_TURN 硬性拦截）
 """
 import os
 import sys
@@ -98,6 +99,20 @@ df_e = make_df(base_closes())
 df_e["pct_chg"] = np.nan
 df_e["open"] = np.nan
 results.append(run_case("E pct_chg/open缺失放行", df_e, "PASS"))
+
+# J 60 分无拐点旁路拦截：RSI反弹25+量价配合25+共振10 可凑满 60 分准入，
+# 但 trend_turn=False（本用例通过临时翻转末行 trend_turn 模拟）时须被 REQUIRE_TREND_TURN 硬性否决
+_orig_cds = m.compute_daily_signals
+
+def _cds_no_trend(df, cfg):
+    out = _orig_cds(df, cfg)
+    if out is not None and not out.empty:
+        out.loc[out.index[-1], "trend_turn"] = False
+    return out
+
+m.compute_daily_signals = _cds_no_trend
+results.append(run_case("J 无趋势转折60分旁路拦截", df_a, "FAIL_NO_TREND"))
+m.compute_daily_signals = _orig_cds
 
 
 def rebound_too_far_closes():
