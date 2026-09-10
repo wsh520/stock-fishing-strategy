@@ -81,11 +81,10 @@ DISPLAY_COLS = [
 
 TITLE = "日线技术指标选股结果"
 PREFIX = "bf"
-# 确定性排序：评分↓ → 20日均成交额(万)↓ → 代码↑。通过分仅 65/75/90/100 四档、并列常见，
-# 而 signals 列表顺序受 as_completed 完成序影响——无次级键时并列内部顺序每次运行都可能不同，
-# 导致决赛圈截取与周线确认顺序不可复现
-SORT_BY = ["score", "avg_amount", "code"]
-SORT_ASC = [False, False, True]
+# 确定性排序：连续质量分↓ → 底背离↓ → 20日均成交额(万)↓ → 代码↑。
+# 底背离已进入总分；将其保留为次级键，可在总分四舍五入相同时继续优先结构更完整的候选。
+SORT_BY = ["score", "has_divergence", "avg_amount", "code"]
+SORT_ASC = [False, False, False, True]
 
 # ===========================================================================
 # StrategyConfig
@@ -127,6 +126,9 @@ class StrategyConfig:
     DAILY_RSI_LONG_PERIOD: int = 21
     DAILY_RSI_OVERSOLD: float = 30.0
     DAILY_RSI_REBOUND_MIN: float = 35.0
+    DAILY_RSI_MIN_IMPROVEMENT: float = 1.0  # 当日至少改善1个RSI点
+    VOLUME_NORMAL_RATIO: float = 1.0
+    VOLUME_PEAK_RATIO: float = 2.5
     DAILY_RSI_OVERBOUGHT: float = 70.0
     DAILY_RSI_DIVERGENCE_THRESHOLD: float = 2.0
     DAILY_MACD_FAST: int = 12
@@ -134,7 +136,15 @@ class StrategyConfig:
     DAILY_MACD_SIGNAL: int = 9
     DAILY_VOL_EXPAND: float = 1.2
     DAILY_TURNOVER_LOOKBACK: int = 20
-    DIVERGENCE_LOOKBACK: int = 20
+    # 趋势转折在最近 N 日内发生且当前结构仍有效即可，不再局限于触发当天
+    TREND_CONFIRM_WINDOW: int = 3
+    # 底背离使用两个已确认价格波谷配对，不再比较互不对应的滚动极值
+    DIVERGENCE_LOOKBACK: int = 40
+    DIVERGENCE_SWING_WINDOW: int = 2
+    DIVERGENCE_MIN_GAP: int = 5
+    DIVERGENCE_MAX_GAP: int = 30
+    DIVERGENCE_PRICE_TOLERANCE: float = 0.02
+    DIVERGENCE_CONFIRM_WINDOW: int = 10
 
     FIXED_STOP_LOSS_PCT: float = 5.0
     FIXED_TAKE_PROFIT_PCT: float = 10.0
@@ -175,9 +185,10 @@ class StrategyConfig:
     # 区间位置过滤：现价在近 N 日价格区间（最低~最高）中的位置超过该比例，判定不够低位，否决
     RANGE_LOOKBACK: int = 20
     POSITION_IN_RANGE_MAX: float = 0.40
-    # MACD 动能确认：要求 MACD 柱当日较昨日改善（绿柱缩短或红柱放大）
+    # 动能组由 MACD / RSI / KDJ 三类同源指标共同描述，至少满足一项，组内统一封顶计分
+    MIN_MOMENTUM_CONFIRMATIONS: int = 1
+    # 保留旧开关供配置兼容；准入不再要求 MACD 与 KDJ 分别同时成立
     REQUIRE_MACD_MOMENTUM: bool = True
-    # KDJ 确认：要求 KDJ 处于金叉状态（K>D）且 K 值不高于该上限（避免高位接力）
     REQUIRE_KDJ_GOLDEN: bool = True
     KDJ_K_MAX: float = 60.0
     # 周线趋势确认：仅对通过全部日线筛选的决赛圈股票拉取周线；
@@ -200,27 +211,22 @@ class StrategyConfig:
     WEEKLY_MACD_SLOW: int = 26
     WEEKLY_MACD_SIGNAL: int = 9
 
-    # 趋势转折（MA5拐头 或 EMA金叉，同源信号合并计分，避免右侧拐点同日触发导致分数通胀）
-    W_DAILY_TREND_TURN: float = 40.0
-    W_DAILY_RSI_REBOUND: float = 25.0
-    W_DAILY_VOL_PRICE: float = 25.0
-    DAILY_MULTI_RESONANCE_BONUS: float = 10.0
-    # 注：RSI 超买评分惩罚已移除——RSI>65 会被 DAILY_RSI_ENTRY_MAX 入场否决在前拦截，
-    # 评分内的超买惩罚永不触发（死代码），保留只会误导后续调参
-    # 底背离不再直接加分，改为评级提升档数（与基础分脱钩，避免底背离股必然 A 级）
-    DIVERGENCE_GRADE_LIFT: int = 1
+    # 连续质量评分：同源动能指标在组内封顶，低位、量价和波谷背离提供不同维度的信息
+    W_TREND_QUALITY: float = 30.0
+    W_MOMENTUM_QUALITY: float = 25.0
+    W_LOCATION_QUALITY: float = 20.0
+    W_VOLUME_QUALITY: float = 15.0
+    W_DIVERGENCE_QUALITY: float = 10.0
+    # 兼容旧配置字段；底背离已直接计入总分，不再额外提升等级，避免重复奖励
+    DIVERGENCE_GRADE_LIFT: int = 0
 
     GRADE_A: float = 80.0
     GRADE_B: float = 60.0
     GRADE_C: float = 40.0
     BEAR_GRADE_BOOST: float = 10.0
-    # 准入等级门槛：基础评级（按分数，不含底背离提升）须不低于该等级，默认 B（≥60 分）。
-    # C 级仅为单一趋势转折信号（40 分），噪音过大不再推荐；设为 "C" 可恢复旧行为。
+    # 连续质量分的准入等级默认 B（≥60）；熊市在该门槛基础上再提高 BEAR_GRADE_BOOST 分。
     MIN_PASS_GRADE: str = "B"
-    # 趋势转折硬性必要条件：评分体系存在「RSI反弹25 + 量价配合25 + 共振10 = 60」的
-    # 无拐点旁路，且该路径恰在 MA20 陡峭下降（接飞刀）场景下成立（趋势转折被门控时仍可凑满 60 分）。
-    # 开启后在任何准入等级下都额外要求 trend_turn 为真，兑现"趋势转折 + 至少一个确认信号"的准入语义；
-    # 设为 False 恢复旧版纯评分准入行为
+    # 趋势转折仍是策略核心硬条件，防止低位/动能/量价分数拼出无趋势转折的旁路。
     REQUIRE_TREND_TURN: bool = True
 
     CACHE_EXPIRE_HOURS: float = 4.0
@@ -1008,6 +1014,99 @@ def check_fundamentals(fund_data: Optional[dict], config: StrategyConfig, code: 
 
 _DAILY_NEED_COLS = {"close", "volume", "amount", "date", "high", "low", "pct_chg"}
 
+
+def _recent_trend_turn(raw_turn: pd.Series, structure_ok: pd.Series, ma20_ok: pd.Series,
+                       window: int, close: pd.Series, low: pd.Series) -> pd.Series:
+    """逐触发锚定当日最低价；后续收盘破位永久撤销该触发，新触发可重建。"""
+    result = pd.Series(False, index=raw_turn.index)
+    active: list[tuple[int, float]] = []
+    window = max(1, int(window))
+    for i in range(len(raw_turn)):
+        price = close.iloc[i]
+        active = [(day, anchor) for day, anchor in active
+                  if i - day < window and pd.notna(price) and price >= anchor]
+        if raw_turn.iloc[i] and pd.notna(low.iloc[i]) and pd.notna(price) and price >= low.iloc[i]:
+            active.append((i, float(low.iloc[i])))
+        result.iloc[i] = bool(active) and bool(structure_ok.fillna(False).iloc[i]) and bool(ma20_ok.fillna(False).iloc[i])
+    return result
+
+
+def _momentum_members(out: pd.DataFrame, config: StrategyConfig) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """成员均要求当前改善；RSI还须达到修复水平和最小改善幅度。"""
+    macd = (out["macd_histogram"].diff() > 0) & config.REQUIRE_MACD_MOMENTUM
+    rsi = ((out["rsi14"].diff() >= config.DAILY_RSI_MIN_IMPROVEMENT) &
+           (out["rsi14"].diff() > 0) &
+           out["rsi14"].between(config.DAILY_RSI_REBOUND_MIN, config.DAILY_RSI_ENTRY_MAX))
+    kdj = ((out["kdj_k"] > out["kdj_d"]) & (out["kdj_k"] <= config.KDJ_K_MAX) &
+           (out["kdj_k"].diff() > 0) & config.REQUIRE_KDJ_GOLDEN)
+    return macd.fillna(False), rsi.fillna(False), kdj.fillna(False)
+
+
+def _volume_quality(ratio: pd.Series, price_up: pd.Series, config: StrategyConfig) -> pd.Series:
+    """分段smoothstep：正常量归零，温和放量达峰，再平滑降至上限端点。"""
+    start, peak, end = config.VOLUME_NORMAL_RATIO, config.VOLUME_PEAK_RATIO, config.MAX_VOL_RATIO
+    if not 0 <= start < peak < end:
+        raise ValueError("量价参数须满足 0<=正常量<峰值<最大量比")
+    up = ((ratio - start) / (peak - start)).clip(0, 1)
+    down = ((ratio - peak) / (end - peak)).clip(0, 1)
+    smooth_up = up * up * (3 - 2 * up)
+    smooth_down = down * down * (3 - 2 * down)
+    quality = smooth_up.where(ratio <= peak, 1 - smooth_down)
+    return quality.where(price_up & (ratio <= end), 0.0).fillna(0).clip(0, 1)
+
+
+def _paired_bottom_divergence(out: pd.DataFrame, right_confirm: pd.Series, config: StrategyConfig) -> pd.Series:
+    """用两个对应价格波谷识别底背离，并要求第二个波谷后出现右侧确认。"""
+    n = len(out)
+    result = pd.Series(False, index=out.index, dtype=bool)
+    swing = max(1, int(config.DIVERGENCE_SWING_WINDOW))
+    if n < swing * 2 + config.DIVERGENCE_MIN_GAP + 1:
+        return result
+
+    low = pd.to_numeric(out["low"], errors="coerce")
+    rsi = pd.to_numeric(out["rsi14"], errors="coerce")
+    macd = pd.to_numeric(out["macd_diff"], errors="coerce")
+    pivot_low = pd.Series(True, index=out.index)
+    for offset in range(1, swing + 1):
+        pivot_low &= (low <= low.shift(offset)) & (low < low.shift(-offset))
+    pivot_indices = [int(i) for i in out.index[pivot_low.fillna(False)]]
+
+    for pos, second in enumerate(pivot_indices):
+        candidates = [
+            first for first in pivot_indices[:pos]
+            if config.DIVERGENCE_MIN_GAP <= second - first <= config.DIVERGENCE_MAX_GAP
+        ]
+        if not candidates:
+            continue
+        first = candidates[-1]
+        # 回看窗口按每个判定时点检查，不能依赖输入总长度，否则历史前缀会漂移。
+        if pd.isna(low.iloc[first]) or pd.isna(low.iloc[second]):
+            continue
+        price_ok = float(low.iloc[second]) <= float(low.iloc[first]) * (1 + config.DIVERGENCE_PRICE_TOLERANCE)
+        rsi_ok = (
+            pd.notna(rsi.iloc[first]) and pd.notna(rsi.iloc[second]) and
+            float(rsi.iloc[second]) >= float(rsi.iloc[first]) + config.DAILY_RSI_DIVERGENCE_THRESHOLD
+        )
+        macd_ok = (
+            pd.notna(macd.iloc[first]) and pd.notna(macd.iloc[second]) and
+            float(macd.iloc[second]) > float(macd.iloc[first])
+        )
+        if not price_ok or not (rsi_ok or macd_ok):
+            continue
+        # 波谷需等待右侧 swing 根K线后才被确认；在此之前不能提前使用尚未成立的波谷。
+        confirm_start = second + swing
+        confirm_end = min(n - 1, second + config.DIVERGENCE_CONFIRM_WINDOW)
+        for current in range(confirm_start, confirm_end + 1):
+            # 日内最低价破第二波谷即永久撤销这组配对；回升不能使旧配对复活。
+            if (low.iloc[second + 1:current + 1] < low.iloc[second]).any():
+                break
+            if current - first >= config.DIVERGENCE_LOOKBACK:
+                break
+            if bool(right_confirm.iloc[second + 1:current + 1].fillna(False).any()):
+                result.iloc[current] = True
+    return result
+
+
 def compute_daily_signals(df: pd.DataFrame, config: StrategyConfig) -> Optional[pd.DataFrame]:
     if df is None or df.empty or not _DAILY_NEED_COLS.issubset(df.columns) or len(df) < config.MIN_DAYS: return None
     # 流动性过滤（MIN_AMOUNT 僵尸股否决）已移至 evaluate，使用独立原因码 FAIL_LIQUIDITY，
@@ -1054,41 +1153,73 @@ def compute_daily_signals(df: pd.DataFrame, config: StrategyConfig) -> Optional[
         out["daily_turnover_ratio"] = np.nan
 
     ma5_slope = out["ma5"] - out["ma5"].shift(1)
+    out["ma5_slope"] = ma5_slope
     out["ma5_turn"] = (ma5_slope > 0) & (ma5_slope.shift(1) <= 0)
     out["ema_golden_cross"] = (out["ema5"] > out["ema10"]) & (out["ema5"].shift(1) <= out["ema10"].shift(1))
-    # 下降通道过滤：MA20 近 N 日斜率低于阈值判定为陡峭下降，此时 MA5 拐头/EMA 金叉多为
-    # 下跌中继的假拐点（接飞刀），趋势转折信号不认可；底背离的右侧确认不受此限（抄底本身发生在下降中）
+    # 下降通道过滤仍是趋势组的硬约束。触发可发生在最近3日，但当前短期结构必须保持有效。
     out["ma20"] = out["close"].rolling(config.DAILY_MA20).mean()
     _ma20_prev = out["ma20"].shift(config.MA20_TREND_LOOKBACK)
     out["ma20_slope"] = (out["ma20"] - _ma20_prev) / _ma20_prev.replace(0, np.nan)
     ma20_trend_ok = (out["ma20_slope"] >= config.MA20_TREND_MIN_SLOPE).fillna(False)
-    # MA5拐头与EMA金叉在右侧拐点经常同日触发（同一信息），合并为一个趋势转折信号
-    out["trend_turn"] = (out["ma5_turn"] | out["ema_golden_cross"]) & ma20_trend_ok
-    out["macd_golden_cross"] = (out["macd_diff"] > out["macd_dea"]) & (out["macd_diff"].shift(1) <= out["macd_dea"].shift(1))
-    rsi_was_oversold = (out["rsi14"].shift(1) < config.DAILY_RSI_OVERSOLD) | (out["rsi14"].shift(2) < config.DAILY_RSI_OVERSOLD)
-    out["rsi_rebound"] = rsi_was_oversold & (out["rsi14"] >= config.DAILY_RSI_REBOUND_MIN)
-    out["rsi_multi_res"] = (out["rsi7"] > out["rsi14"]) & (out["rsi14"] > out["rsi21"]) & (out["rsi7"] < config.DAILY_RSI_OVERBOUGHT) & (out["rsi21"] > config.DAILY_RSI_OVERSOLD)
+    raw_trend_turn = out["ma5_turn"] | out["ema_golden_cross"]
+    trend_structure_ok = (ma5_slope > 0) | (out["ema5"] > out["ema10"])
+    out["trend_turn"] = _recent_trend_turn(raw_trend_turn, trend_structure_ok, ma20_trend_ok,
+                                             config.TREND_CONFIRM_WINDOW, out["close"], out["low"])
 
-    past_min_close = out["close"].shift(1).rolling(config.DIVERGENCE_LOOKBACK).min()
-    past_min_rsi = out["rsi14"].shift(1).rolling(config.DIVERGENCE_LOOKBACK).min()
-    past_min_macd = out["macd_diff"].shift(1).rolling(config.DIVERGENCE_LOOKBACK).min()
-    price_new_low = out["close"] < past_min_close
-    rsi_div_state = price_new_low & (out["rsi14"] > past_min_rsi + config.DAILY_RSI_DIVERGENCE_THRESHOLD)
-    macd_div_state = price_new_low & (out["macd_diff"] > past_min_macd)
-    recent_div = (rsi_div_state | macd_div_state).rolling(3).max() > 0
-    right_confirm = out["macd_golden_cross"] | out["rsi_rebound"] | out["ma5_turn"]
-    out["bottom_divergence"] = recent_div & right_confirm
+    out["macd_golden_cross"] = (out["macd_diff"] > out["macd_dea"]) & (out["macd_diff"].shift(1) <= out["macd_dea"].shift(1))
+    rsi_was_oversold = out["rsi14"].shift(1).rolling(config.TREND_CONFIRM_WINDOW, min_periods=1).min() < config.DAILY_RSI_OVERSOLD
+    out["rsi_rebound"] = rsi_was_oversold & (out["rsi14"] >= config.DAILY_RSI_REBOUND_MIN)
+    out["macd_momentum"], out["rsi_momentum"], out["kdj_momentum"] = _momentum_members(out, config)
+    out["rsi_rebound"] &= out["rsi_momentum"]
+    out["rsi_multi_res"] = (out["rsi7"] > out["rsi14"]) & (out["rsi14"] > out["rsi21"]) & (out["rsi7"] < config.DAILY_RSI_OVERBOUGHT)
+
 
     price_up = out["close"] > out["close"].shift(1)
     vol_expand = out["daily_vol_ratio"] >= config.DAILY_VOL_EXPAND
     out["vol_price_coord"] = price_up & vol_expand
+    # 仅作诊断兼容，不再额外计分，避免量价25分后再以“共振”重复奖励。
     out["multi_resonance"] = out["rsi_multi_res"] & out["macd_golden_cross"] & out["vol_price_coord"]
 
+    right_confirm = out["macd_momentum"] | out["rsi_momentum"] | out["kdj_momentum"] | out["trend_turn"]
+    out["bottom_divergence"] = _paired_bottom_divergence(out, right_confirm, config)
+
+    atr_safe = out["atr"].replace(0, np.nan)
+    ma_strength = (ma5_slope.clip(lower=0) / atr_safe * 12.0).clip(0, 1)
+    ema_strength = ((out["ema5"] - out["ema10"]).clip(lower=0) / atr_safe * 8.0).clip(0, 1)
+    trigger_recency = raw_trend_turn.astype(float).rolling(config.TREND_CONFIRM_WINDOW, min_periods=1).max()
+    out["trend_score"] = out["trend_turn"].astype(float) * config.W_TREND_QUALITY * (
+        0.60 + 0.20 * trigger_recency + 0.20 * pd.concat([ma_strength, ema_strength], axis=1).max(axis=1)
+    )
+
+    macd_strength = ((out["macd_histogram"] - out["macd_histogram"].shift(1)).clip(lower=0) / atr_safe * 20.0).clip(0, 1)
+    rsi_strength = ((out["rsi14"] - out["rsi14"].shift(1)).clip(lower=0) / 10.0).clip(0, 1)
+    kdj_strength = ((out["kdj_k"] - out["kdj_d"]).clip(lower=0) / 15.0).clip(0, 1)
+    momentum_parts = pd.concat([
+        out["macd_momentum"].astype(float) * (0.45 + 0.55 * macd_strength),
+        out["rsi_momentum"].astype(float) * (0.45 + 0.55 * rsi_strength),
+        out["kdj_momentum"].astype(float) * (0.45 + 0.55 * kdj_strength),
+    ], axis=1)
+    out["momentum_confirmations"] = (momentum_parts > 0).sum(axis=1)
+    momentum_best = momentum_parts.max(axis=1)
+    momentum_breadth = ((out["momentum_confirmations"] - 1).clip(lower=0) / 2.0).clip(0, 1)
+    out["momentum_score"] = config.W_MOMENTUM_QUALITY * (0.85 * momentum_best + 0.15 * momentum_breadth)
+
+    range_low = out["low"].rolling(config.RANGE_LOOKBACK).min()
+    range_high = out["high"].rolling(config.RANGE_LOOKBACK).max()
+    range_position = (out["close"] - range_low) / (range_high - range_low).replace(0, np.nan)
+    high_n = out["high"].rolling(config.DRAWDOWN_LOOKBACK).max()
+    drawdown = (high_n - out["close"]) / high_n.replace(0, np.nan)
+    range_quality = (1 - range_position / config.POSITION_IN_RANGE_MAX).clip(0, 1)
+    drawdown_quality = ((drawdown - config.MIN_DRAWDOWN_FROM_HIGH) / 0.20).clip(0, 1)
+    out["location_score"] = config.W_LOCATION_QUALITY * (0.60 * range_quality + 0.40 * drawdown_quality)
+
+    vol_quality = _volume_quality(out["daily_vol_ratio"], price_up, config)
+    out["volume_score"] = config.W_VOLUME_QUALITY * vol_quality
+    out["divergence_score"] = out["bottom_divergence"].astype(float) * config.W_DIVERGENCE_QUALITY
+
     out["daily_score"] = (
-        out["trend_turn"].astype(float) * config.W_DAILY_TREND_TURN +
-        out["rsi_rebound"].astype(float) * config.W_DAILY_RSI_REBOUND +
-        out["vol_price_coord"].astype(float) * config.W_DAILY_VOL_PRICE +
-        out["multi_resonance"].astype(float) * config.DAILY_MULTI_RESONANCE_BONUS
+        out["trend_score"] + out["momentum_score"] + out["location_score"] +
+        out["volume_score"] + out["divergence_score"]
     ).fillna(0).clip(0, 100).round(1)
 
     return out
@@ -1250,25 +1381,22 @@ def evaluate(daily_df: Optional[pd.DataFrame], code: str = "", name: str = "", c
     if high_n > 0 and (high_n - last_close) / high_n < config.MIN_DRAWDOWN_FROM_HIGH:
         return None, "FAIL_NOT_BOTTOM"
 
-    # 严格确认指标：低位/动能/KDJ 三重确认，任一不过即否决
+    # 低位仍是硬条件；MACD/RSI/KDJ 改为同一动能组，至少一项确认即可，避免同源指标层层否决。
     if not _range_position_ok(daily_out, config): return None, "FAIL_POSITION"
-    if config.REQUIRE_MACD_MOMENTUM and not _macd_momentum_ok(daily_out, config): return None, "FAIL_MACD_MOM"
-    if config.REQUIRE_KDJ_GOLDEN and not _kdj_ok(daily_out, config): return None, "FAIL_KDJ"
+    momentum_count = int(d_last.get("momentum_confirmations", 0))
+    if momentum_count < config.MIN_MOMENTUM_CONFIRMATIONS: return None, "FAIL_MOMENTUM"
 
     daily_score = float(d_last.get("daily_score", 0))
     has_div = bool(d_last.get("bottom_divergence", False))
-    # 准入门槛：按基础评级（分数扣除熊市加码后定级）判断，默认须达 B 级（≥60 分），
-    # 即趋势转折之外还需至少一个确认信号；设为 "C" 可恢复旧行为
+    # 趋势转折仍是策略核心硬条件，但允许最近 TREND_CONFIRM_WINDOW 日内触发且当前结构仍有效。
+    if config.REQUIRE_TREND_TURN and not bool(d_last.get("trend_turn", False)):
+        return None, "FAIL_NO_TREND"
+    # 连续质量分直接定级；熊市以提高分数门槛的方式收紧。
     base_grade = _grade_from_score(daily_score - grade_boost, config)
     min_grade = config.MIN_PASS_GRADE if config.MIN_PASS_GRADE in _GRADE_ORDER else "B"
     if _GRADE_ORDER.index(base_grade) < _GRADE_ORDER.index(min_grade):
         return None, "FAIL_TECH"
-    # 趋势转折硬性条件：堵住「RSI反弹25 + 量价配合25 + 共振10 = 60」的无拐点旁路
-    # （该路径恰在 MA20 陡峭下降的接飞刀场景成立），确保推荐必含趋势转折信号
-    if config.REQUIRE_TREND_TURN and not bool(d_last.get("trend_turn", False)):
-        return None, "FAIL_NO_TREND"
-    # 底背离：通过准入后评级提升一档（与基础分脱钩），仅用于展示/排序，不能绕过准入门槛
-    grade = _lift_grade(base_grade, config.DIVERGENCE_GRADE_LIFT) if has_div and config.DIVERGENCE_GRADE_LIFT > 0 else base_grade
+    grade = base_grade
 
     atr_val = d_last.get("atr")
     atr_val = float(atr_val) if atr_val is not None and not pd.isna(atr_val) else None
@@ -1403,10 +1531,10 @@ def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] 
                 elif reason == "FAIL_DATA": stats["fail_data"] += 1
                 elif reason == "FAIL_LIQUIDITY": stats["fail_liq"] += 1  # 僵尸股淘汰（独立归因）
                 # FAIL_CHASE（追高）/ FAIL_GAP（跳空）/ FAIL_RSI_HIGH（RSI过高）/ FAIL_CLIMAX_VOL（天量）/ FAIL_NOT_BOTTOM（非底部区域）
-                # / FAIL_POSITION（区间位置偏高）/ FAIL_MACD_MOM（动能未改善）/ FAIL_KDJ（KDJ未金叉）/ FAIL_NO_TREND（无趋势转折旁路拦截）
+                # / FAIL_POSITION（区间位置偏高）/ FAIL_MOMENTUM（动能组无确认）/ FAIL_NO_TREND（近期无有效趋势转折）
                 # 均属技术面入场质量层
                 elif reason in ("FAIL_TECH", "FAIL_NO_TREND", "FAIL_CHASE", "FAIL_GAP", "FAIL_RSI_HIGH", "FAIL_CLIMAX_VOL",
-                                "FAIL_NOT_BOTTOM", "FAIL_POSITION", "FAIL_MACD_MOM", "FAIL_KDJ"): stats["fail_tech"] += 1
+                                "FAIL_NOT_BOTTOM", "FAIL_POSITION", "FAIL_MOMENTUM", "FAIL_MACD_MOM", "FAIL_KDJ"): stats["fail_tech"] += 1
                 elif reason == "FAIL_VOLATILE": stats["fail_vol"] += 1  # 波动率上限（替代原 FAIL_RR）
                 elif reason == "ERROR": stats["error"] += 1
                 if processed % config.PROGRESS_LOG_EVERY == 0 or processed == total:
