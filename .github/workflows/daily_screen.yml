@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       no_cache:
-        description: "跳过 cache/ 磁盘缓存，强制拉最新数据"
+        description: "跳过 cache/ 磁盘缓存，强制拉最新数据（定时任务始终不用缓存，此项仅对手动触发有效）"
         type: boolean
         default: false
 
@@ -45,6 +45,16 @@ jobs:
           restore-keys: |
             baostock-cache-
 
+      - name: Show restored cache stats
+        run: |
+          if [ -d cache ]; then
+            echo "cache/ 文件数: $(find cache -type f | wc -l)，总大小: $(du -sh cache | cut -f1)"
+            echo "最近写入的 3 个缓存文件（mtime 决定新鲜度判定）:"
+            find cache -type f -printf '%TY-%Tm-%Td %TH:%TM  %p\n' | sort -r | head -3
+          else
+            echo "cache/ 目录不存在：actions/cache 未恢复（首次运行或缓存已过期淘汰）"
+          fi
+
       - name: Run strategy
         env:
           FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
@@ -58,12 +68,20 @@ jobs:
           TZ: Asia/Shanghai
           # 关闭 stdout 缓冲：否则 Python 输出按块缓冲，任务超时/取消后缓冲的日志全部丢失
           PYTHONUNBUFFERED: "1"
-          NO_CACHE: ${{ inputs.no_cache }}
+          # 定时任务（每日 21:00 正式推荐）强制不用磁盘缓存，保证数据全部当天最新；
+          # 手动触发由 no_cache 勾选项决定。注意：行情类缓存按「当日 mtime」判定，
+          # 即使此处用缓存，日线/周线行情每天也必然重新拉取，缓存只复用股票列表(6天)与基本面(7天)。
+          NO_CACHE: ${{ github.event_name == 'schedule' || inputs.no_cache }}
         run: |
           if [ "$NO_CACHE" = "true" ]; then
-            echo "::notice::手动触发已勾选 no_cache，本次跳过 cache/ 磁盘缓存"
+            if [ "${{ github.event_name }}" = "schedule" ]; then
+              echo "::notice::定时任务（每日 21:00）按约定强制不使用 cache/ 磁盘缓存，全部拉取最新数据"
+            else
+              echo "::notice::手动触发已勾选 no_cache，本次跳过 cache/ 磁盘缓存"
+            fi
             python -u run.py --no-cache
           else
+            echo "::notice::本次使用 cache/ 磁盘缓存（股票列表/基本面在 TTL 内直接复用，行情按当日新鲜度重拉）"
             python -u run.py
           fi
 
