@@ -119,36 +119,49 @@ class StrategyConfig:
     ATR_STOP_MULT: float = 2.0
     USE_ATR_STOP: bool = True
 
-    MIN_AMOUNT: float = 5_000_000.0  # 近 20 日日均成交额下限（元），低于则判定流动性不足（僵尸股）
+    MIN_AMOUNT: float = 30_000_000.0  # 近 20 日日均成交额下限（元）；原 500 万对主板几乎无筛选力，上调至 3000 万过滤低流动性标的
     MIN_DAYS: int = 60
 
     # 防追高否决：当日涨幅超过该值（%）判定为追高——涨停股买不进、大阳线次日易回调，直接否决
-    MAX_ENTRY_PCT_CHG: float = 7.0
+    MAX_ENTRY_PCT_CHG: float = 5.0
     # 防跳空否决：开盘价相对前收跳空高开超过该比例（%），追买风险大，直接否决
-    MAX_GAP_UP_PCT: float = 3.0
+    MAX_GAP_UP_PCT: float = 2.0
     # 下降通道过滤：MA20 近 N 日变化率低于该阈值判定为陡峭下降（接飞刀），当日趋势转折信号不认可
     DAILY_MA20: int = 20
     MA20_TREND_LOOKBACK: int = 5
     MA20_TREND_MIN_SLOPE: float = -0.04
     # RSI 入场上限：RSI14 高于该值说明已反弹一段、不再是底部入场点，直接否决
-    DAILY_RSI_ENTRY_MAX: float = 65.0
+    DAILY_RSI_ENTRY_MAX: float = 60.0
     # 天量否决：量比超过该值疑似主力出货/消息驱动，次日接力风险大，直接否决
-    MAX_VOL_RATIO: float = 5.0
+    MAX_VOL_RATIO: float = 4.0
     # 底部区域过滤：现价距近 N 日最高价回撤不足该比例，不符合抄底定位（可能只是上涨中继回调），直接否决
     DRAWDOWN_LOOKBACK: int = 60
-    MIN_DRAWDOWN_FROM_HIGH: float = 0.10
+    MIN_DRAWDOWN_FROM_HIGH: float = 0.15
+    # 回撤上限：跌幅过深多为基本面恶化/退市风险（价值陷阱），并非健康底部，超过该比例则否决
+    MAX_DRAWDOWN_FROM_HIGH: float = 0.70
+    # 已反弹一段否决：近 N 日累计涨幅超过该值（%），说明底部反弹可能已走完，不再是介入点
+    RECENT_GAIN_LOOKBACK: int = 5
+    MAX_RECENT_GAIN_PCT: float = 12.0
     # 最终推荐数量上限：评分降序截取前 N 只（目标每日推荐 3~5 只）
     MAX_PICKS: int = 5
+    # 行业分散（组合层风控）：同一行业最多推荐的只数，避免 Top5 集中单一板块导致组合同涨同跌
+    USE_INDUSTRY_DEDUP: bool = True
+    MAX_PICKS_PER_INDUSTRY: int = 2
+    INDUSTRY_CACHE_TTL_DAYS: float = 30.0
 
     # ===== 严格确认指标（提高胜率，进一步压缩低质量信号）=====
     # 区间位置过滤：现价在近 N 日价格区间（最低~最高）中的位置超过该比例，判定不够低位，否决
     RANGE_LOOKBACK: int = 20
-    POSITION_IN_RANGE_MAX: float = 0.40
+    POSITION_IN_RANGE_MAX: float = 0.35
     # MACD 动能确认：要求 MACD 柱当日较昨日改善（绿柱缩短或红柱放大）
     REQUIRE_MACD_MOMENTUM: bool = True
+    # MACD 柱需连续改善的天数（1=仅当日较昨日；2=连续两日改善，过滤单日反抽）
+    MACD_MOMENTUM_DAYS: int = 2
     # KDJ 确认：要求 KDJ 处于金叉状态（K>D）且 K 值不高于该上限（避免高位接力）
     REQUIRE_KDJ_GOLDEN: bool = True
-    KDJ_K_MAX: float = 60.0
+    KDJ_K_MAX: float = 55.0
+    # KDJ 动能：要求 K 值较昨日上行（仅 K>D 不够，K 掉头时容易误判为金叉）
+    REQUIRE_KDJ_RISING: bool = True
     # 周线趋势确认：仅对通过全部日线筛选的决赛圈股票拉取周线；
     # WEEKLY_MA_BOTH_REQUIRED=True 时须同时满足「收盘站上周线 MA10（容忍 2%）」和「MA10 在上行」，
     # 设为 False 退回旧行为（两条件满足其一即可）
@@ -192,6 +205,8 @@ class StrategyConfig:
     CACHE_DIR: str = os.path.join(_PROJECT_ROOT, "cache")
     CACHE_TTL_DAYS: float = 6.0
     FUND_CACHE_TTL_DAYS: float = 7.0
+    # 财报季度回溯次数：从「已披露窗口」的最新一季开始向前找，最多尝试几个季度
+    FUND_QUARTER_LOOKBACK: int = 3
     FUND_START_YEAR: str = "2023"
     MAX_RETRY: int = 2
     LIST_MAX_RETRY: int = 4
@@ -484,44 +499,69 @@ def _fetch_index_weekly_bs(symbol: str, weeks: int = 60, config: Optional[Strate
     weekly["date"] = weekly["_dt"].dt.strftime(_DATE_FMT)
     return weekly.drop(columns=["_dt"])
 
+def _quarter_candidates(now: datetime, n: int = 3) -> list[tuple[int, int]]:
+    """按交易所披露截止日推算「已确定公开」的财报季度候选（由新到旧，最多 n 个）。
+
+    披露截止：一季报 4/30、半年报 8/31、三季报 10/31、年报次年 4/30 前披露完毕。
+    原实现按「当前季度」取数（(month - 1) // 3），在 2–4 月与 7 月必然取空，
+    导致基本面防雷层整层静默失效；此处改为按已披露窗口回溯。
+    """
+    m, y = now.month, now.year
+    if m >= 11:   y0, q0 = y, 3          # 三季报窗口
+    elif m >= 9:  y0, q0 = y, 2          # 半年报窗口
+    elif m >= 5:  y0, q0 = y, 1          # 一季报窗口
+    else:         y0, q0 = y - 1, 4      # 1–4 月：依赖上年年报（未出则回溯到三季报）
+    out: list[tuple[int, int]] = []
+    q, yy = q0, y0
+    for _ in range(max(1, n)):
+        out.append((yy, q))
+        q -= 1
+        if q == 0: q, yy = 4, yy - 1
+    return out
+
+
 def _fetch_fundamentals_bs(code: str, config: Optional[StrategyConfig] = None) -> Optional[dict]:
     config = config or StrategyConfig()
     bs_code = _format_bs_code(code)
+    quarters = _quarter_candidates(datetime.now(), n=config.FUND_QUARTER_LOOKBACK)
     path = ""
     if config.USE_CACHE:
-        path = _cache_path(config, f"fund_{bs_code}.json")
+        # 缓存名带起始季度标签：财报窗口滚动后自动失效，避免复用上一季的旧数据
+        path = _cache_path(config, f"fund_{bs_code}_{quarters[0][0]}Q{quarters[0][1]}.json")
         if _cache_fresh(path, config.FUND_CACHE_TTL_DAYS):
             if (cached := _read_cache_json(path)) is not None: return cached
-
-    # 动态计算最近的已披露财报季度
-    now = datetime.now()
-    year, quarter = now.year, (now.month - 1) // 3
-    if quarter == 0: year -= 1; quarter = 4
 
     # 商誉与扣非净利润在 Baostock 中缺失，置为 None
     result: dict[str, Optional[float]] = {"roe": None, "debt_ratio": None, "goodwill_ratio": None, "deducted_profit_ratio": None}
 
-    def fetch_fund():
-        _bs_guard(f"bs_fund({bs_code})")
-        with bs_lock:
-            p_rs = bs.query_profit_data(code=bs_code, year=year, quarter=quarter)
-            b_rs = bs.query_balance_data(code=bs_code, year=year, quarter=quarter)
-        if getattr(p_rs, "error_code", None) == "0" or getattr(b_rs, "error_code", None) == "0":
-            _bs_mark_success()
-            return p_rs, b_rs
-        _bs_mark_failure()
-        raise RuntimeError(f"bs_fund({bs_code}) 查询失败: {getattr(p_rs, 'error_msg', '')} / {getattr(b_rs, 'error_msg', '')}")
+    # 逐季回溯：从已披露窗口的最新一季往前找，取到数据即停
+    for (year, quarter) in quarters:
+        if result["roe"] is not None and result["debt_ratio"] is not None:
+            break
 
-    rs = _fetch_with_retry(fetch_fund, config.MAX_RETRY, f"bs_fund({bs_code})")
-    if rs:
+        def fetch_fund(_y: int = year, _q: int = quarter):
+            _bs_guard(f"bs_fund({bs_code},{_y}Q{_q})")
+            with bs_lock:
+                p_rs = bs.query_profit_data(code=bs_code, year=_y, quarter=_q)
+                b_rs = bs.query_balance_data(code=bs_code, year=_y, quarter=_q)
+            if getattr(p_rs, "error_code", None) == "0" or getattr(b_rs, "error_code", None) == "0":
+                _bs_mark_success()
+                return p_rs, b_rs
+            _bs_mark_failure()
+            raise RuntimeError(f"bs_fund({bs_code}) 查询失败: {getattr(p_rs, 'error_msg', '')} / {getattr(b_rs, 'error_msg', '')}")
+
+        rs = _fetch_with_retry(fetch_fund, config.MAX_RETRY, f"bs_fund({bs_code},{year}Q{quarter})")
+        if not rs:
+            if _bs_state["circuit_open"]:
+                break  # 已熔断，继续回溯只是无效重试，直接放弃让上层降级 AkShare
+            continue
         p_rs, b_rs = rs
-        if p_rs.error_code == '0' and len(p_rs.data) > 0:
+        if p_rs.error_code == '0' and len(p_rs.data) > 0 and result["roe"] is None:
             df = p_rs.get_data()
             if "roeAvg" in df.columns:
                 roe = pd.to_numeric(df["roeAvg"].iloc[0], errors="coerce")
-                if not pd.isna(roe): result["roe"] = roe * 100 # Baostock 返回小数(如0.05)
-
-        if b_rs.error_code == '0' and len(b_rs.data) > 0:
+                if not pd.isna(roe): result["roe"] = roe * 100  # Baostock 返回小数(如0.05)
+        if b_rs.error_code == '0' and len(b_rs.data) > 0 and result["debt_ratio"] is None:
             df = b_rs.get_data()
             # Baostock 资产负债率字段为 liabilityToAsset（小数形式，兼容其他可能的字段名）
             debt_col = next((c for c in ("liabilityToAsset", "liabToAsset", "liabRate") if c in df.columns), None)
@@ -595,6 +635,42 @@ def _apply_pool_filters(df: pd.DataFrame, config: StrategyConfig) -> pd.DataFram
     if config.FILTER_ST: out = out[~out["name"].str.contains("ST", case=False, na=False)]
     if config.EXCLUDE_DELISTING: out = out[~out["name"].str.contains("退", na=False)]
     return out.reset_index(drop=True)
+
+
+def _fetch_industry_bs(config: Optional[StrategyConfig] = None) -> dict[str, str]:
+    """一次性拉取全市场行业分类（6 位代码 -> 行业名），供推荐结果的行业分散使用。
+    失败或无数据时返回空 dict，调用方降级为不做行业去重（不阻断选股流程）。"""
+    config = config or StrategyConfig()
+    path = ""
+    if config.USE_CACHE:
+        path = _cache_path(config, "industry_bs.json")
+        if _cache_fresh(path, config.INDUSTRY_CACHE_TTL_DAYS):
+            if (cached := _read_cache_json(path)) is not None: return cached
+
+    out: dict[str, str] = {}
+
+    def fetch_industry():
+        _bs_guard("bs_industry")
+        with bs_lock:
+            rs = bs.query_stock_industry()
+        if getattr(rs, "error_code", None) == "0":
+            _bs_mark_success()
+            return rs
+        _bs_mark_failure()
+        raise RuntimeError(f"bs_industry 查询失败: {getattr(rs, 'error_msg', '')}")
+
+    rs = _fetch_with_retry(fetch_industry, config.MAX_RETRY, "bs_industry", retry_on_empty=True)
+    if rs is not None:
+        try:
+            for _, row in rs.get_data().iterrows():
+                code = str(row.get("code", "")).split(".")[-1].strip()
+                industry = str(row.get("industry", "") or "").strip()
+                if code and industry: out[code] = industry
+        except Exception as e:
+            logging.debug("行业分类解析失败: %s", e)
+
+    if out and path: _write_cache_json(out, path)
+    return out
 
 
 # ===========================================================================
@@ -852,6 +928,14 @@ def get_stock_list(config: StrategyConfig, cache: Optional[CacheManager] = None)
     if cache and stocks: cache.set(cache_key, stocks)
     return stocks
 
+def get_stock_industry(config: StrategyConfig, cache: Optional[CacheManager] = None) -> dict[str, str]:
+    """6 位代码 -> 行业名（用于推荐结果的行业分散）。
+    仅主源 Baostock 提供；主源不可用时返回空 dict，调用方自动跳过行业去重。"""
+    if cache and (cached := cache.get("industry_map")) is not None: return cached
+    industries = _fetch_industry_bs(config) if _bs_available() else {}
+    if cache is not None: cache.set("industry_map", industries)
+    return industries
+
 
 # ===========================================================================
 # Strategy Logic (Unchanged Layer 1-4)
@@ -1014,17 +1098,24 @@ def _range_position_ok(daily_out: pd.DataFrame, config: StrategyConfig) -> bool:
     return (float(daily_out.iloc[-1]["close"]) - lo) / (hi - lo) <= config.POSITION_IN_RANGE_MAX
 
 def _macd_momentum_ok(daily_out: pd.DataFrame, config: StrategyConfig) -> bool:
-    """MACD 柱当日较昨日改善（绿柱缩短或红柱放大）"""
-    if len(daily_out) < 2: return True
-    h, hp = daily_out.iloc[-1]["macd_histogram"], daily_out.iloc[-2]["macd_histogram"]
-    if pd.isna(h) or pd.isna(hp): return True
-    return float(h) > float(hp)
+    """MACD 柱持续改善：要求连续 MACD_MOMENTUM_DAYS 日柱值递增（绿柱缩短或红柱放大），
+    过滤单日反抽造成的假改善；数据缺失一律放行不误杀"""
+    n = max(1, int(getattr(config, "MACD_MOMENTUM_DAYS", 1)))
+    if len(daily_out) < n + 1: return True
+    hist = daily_out["macd_histogram"].iloc[-(n + 1):].tolist()
+    if any(pd.isna(v) for v in hist): return True
+    hist = [float(v) for v in hist]
+    return all(hist[i] > hist[i - 1] for i in range(1, len(hist)))
 
 def _kdj_ok(daily_out: pd.DataFrame, config: StrategyConfig) -> bool:
-    """KDJ 处于金叉状态（K>D）且 K 值不在高位（≤ KDJ_K_MAX）"""
+    """KDJ 处于金叉状态（K>D）且 K 值不在高位（≤ KDJ_K_MAX）；可选要求 K 值较昨日上行"""
     k, d = daily_out.iloc[-1]["kdj_k"], daily_out.iloc[-1]["kdj_d"]
     if pd.isna(k) or pd.isna(d): return True
-    return float(k) > float(d) and float(k) <= config.KDJ_K_MAX
+    if not (float(k) > float(d) and float(k) <= config.KDJ_K_MAX): return False
+    if getattr(config, "REQUIRE_KDJ_RISING", False) and len(daily_out) >= 2:
+        k_prev = daily_out.iloc[-2]["kdj_k"]
+        if not pd.isna(k_prev) and float(k) <= float(k_prev): return False
+    return True
 
 def check_weekly_trend(weekly_df: Optional[pd.DataFrame], config: StrategyConfig) -> bool:
     """周线趋势确认：收盘价站上周线 MA10（容忍 WEEKLY_TOLERANCE）且 MA10 在上行；
@@ -1075,6 +1166,14 @@ def evaluate(daily_df: Optional[pd.DataFrame], code: str = "", name: str = "", c
             and (float(open_today) / prev_close - 1) * 100 > config.MAX_GAP_UP_PCT):
         return None, "FAIL_GAP"
 
+    # 已反弹一段否决：近 N 日累计涨幅过大，说明底部反弹可能已走完，此时介入性价比低。
+    # 比 RSI 上限更直接——RSI14 被 14 日平滑，夹杂回调的连续上攻可能尚未触发 RSI 阈值
+    n_gain = max(1, int(config.RECENT_GAIN_LOOKBACK))
+    if len(daily_out) > n_gain:
+        base_close = float(daily_out.iloc[-(1 + n_gain)]["close"])
+        if base_close > 0 and (float(d_last["close"]) / base_close - 1) * 100 > config.MAX_RECENT_GAIN_PCT:
+            return None, "FAIL_RECENT_RALLY"
+
     # RSI 入场上限否决：RSI14 过高说明已反弹一段，不再是底部入场点
     rsi_today = d_last.get("rsi14")
     if rsi_today is not None and not pd.isna(rsi_today) and float(rsi_today) > config.DAILY_RSI_ENTRY_MAX:
@@ -1086,8 +1185,12 @@ def evaluate(daily_df: Optional[pd.DataFrame], code: str = "", name: str = "", c
     # 底部区域过滤：距近 N 日高点回撤不足，不符合抄底定位（上涨中继回调不买）
     high_n = float(daily_out["high"].tail(config.DRAWDOWN_LOOKBACK).max())
     last_close = float(d_last["close"])
-    if high_n > 0 and (high_n - last_close) / high_n < config.MIN_DRAWDOWN_FROM_HIGH:
+    drawdown = (high_n - last_close) / high_n if high_n > 0 else 0.0
+    if high_n > 0 and drawdown < config.MIN_DRAWDOWN_FROM_HIGH:
         return None, "FAIL_NOT_BOTTOM"
+    # 回撤上限否决：跌幅过深多为基本面恶化/退市风险（价值陷阱），并非健康底部
+    if high_n > 0 and drawdown > config.MAX_DRAWDOWN_FROM_HIGH:
+        return None, "FAIL_DEEP_CRASH"
 
     # 严格确认指标：低位/动能/KDJ 三重确认，任一不过即否决
     if not _range_position_ok(daily_out, config): return None, "FAIL_POSITION"
@@ -1129,6 +1232,23 @@ def get_market_environment(config: StrategyConfig, cache: CacheManager) -> dict:
     result = compute_market_environment(df_index, config) if df_index is not None and not df_index.empty else {"regime": "unknown", "description": "数据获取失败", "ma20": 0, "slope": 0, "close": 0}
     cache.set("market_env", result)
     return result
+
+def _dedup_by_industry(df: pd.DataFrame, config: StrategyConfig, cache: Optional[CacheManager] = None) -> pd.DataFrame:
+    """行业分散：同一行业最多保留 MAX_PICKS_PER_INDUSTRY 只，保持传入顺序（评分降序）。
+    行业数据缺失时原样返回，不做处理。"""
+    industry_map = get_stock_industry(config, cache)
+    if not industry_map or df.empty: return df
+    kept, used = [], {}
+    for _, row in df.iterrows():
+        industry = industry_map.get(str(row["code"]), "") or ""
+        if industry and used.get(industry, 0) >= config.MAX_PICKS_PER_INDUSTRY:
+            continue
+        if industry: used[industry] = used.get(industry, 0) + 1
+        kept.append(row)
+    dropped = len(df) - len(kept)
+    if dropped:
+        print(f"[INFO] 行业分散：淘汰 {dropped} 只（同一行业最多 {config.MAX_PICKS_PER_INDUSTRY} 只）")
+    return pd.DataFrame(kept).reset_index(drop=True) if kept else df.iloc[0:0]
 
 # ===========================================================================
 # 编排函数
@@ -1190,7 +1310,8 @@ def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] 
                 # FAIL_CHASE（追高）/ FAIL_GAP（跳空）/ FAIL_RSI_HIGH（RSI过高）/ FAIL_CLIMAX_VOL（天量）/ FAIL_NOT_BOTTOM（非底部区域）
                 # / FAIL_POSITION（区间位置偏高）/ FAIL_MACD_MOM（动能未改善）/ FAIL_KDJ（KDJ未金叉）均属技术面入场质量层
                 elif reason in ("FAIL_TECH", "FAIL_CHASE", "FAIL_GAP", "FAIL_RSI_HIGH", "FAIL_CLIMAX_VOL",
-                                "FAIL_NOT_BOTTOM", "FAIL_POSITION", "FAIL_MACD_MOM", "FAIL_KDJ"): stats["fail_tech"] += 1
+                                "FAIL_NOT_BOTTOM", "FAIL_DEEP_CRASH", "FAIL_RECENT_RALLY",
+                                "FAIL_POSITION", "FAIL_MACD_MOM", "FAIL_KDJ"): stats["fail_tech"] += 1
                 elif reason == "FAIL_RR": stats["fail_rr"] += 1
                 elif reason == "ERROR": stats["error"] += 1
 
@@ -1213,28 +1334,46 @@ def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] 
             print("[INFO] 未发现符合条件的信号")
             return None
 
-        df = pd.DataFrame(signals).sort_values(SORT_BY, ascending=SORT_ASC).reset_index(drop=True)
+        # 排序：评分降序为主键；同分时依次用 底背离 > 盈亏比 打破并列，
+        # 避免同分股票之间的先后纯靠偶然顺序决定（原先仅按 score 排序）
+        df = pd.DataFrame(signals).sort_values(
+            SORT_BY + ["has_divergence", "rr_ratio"],
+            ascending=SORT_ASC + [False, False],
+        ).reset_index(drop=True)
 
-        # 决赛圈周线确认：按评分降序逐个拉周线确认，取满 MAX_PICKS 即止（只对决赛圈拉取，成本可控）
+        # 决赛圈周线确认 + 行业分散：按评分降序逐个拉周线确认，取满 MAX_PICKS 即止（只对决赛圈拉取，成本可控）；
+        # 周线不过或所属行业额度已满则跳过并继续向后面候补，保证最终名单仍然取满
         if config.REQUIRE_WEEKLY_TREND and not df.empty:
+            industry_map = get_stock_industry(config, cache) if config.USE_INDUSTRY_DEDUP else {}
             confirmed = []
-            weekly_checked = 0
+            industry_used: dict[str, int] = {}
+            weekly_checked = weekly_dropped = industry_dropped = 0
             for _, row in df.iterrows():
                 if len(confirmed) >= config.MAX_PICKS: break
-                weekly_checked += 1
                 wk = _fetch_weekly_dual(row["code"], config)
+                time.sleep(config.FETCH_DELAY)
+                weekly_checked += 1
                 weekly_ok = check_weekly_trend(wk, config)
                 if weekly_ok and config.REQUIRE_WEEKLY_MACD_STABLE:
                     weekly_ok = check_weekly_macd(wk, config)
-                if weekly_ok:
-                    confirmed.append(row)
-                time.sleep(config.FETCH_DELAY)
-            weekly_dropped = weekly_checked - len(confirmed)
+                if not weekly_ok:
+                    weekly_dropped += 1
+                    continue
+                industry = industry_map.get(str(row["code"]), "") or ""
+                if industry and industry_used.get(industry, 0) >= config.MAX_PICKS_PER_INDUSTRY:
+                    industry_dropped += 1
+                    continue
+                if industry: industry_used[industry] = industry_used.get(industry, 0) + 1
+                confirmed.append(row)
             if weekly_dropped > 0:
                 conds = [f"周线MA{config.WEEKLY_MA_PERIOD}" + ("站上且上行" if config.WEEKLY_MA_BOTH_REQUIRED else "站上或上行")]
                 if config.REQUIRE_WEEKLY_MACD_STABLE: conds.append("周线MACD企稳")
                 print(f"[INFO] 周线确认：检查 {weekly_checked} 只，淘汰 {weekly_dropped} 只（未满足 {' + '.join(conds)}）")
+            if industry_dropped > 0:
+                print(f"[INFO] 行业分散：淘汰 {industry_dropped} 只（同一行业最多 {config.MAX_PICKS_PER_INDUSTRY} 只）")
             df = pd.DataFrame(confirmed).reset_index(drop=True) if confirmed else df.iloc[0:0]
+        elif config.USE_INDUSTRY_DEDUP and not df.empty:
+            df = _dedup_by_industry(df, config, cache)
 
         # 推荐数量上限：评分降序截取前 MAX_PICKS 只（目标每日 3~5 只精推，其余评分靠后的不推荐）
         if len(df) > config.MAX_PICKS:
