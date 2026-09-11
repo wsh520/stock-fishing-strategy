@@ -17,3 +17,7 @@ pandas>=2.0.0,<4.0.0
 
 # Feishu Webhook notification
 requests>=2.32.4,<3.0.0
+
+# MySQL persistence (recommendations + weekly tracking). Optional at runtime:
+# code skips DB writes gracefully if MYSQL_* env vars are not set.
+PyMySQL>=1.1.1,<2.0.0

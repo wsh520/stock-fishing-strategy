@@ -1,0 +1,65 @@
+name: Weekly Recommendation Tracking
+
+on:
+  schedule:
+    # UTC 13:20 = 北京时间 21:20（周五每日选股 21:00 起跑后 20 分钟，
+    # 确保当日新推荐已落库 MySQL，再由本工作流决定首期追踪）
+    - cron: "20 13 * * 5"
+  workflow_dispatch:
+    inputs:
+      no_cache:
+        description: "跳过 cache/ 磁盘缓存，强制拉最新行情"
+        type: boolean
+        default: false
+
+jobs:
+  track:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # 复用磁盘缓存：周五选股已拉过当日行情，追踪直接命中缓存，几乎零请求
+      - name: Resolve cache date
+        id: cachedate
+        run: echo "ymd=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache baostock data
+        uses: actions/cache@v4
+        with:
+          path: cache
+          key: baostock-cache-${{ steps.cachedate.outputs.ymd }}
+          restore-keys: |
+            baostock-cache-
+
+      - name: Run weekly tracking
+        env:
+          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+          MYSQL_HOST: ${{ secrets.MYSQL_HOST }}
+          MYSQL_PORT: ${{ secrets.MYSQL_PORT }}
+          MYSQL_USER: ${{ secrets.MYSQL_USER }}
+          MYSQL_PASSWORD: ${{ secrets.MYSQL_PASSWORD }}
+          MYSQL_DATABASE: ${{ secrets.MYSQL_DATABASE }}
+          # query_all_stock 与缓存「当天」判断依赖本地日期，固定北京时间
+          TZ: Asia/Shanghai
+          # 关闭 stdout 缓冲：否则 Python 输出按块缓冲，任务超时/取消后缓冲的日志全部丢失
+          PYTHONUNBUFFERED: "1"
+          NO_CACHE: ${{ inputs.no_cache }}
+        run: |
+          if [ "$NO_CACHE" = "true" ]; then
+            echo "::notice::手动触发已勾选 no_cache，本次跳过 cache/ 磁盘缓存"
+            python -u run_weekly_tracking.py --no-cache
+          else
+            python -u run_weekly_tracking.py
+          fi
