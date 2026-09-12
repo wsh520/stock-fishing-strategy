@@ -1,7 +1,7 @@
 """
 飞书 Webhook 通知模块
 
-通过飞书自定义机器人 Webhook 发送选股结果、追踪报告、信号归因月报、月度绩效。
+通过飞书自定义机器人 Webhook 发送选股结果、周度追踪报告、信号归因月报。
 环境变量 FEISHU_WEBHOOK_URL 未配置时静默跳过。
 """
 
@@ -253,49 +253,3 @@ def notify_attribution_report(stats: Optional[dict]) -> None:
     }
     _send_feishu(card)
 
-
-def notify_monthly_performance(stats: Optional[dict]) -> None:
-    """发送月度绩效报告。
-
-    参数匹配 run.py 中的调用:
-        notify_monthly_performance(monthly_stats)
-
-    stats 格式:
-        {"total_signals": int, "win_rate": float, "avg_return": float,
-         "max_return": float, "min_return": float, "period": str, ...}
-    """
-    if not stats or stats.get("total_signals", 0) == 0:
-        return
-
-    now = datetime.now().strftime("%Y-%m-%d %H:%M")
-    total = stats.get("total_signals", 0)
-    win_rate = stats.get("win_rate", 0)
-    avg_return = stats.get("avg_return", 0)
-    max_return = stats.get("max_return", 0)
-    min_return = stats.get("min_return", 0)
-
-    elements = [
-        _md_element(
-            f"**时间:** {now}\n"
-            f"**统计周期:** 近30天\n"
-            f"**推荐总数:** {total} 只\n"
-            f"**胜率:** {win_rate:.1f}%\n"
-            f"**平均收益:** {avg_return:.2f}%\n"
-            f"**最大收益:** {max_return:.2f}%\n"
-            f"**最大亏损:** {min_return:.2f}%"
-        ),
-    ]
-
-    # 等级分布
-    grade_dist = stats.get("grade_distribution")
-    if grade_dist:
-        grade_text = " | ".join([f"{k}级: {v}只" for k, v in grade_dist.items()])
-        elements.append(_divider())
-        elements.append(_md_element(f"**等级分布:** {grade_text}"))
-
-    color = "green" if win_rate >= 50 else "red"
-    card = {
-        "header": _build_header(f"月度绩效 - 胜率{win_rate:.0f}%", color=color),
-        "elements": elements,
-    }
-    _send_feishu(card)

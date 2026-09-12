@@ -1066,6 +1066,38 @@ def compute_risk_reward(entry_price: float, config: StrategyConfig, atr: Optiona
     rr_ratio = reward / risk if risk > 0 else 0.0
     return {"stop_loss": round(stop_loss, 2), "take_profit": round(take_profit, 2), "rr_ratio": round(rr_ratio, 2), "passes": rr_ratio >= config.MIN_RR_RATIO}
 
+def _fmt_cell(v: Any, default: str = "-") -> Any:
+    """展示用取值：None/NaN 统一回退默认值，避免卡片出现 None 或 nan。"""
+    if v is None:
+        return default
+    try:
+        if pd.isna(v):
+            return default
+    except (TypeError, ValueError):
+        pass
+    return v
+
+
+def describe(row: dict) -> str:
+    """把一条推荐格式化为飞书卡片文本（notify/feishu.py 调用）。
+
+    只使用 Signal 实际携带的字段：历史实现引用了并不存在的 avg_amount 字段，
+    导致卡片尾部恒定展示「日均额: -万」。
+    """
+    div_tag = " | 底背离" if row.get("has_divergence") else ""
+    return (
+        f"**{row.get('name', '')} {row.get('code', '')}**\n"
+        f"评分: {_fmt_cell(row.get('score'))} ({row.get('grade') or '-'})"
+        f" | 收盘: {_fmt_cell(row.get('close'))}"
+        f" | 止损: {_fmt_cell(row.get('stop_loss'))}"
+        f" | 止盈: {_fmt_cell(row.get('take_profit'))}"
+        f" | RR: {_fmt_cell(row.get('rr_ratio'))}\n"
+        f"RSI14: {_fmt_cell(row.get('rsi'))}"
+        f" | 量比: {_fmt_cell(row.get('vol_ratio'))}"
+        f" | 市场: {row.get('market_env') or '-'}{div_tag}"
+    )
+
+
 @dataclass
 class Signal:
     code: str; name: str; date: str; close: float; score: float; grade: str

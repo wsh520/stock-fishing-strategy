@@ -27,7 +27,7 @@ Thumbs.db
 data_cache/
 cache/
 
-# 保留 data 目录（其中的 csv 产物需要作为 artifact 上传）
+# data/ 为 CI artifact 预留目录（当前策略不写入文件，见 README「运行方式」）
 !data/
 
 .cleanup_backup
