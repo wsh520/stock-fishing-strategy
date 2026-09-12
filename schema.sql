@@ -14,6 +14,9 @@
 
 -- ----------------------------------------------------------------------------
 -- 推荐记录表：每次选股输出的个股明细，(rec_date, code) 唯一防重复写入
+-- 注：程序首次连接会自动建表（store/mysql_store.py 内置同款 DDL），并对存量表
+--     自动 ALTER 补齐 signals_hit 等新列（幂等迁移），本文件为手动建库参考。
+--     只有 rec_tier='formal' 的正式推荐会落库（待核验候选不落库、不参与追踪）。
 -- ----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS stock_recommendation (
     id               BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '主键',
@@ -21,8 +24,8 @@ CREATE TABLE IF NOT EXISTS stock_recommendation (
     code             VARCHAR(8)      NOT NULL COMMENT '股票代码（6位数字）',
     name             VARCHAR(32)     NOT NULL COMMENT '股票名称',
     rec_close        DECIMAL(10, 3)  NOT NULL COMMENT '推荐时收盘价（元）',
-    score            DECIMAL(5, 1)   NULL COMMENT '综合评分（含熊市加码）',
-    grade            VARCHAR(2)      NULL COMMENT '信号等级 A/B（底背离可升档）',
+    score            DECIMAL(5, 1)   NULL COMMENT '技术评分（与等级同源定级）',
+    grade            VARCHAR(2)      NULL COMMENT '信号等级 A/B/C/D（原始技术分定级，无升档）',
     daily_score      DECIMAL(5, 1)   NULL COMMENT '日线基础评分',
     rsi              DECIMAL(5, 1)   NULL COMMENT 'RSI14',
     rsi7             DECIMAL(5, 1)   NULL COMMENT 'RSI7',
@@ -33,7 +36,12 @@ CREATE TABLE IF NOT EXISTS stock_recommendation (
     take_profit      DECIMAL(10, 3)  NULL COMMENT '止盈价（固定10%）',
     rr_ratio         DECIMAL(6, 2)   NULL COMMENT '风险收益比',
     market_env       VARCHAR(16)     NULL COMMENT '市场环境 bull/bear/neutral/unknown',
-    has_divergence   TINYINT(1)      NOT NULL DEFAULT 0 COMMENT '是否底背离 1/0',
+    has_divergence   TINYINT(1)      NOT NULL DEFAULT 0 COMMENT '是否底背离（双低点算法）1/0',
+    signals_hit      VARCHAR(255)    NULL COMMENT '入选依据（实际触发的技术条件，逗号分隔）',
+    fund_status      VARCHAR(16)     NULL COMMENT '财务核验 verified/partial/missing',
+    weekly_status    VARCHAR(16)     NULL COMMENT '周线核验 confirmed/unverified/disabled',
+    rec_tier         VARCHAR(8)      NULL COMMENT '推荐层级 formal/pending',
+    missing_tags     VARCHAR(255)    NULL COMMENT '缺失项标签（逗号分隔）',
     created_at       DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '写入时间',
     PRIMARY KEY (id),
     UNIQUE KEY uk_rec_date_code (rec_date, code),

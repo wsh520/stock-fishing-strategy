@@ -15,6 +15,8 @@ import os
 import time
 import traceback
 
+import pandas as pd
+
 # 将 src 目录加入 Python 路径
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
 
@@ -91,15 +93,19 @@ def run(argv: list[str] | None = None):
         logger.info("Step 1/4 完成 (%.1f 秒): %s", time.time() - t, market_env_desc)
 
         # Step 2: 运行选股策略（传入 config/cache 复用市场环境缓存）
+        # pending_rows 收集「待核验候选」（财务/周线数据缺失），只用于通知展示，不落库、不参与追踪
         t = time.time()
         logger.info("Step 2/4 执行选股策略（明细见 strategy 日志）...")
-        output_df = main(config=config, cache=cache)
+        pending_rows: list[dict] = []
+        output_df = main(config=config, cache=cache, pending_out=pending_rows)
         n_picks = 0 if output_df is None else len(output_df)
-        logger.info("Step 2/4 完成 (%.1f 分钟)，推荐 %d 只", (time.time() - t) / 60, n_picks)
+        logger.info("Step 2/4 完成 (%.1f 分钟)，正式推荐 %d 只，待核验候选 %d 只",
+                    (time.time() - t) / 60, n_picks, len(pending_rows))
         if output_df is not None and not output_df.empty:
             for _, r in output_df.iterrows():
-                logger.info("  推荐: %s(%s) 评分 %s %s级 收盘 %s",
-                            r.get("name"), r.get("code"), r.get("score"), r.get("grade"), r.get("close"))
+                logger.info("  推荐: %s(%s) 评分 %s %s级 收盘 %s | 入选 %s | 核验 财务=%s 周线=%s",
+                            r.get("name"), r.get("code"), r.get("score"), r.get("grade"), r.get("close"),
+                            r.get("signals_hit") or "-", r.get("fund_status") or "-", r.get("weekly_status") or "-")
 
         # Step 3: 推荐结果落库 MySQL（未配置环境变量时静默跳过，不影响主流程）
         t = time.time()
@@ -110,7 +116,8 @@ def run(argv: list[str] | None = None):
         # Step 4: 发送选股结果通知
         t = time.time()
         logger.info("Step 4/4 发送飞书通知...")
-        notify_screening_result(output_df, market_env=market_env_desc)
+        pending_df = pd.DataFrame(pending_rows) if pending_rows else None
+        notify_screening_result(output_df, market_env=market_env_desc, pending=pending_df)
         logger.info("Step 4/4 完成 (%.1f 秒)", time.time() - t)
 
         logger.info("任务全部完成，总耗时 %.1f 分钟", (time.time() - t_start) / 60)

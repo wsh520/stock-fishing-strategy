@@ -2,10 +2,15 @@
 精简版日线选股策略（Baostock 主数据源 + AkShare 备用数据源 + 底背离 + 漏斗日志版）
 
 仅使用日线数据进行选股，简化策略逻辑：
-1. 市场环境过滤（沪深300日线MA20斜率）
-2. 基本面防雷（ROE/负债率否决；Baostock 无商誉/扣非数据，切 AkShare 时自动补齐）
-3. 日线技术指标筛选（底背离 + MA5拐头 + EMA金叉 + RSI超卖反弹 + 量价配合）
-4. 风险收益比过滤（固定止损止盈）
+1. 市场环境过滤（沪深300日线MA20斜率；数据不足时明示「未知」，不隐含为正常）
+2. 基本面防雷（ROE/负债率核心否决；商誉/扣非为可选否决，主源不提供时决赛圈用 AkShare 按字段补齐）
+3. 日线技术指标筛选（底背离 + MA5拐头 + EMA金叉 + RSI超卖反弹 + 量价质量分）
+4. 风险收益比过滤（固定止损止盈）+ 决赛圈周线确认 + 行业分散
+
+荐股质量分层（数据缺失不等于筛选通过）：
+- 正式推荐（formal）：财务核心项已核验、启用的周线确认已确认、行情日期与市场最新交易日一致
+- 待核验候选（pending）：技术面通过但财务或周线数据缺失，不与正式推荐混排
+- 暂不推荐：行情日期滞后（停牌/数据过期）或关键否决项未通过
 
 数据层：Baostock 为主、AkShare 为备的双数据源架构。
 - Baostock 连接管理：登录真实重试（检查 error_code）、查询失败自动重连、线程安全锁
@@ -60,7 +65,9 @@ bs_lock = threading.Lock()
 
 DISPLAY_COLS = [
     ("code", "代码"), ("name", "名称"), ("date", "日期"), ("close", "收盘"),
-    ("score", "评分"), ("grade", "等级"), ("daily_score", "日线分"),
+    ("score", "评分"), ("grade", "等级"), ("tier", "层级"),
+    ("signals_hit", "入选依据"), ("fund_status", "财务核验"),
+    ("weekly_status", "周线核验"), ("missing_tags", "缺项"), ("daily_score", "日线分"),
     ("rsi", "RSI"), ("rsi7", "RSI7"), ("rsi21", "RSI21"),
     ("vol_ratio", "量比"), ("turnover_ratio", "换手比"), ("stop_loss", "止损"),
     ("take_profit", "止盈"), ("rr_ratio", "收益比"), ("market_env", "市场"),
@@ -111,6 +118,11 @@ class StrategyConfig:
     DAILY_VOL_EXPAND: float = 1.2
     DAILY_TURNOVER_LOOKBACK: int = 20
     DIVERGENCE_LOOKBACK: int = 20
+    # 底背离双低点参数：前一个价格低点与当前低点至少间隔该根数（保证是两个独立低点，
+    # 而非同一段下跌中的连续新低）；指标比较锚定在前一个「价格低点」当根的指标值上
+    DIVERGENCE_MIN_SEPARATION: int = 5
+    # DIF 背离最低幅度（价格单位；0=严格更高即可），RSI 背离沿用 DAILY_RSI_DIVERGENCE_THRESHOLD
+    DAILY_MACD_DIVERGENCE_THRESHOLD: float = 0.0
 
     FIXED_STOP_LOSS_PCT: float = 5.0
     FIXED_TAKE_PROFIT_PCT: float = 10.0
@@ -121,6 +133,9 @@ class StrategyConfig:
 
     MIN_AMOUNT: float = 30_000_000.0  # 近 20 日日均成交额下限（元）；原 500 万对主板几乎无筛选力，上调至 3000 万过滤低流动性标的
     MIN_DAYS: int = 60
+    # 数据时效：个股最新K线日期须与市场（沪深300）最新交易日一致，
+    # 否则视为停牌/数据滞后，暂不推荐（宁可少荐，不让过期数据混入名单）
+    REQUIRE_FRESH_DAILY: bool = True
 
     # 防追高否决：当日涨幅超过该值（%）判定为追高——涨停股买不进、大阳线次日易回调，直接否决
     MAX_ENTRY_PCT_CHG: float = 5.0
@@ -180,18 +195,26 @@ class StrategyConfig:
     # 趋势转折（MA5拐头 或 EMA金叉，同源信号合并计分，避免右侧拐点同日触发导致分数通胀）
     W_DAILY_TREND_TURN: float = 40.0
     W_DAILY_RSI_REBOUND: float = 25.0
-    W_DAILY_VOL_PRICE: float = 25.0
+    # 量价质量分：基础条件（上涨+适度放量）之上按 收盘位置/实体方向/上影线占比 分三档，
+    # 冲高回落只降分不否决（满分档须为阳线、收盘位于日内区间上部、上影线占比小）
+    W_DAILY_VOL_PRICE: float = 25.0        # 满分档：放量企稳（阳线收高位、短上影）
+    W_DAILY_VOL_PRICE_MID: float = 18.0    # 中档：一般放量上涨
+    W_DAILY_VOL_PRICE_WEAK: float = 10.0   # 降档：放量冲高回落（收盘位于日内区间下部）
+    VOLP_CLOSE_POS_FULL: float = 0.6       # 收盘位置高于该值视为收高位（(close-low)/(high-low)）
+    VOLP_CLOSE_POS_MIN: float = 0.35       # 收盘位置低于该值判定冲高回落
+    VOLP_MAX_UPPER_SHADOW: float = 0.35    # 满分档允许的上影线占日内区间比例上限
     DAILY_MULTI_RESONANCE_BONUS: float = 10.0
     DAILY_RSI_OVERBOUGHT_PENALTY: float = 3.0
-    # 底背离不再直接加分，改为评级提升档数（与基础分脱钩，避免底背离股必然 A 级）
-    DIVERGENCE_GRADE_LIFT: int = 1
+    # 底背离不参与评级升降（评级统一：等级=原始技术分定级），仅作形态标签与同分排序优先项
 
     GRADE_A: float = 80.0
     GRADE_B: float = 60.0
     GRADE_C: float = 40.0
+    # 熊市环境下准入门槛上浮的分数（直接抬高分数线，展示分数与等级始终同源）
     BEAR_GRADE_BOOST: float = 10.0
-    # 准入等级门槛：基础评级（按分数，不含底背离提升）须不低于该等级，默认 B（≥60 分）。
+    # 准入等级门槛：技术评分须不低于该等级对应分数（默认 B=60 分）。
     # C 级仅为单一趋势转折信号（40 分），噪音过大不再推荐；设为 "C" 可恢复旧行为。
+    # 熊市环境门槛上浮 BEAR_GRADE_BOOST 分；未知/非熊市按原门槛。
     MIN_PASS_GRADE: str = "B"
 
     CACHE_EXPIRE_HOURS: float = 4.0
@@ -943,7 +966,7 @@ def get_stock_industry(config: StrategyConfig, cache: Optional[CacheManager] = N
 
 def compute_market_environment(df_index: pd.DataFrame, config: StrategyConfig) -> dict:
     if df_index is None or df_index.empty or len(df_index) < config.MARKET_MA_PERIOD + config.MARKET_SLOPE_LOOKBACK:
-        return {"regime": "unknown", "description": "数据不足", "ma20": 0, "slope": 0, "close": 0}
+        return {"regime": "unknown", "description": "未知（沪深300数据不足）", "ma20": 0, "slope": 0, "close": 0}
     df = df_index.copy().reset_index(drop=True)
     df["ma"] = df["close"].rolling(config.MARKET_MA_PERIOD).mean()
     cur, prev = df.iloc[-1], df.iloc[-(1 + config.MARKET_SLOPE_LOOKBACK)]
@@ -965,12 +988,119 @@ def check_fundamentals(fund_data: Optional[dict], config: StrategyConfig, code: 
     # 金融业负债率天然 80%+（如银行约 90%），使用放宽阈值避免全行业误杀；极端值仍否决
     debt_limit = config.FINANCE_MAX_DEBT_RATIO if _is_financial_stock(code, name, config) else config.MAX_DEBT_RATIO
     if (debt := fund_data.get("debt_ratio")) is not None and debt > debt_limit: return False
-    # Baostock 缺失时为 None，自动放行，逻辑保持不变
+    # 商誉/扣非为主源不提供的可选否决项：Baostock 缺失时为 None 自动放行，
+    # 决赛圈会用 AkShare 按字段补齐后复核（见 _fill_optional_fundamentals）
     if (goodwill := fund_data.get("goodwill_ratio")) is not None and goodwill > config.MAX_GOODWILL_RATIO: return False
     if (deducted := fund_data.get("deducted_profit_ratio")) is not None and deducted < config.MIN_DEDUCTED_PROFIT_RATIO: return False
     return True
 
+def _fund_verify_state(fund_data: Optional[dict]) -> tuple[str, list[str]]:
+    """财务核验状态分层：
+    - verified：核心项（ROE+负债率）齐备，基本面防雷实际生效
+    - partial ：核心项缺其一，防雷只部分生效 → 待核验候选
+    - missing ：无财务数据，防雷整层未生效 → 待核验候选
+    商誉/扣非为可选补充指标，缺失只记标签、不降级（决赛圈 AkShare 按字段补齐）。"""
+    if fund_data is None:
+        return "missing", ["fund"]
+    tags: list[str] = []
+    core_ok = True
+    if fund_data.get("roe") is None: core_ok = False; tags.append("fund_roe")
+    if fund_data.get("debt_ratio") is None: core_ok = False; tags.append("fund_debt")
+    if fund_data.get("goodwill_ratio") is None: tags.append("fund_goodwill")
+    if fund_data.get("deducted_profit_ratio") is None: tags.append("fund_deducted")
+    return ("verified" if core_ok else "partial"), tags
+
+def _fill_optional_fundamentals(code: str, fund_data: dict, config: StrategyConfig) -> dict:
+    """按字段补齐财务数据（仅决赛圈调用，控制 AkShare 成本）：
+    主源 Baostock 只提供 ROE/负债率，商誉/扣非（及主源缺失的核心项）用 AkShare 补齐，
+    只填 None 字段、不覆盖主源已有值——补齐后「四项基本面防雷」才算完整执行。"""
+    if not _AK_AVAILABLE:
+        return fund_data
+    ak_data = _fetch_fundamentals_ak(code, config)
+    if ak_data:
+        for key in ("roe", "debt_ratio", "goodwill_ratio", "deducted_profit_ratio"):
+            if fund_data.get(key) is None and ak_data.get(key) is not None:
+                fund_data[key] = ak_data[key]
+    return fund_data
+
 _DAILY_NEED_COLS = {"close", "volume", "amount", "date", "high", "low", "pct_chg"}
+
+def _divergence_confirmed(out: pd.DataFrame, config: StrategyConfig) -> pd.Series:
+    """双低点底背离（修正版：指标比较锚定在「前一个价格低点」当根的指标值上，
+    而非指标自身的窗口最小值——指标最低点未必出现在价格低点，旧口径会误报背离）。
+
+    对每根 bar t 的判定：
+    1. t 收盘创近 DIVERGENCE_LOOKBACK 根新低（价格低点降低的当根体现）；
+    2. 在窗口 [t-L, t-sep-1] 内找收盘价最低的 bar 作为前一个价格低点（与 t 至少
+       间隔 DIVERGENCE_MIN_SEPARATION 根，保证是两个独立低点而非同段下跌的连续新低）；
+    3. 价格更低 + RSI（超 DAILY_RSI_DIVERGENCE_THRESHOLD）或 DIF（超
+       DAILY_MACD_DIVERGENCE_THRESHOLD）在前低点处显著更低 → 背离成立；
+       任一侧指标缺失（NaN）不认定（标签宁缺毋滥）；
+    4. 背离须出现在近 3 根内，且当根出现右侧企稳确认（MACD金叉/RSI超卖反弹/MA5拐头），
+       才输出「已确认底背离」。
+    """
+    L = int(config.DIVERGENCE_LOOKBACK)
+    sep = max(1, int(config.DIVERGENCE_MIN_SEPARATION))
+    if L <= sep:
+        return pd.Series(False, index=out.index)
+    close = out["close"].to_numpy(dtype=float)
+    rsi = out["rsi14"].to_numpy(dtype=float)
+    macd = out["macd_diff"].to_numpy(dtype=float)
+    n = len(out)
+    state = np.zeros(n, dtype=bool)
+    for t in range(L, n):
+        c = close[t]
+        if np.isnan(c):
+            continue
+        window = close[t - L:t]                     # t 之前的 L 根（不含 t）
+        if np.isnan(window).all():
+            continue
+        if c >= np.nanmin(window):                  # 未创窗口新低：不是新低点
+            continue
+        seg = close[t - L:t - sep]                   # 排除近 sep 根，保证两个低点有间隔
+        if seg.size == 0 or np.isnan(seg).all():
+            continue
+        prev = t - L + int(np.nanargmin(seg))       # 前一个价格低点位置
+        pv = close[prev]
+        if np.isnan(pv) or c >= pv:
+            continue
+        rsi_div = (not np.isnan(rsi[t])) and (not np.isnan(rsi[prev])) and (
+            rsi[t] > rsi[prev] + config.DAILY_RSI_DIVERGENCE_THRESHOLD)
+        macd_div = (not np.isnan(macd[t])) and (not np.isnan(macd[prev])) and (
+            macd[t] > macd[prev] + config.DAILY_MACD_DIVERGENCE_THRESHOLD)
+        state[t] = rsi_div or macd_div
+    recent_div = pd.Series(state, index=out.index).astype(float).rolling(3).max() > 0
+    right_confirm = out["macd_golden_cross"] | out["rsi_rebound"] | out["ma5_turn"]
+    return recent_div & right_confirm
+
+def _vol_price_quality(out: pd.DataFrame, config: StrategyConfig) -> tuple[pd.Series, pd.Series]:
+    """量价质量分：在「上涨 + 适度放量」基础条件之上，按 收盘位置/实体方向/上影线占比 分档。
+
+    - 满分 W_DAILY_VOL_PRICE（放量企稳）：阳线、收盘位置 ≥ VOLP_CLOSE_POS_FULL、上影线 ≤ VOLP_MAX_UPPER_SHADOW
+    - 中档 W_DAILY_VOL_PRICE_MID（放量上涨）：基础条件满足、收盘位置一般
+    - 降档 W_DAILY_VOL_PRICE_WEAK（放量冲高回落）：收盘位置 < VOLP_CLOSE_POS_MIN，承接弱，
+      只降分不否决——高开冲高回落的长上影线与放量阳线收高位不应同分
+
+    返回 (质量分, 标签)。一字板（high==low）收盘位置无法定义，按中档处理。
+    """
+    rng = (out["high"] - out["low"]).replace(0, np.nan)
+    close_pos = ((out["close"] - out["low"]) / rng).clip(0, 1)
+    upper_shadow = (out["high"] - out[["open", "close"]].max(axis=1)) / rng
+    is_bull = out["close"] >= out["open"]
+    strong = (close_pos >= config.VOLP_CLOSE_POS_FULL) & is_bull & (upper_shadow <= config.VOLP_MAX_UPPER_SHADOW)
+    weak = close_pos < config.VOLP_CLOSE_POS_MIN
+    coord = out["vol_price_coord"]
+    quality = pd.Series(
+        np.where(~coord, 0.0,
+                 np.where(strong, config.W_DAILY_VOL_PRICE,
+                          np.where(weak, config.W_DAILY_VOL_PRICE_WEAK, config.W_DAILY_VOL_PRICE_MID))),
+        index=out.index,
+    )
+    label = pd.Series(
+        np.select([~coord, strong, weak], ["", "放量企稳", "放量冲高回落"], default="放量上涨"),
+        index=out.index,
+    )
+    return quality.fillna(0.0), label
 
 def compute_daily_signals(df: pd.DataFrame, config: StrategyConfig) -> Optional[pd.DataFrame]:
     if df is None or df.empty or not _DAILY_NEED_COLS.issubset(df.columns) or len(df) < config.MIN_DAYS: return None
@@ -1033,25 +1163,18 @@ def compute_daily_signals(df: pd.DataFrame, config: StrategyConfig) -> Optional[
     out["rsi_rebound"] = rsi_was_oversold & (out["rsi14"] >= config.DAILY_RSI_REBOUND_MIN)
     out["rsi_multi_res"] = (out["rsi7"] > out["rsi14"]) & (out["rsi14"] > out["rsi21"]) & (out["rsi7"] < config.DAILY_RSI_OVERBOUGHT) & (out["rsi21"] > config.DAILY_RSI_OVERSOLD)
 
-    past_min_close = out["close"].shift(1).rolling(config.DIVERGENCE_LOOKBACK).min()
-    past_min_rsi = out["rsi14"].shift(1).rolling(config.DIVERGENCE_LOOKBACK).min()
-    past_min_macd = out["macd_diff"].shift(1).rolling(config.DIVERGENCE_LOOKBACK).min()
-    price_new_low = out["close"] < past_min_close
-    rsi_div_state = price_new_low & (out["rsi14"] > past_min_rsi + config.DAILY_RSI_DIVERGENCE_THRESHOLD)
-    macd_div_state = price_new_low & (out["macd_diff"] > past_min_macd)
-    recent_div = (rsi_div_state | macd_div_state).rolling(3).max() > 0
-    right_confirm = out["macd_golden_cross"] | out["rsi_rebound"] | out["ma5_turn"]
-    out["bottom_divergence"] = recent_div & right_confirm
+    out["bottom_divergence"] = _divergence_confirmed(out, config)
 
     price_up = out["close"] > out["close"].shift(1)
     vol_expand = out["daily_vol_ratio"] >= config.DAILY_VOL_EXPAND
     out["vol_price_coord"] = price_up & vol_expand
+    out["vol_price_quality"], out["vol_price_label"] = _vol_price_quality(out, config)
     out["multi_resonance"] = out["rsi_multi_res"] & out["macd_golden_cross"] & out["vol_price_coord"]
 
     out["daily_score"] = (
         out["trend_turn"].astype(float) * config.W_DAILY_TREND_TURN +
         out["rsi_rebound"].astype(float) * config.W_DAILY_RSI_REBOUND +
-        out["vol_price_coord"].astype(float) * config.W_DAILY_VOL_PRICE +
+        out["vol_price_quality"].astype(float) +
         out["multi_resonance"].astype(float) * config.DAILY_MULTI_RESONANCE_BONUS +
         (out["rsi14"] >= config.DAILY_RSI_OVERBOUGHT).astype(float) * (-config.DAILY_RSI_OVERBOUGHT_PENALTY)
     ).fillna(0).clip(0, 100).round(1)
@@ -1078,24 +1201,67 @@ def _fmt_cell(v: Any, default: str = "-") -> Any:
     return v
 
 
-def describe(row: dict) -> str:
-    """把一条推荐格式化为飞书卡片文本（notify/feishu.py 调用）。
+_FUND_STATUS_ZH = {"verified": "财务已核验", "partial": "财务部分核验", "missing": "财务未核验"}
+_WEEKLY_STATUS_ZH = {"confirmed": "周线已确认", "unverified": "周线待核验", "disabled": "周线未启用"}
+_MISSING_TAG_ZH = {
+    "fund": "财务数据缺失", "fund_roe": "ROE缺失", "fund_debt": "负债率缺失",
+    "fund_goodwill": "商誉缺失", "fund_deducted": "扣非缺失",
+    "pct_chg": "涨幅数据缺失", "gap": "开盘价缺失",
+    "macd_mom": "MACD柱数据缺失", "kdj": "KDJ数据缺失",
+}
 
-    只使用 Signal 实际携带的字段：历史实现引用了并不存在的 avg_amount 字段，
-    导致卡片尾部恒定展示「日均额: -万」。
+def _missing_tags_zh(tags: str) -> str:
+    if not tags:
+        return ""
+    return "、".join(_MISSING_TAG_ZH.get(t, t) for t in str(tags).split(",") if t)
+
+def describe(row: dict) -> str:
+    """把一条推荐格式化为飞书卡片文本（notify/feishu.py 调用），按三维展示：
+
+    1. 基础评分/等级：分数与等级同源（均按原始技术分定级，熊市只抬门槛不扣展示分）；
+    2. 入选依据：实际触发的技术条件（放量企稳/放量上涨/放量冲高回落措辞区分）；
+    3. 核验状态：财务/周线是否已核验、缺项明细（可选指标缺失只标注不降级）。
     """
-    div_tag = " | 底背离" if row.get("has_divergence") else ""
-    return (
-        f"**{row.get('name', '')} {row.get('code', '')}**\n"
-        f"评分: {_fmt_cell(row.get('score'))} ({row.get('grade') or '-'})"
+    verify_bits = [
+        _FUND_STATUS_ZH.get(str(row.get("fund_status", "")), "财务未核验"),
+        _WEEKLY_STATUS_ZH.get(str(row.get("weekly_status", "")), "周线待核验"),
+    ]
+    missing = _missing_tags_zh(str(row.get("missing_tags", "") or ""))
+    verify = " | ".join(verify_bits) + (f" | 缺项: {missing}" if missing else "")
+    lines = [
+        f"**{row.get('name', '')} {row.get('code', '')}**（低位企稳候选）",
+        f"评分: {_fmt_cell(row.get('score'))} ({row.get('grade') or '-'}级)"
         f" | 收盘: {_fmt_cell(row.get('close'))}"
         f" | 止损: {_fmt_cell(row.get('stop_loss'))}"
         f" | 止盈: {_fmt_cell(row.get('take_profit'))}"
-        f" | RR: {_fmt_cell(row.get('rr_ratio'))}\n"
+        f" | RR: {_fmt_cell(row.get('rr_ratio'))}",
+    ]
+    if row.get("signals_hit"):
+        lines.append(f"入选依据: {row.get('signals_hit')}")
+    lines.append(f"核验: {verify}")
+    lines.append(
         f"RSI14: {_fmt_cell(row.get('rsi'))}"
         f" | 量比: {_fmt_cell(row.get('vol_ratio'))}"
-        f" | 市场: {row.get('market_env') or '-'}{div_tag}"
+        f" | 市场: {row.get('market_env') or '-'}"
+        + (" | 底背离" if row.get("has_divergence") else "")
     )
+    return "\n".join(lines)
+
+def describe_pending(row: dict) -> str:
+    """把一条待核验候选格式化为飞书卡片文本：说明缺什么、为什么没进正式推荐。"""
+    missing = _missing_tags_zh(str(row.get("missing_tags", "") or ""))
+    reasons = [
+        _FUND_STATUS_ZH.get(str(row.get("fund_status", "")), "财务未核验"),
+        _WEEKLY_STATUS_ZH.get(str(row.get("weekly_status", "")), "周线待核验"),
+    ]
+    parts = [
+        f"**{row.get('name', '')} {row.get('code', '')}**"
+        f" | 评分: {_fmt_cell(row.get('score'))} ({row.get('grade') or '-'}级)",
+        f"待核验: {'、'.join(reasons)}",
+    ]
+    if missing:
+        parts.append(f"缺项: {missing}")
+    return "\n".join(parts)
 
 
 @dataclass
@@ -1104,6 +1270,12 @@ class Signal:
     daily_score: float; rsi: float; rsi7: float; rsi21: float; vol_ratio: float
     turnover_ratio: float; stop_loss: float; take_profit: float; rr_ratio: float
     market_env: str; has_divergence: bool
+    # ===== 荐股质量三维（TOP5 改进）=====
+    signals_hit: str = ""             # 形态标签：实际触发的技术条件（逗号分隔）
+    fund_status: str = "missing"      # 核验状态：财务 verified/partial/missing
+    weekly_status: str = "unverified" # 核验状态：周线 confirmed/unverified/disabled（决赛圈更新）
+    missing_tags: str = ""            # 缺项标签（逗号分隔；可选指标缺失只标注不降级）
+    tier: str = "pending"             # 推荐层级：formal=正式推荐 / pending=待核验候选
 
     def to_dict(self) -> dict: return asdict(self)
 
@@ -1115,10 +1287,17 @@ def _grade_from_score(score: float, config: StrategyConfig) -> str:
 
 _GRADE_ORDER = ("D", "C", "B", "A")
 
-def _lift_grade(grade: str, levels: int = 1) -> str:
-    """评级提升（底背离奖励），A 级封顶"""
-    idx = _GRADE_ORDER.index(grade) if grade in _GRADE_ORDER else 0
-    return _GRADE_ORDER[min(idx + levels, len(_GRADE_ORDER) - 1)]
+def _rank_signals(df: pd.DataFrame) -> pd.DataFrame:
+    """确定性排序：评分降序 → 底背离优先 → 盈亏比降序 → 股票代码升序（末级键）。
+
+    分数、背离、盈亏比完全相同时按代码排序，保证两次运行结果可复现，
+    不受并发完成顺序（as_completed）影响。
+    """
+    return df.sort_values(
+        by=SORT_BY + ["has_divergence", "rr_ratio", "code"],
+        ascending=SORT_ASC + [False, False, True],
+        kind="mergesort",
+    ).reset_index(drop=True)
 
 # ===== 严格确认指标判定（纯函数，数据缺失一律放行不误杀）=====
 
@@ -1175,10 +1354,36 @@ def check_weekly_macd(weekly_df: Optional[pd.DataFrame], config: StrategyConfig)
     if float(h1) > 0: return True                 # 红柱（含金叉翻红），周线动能已占优
     return float(h1) > float(h2) > float(h3)      # 绿柱连续 2 周收窄，企稳确认
 
-def evaluate(daily_df: Optional[pd.DataFrame], code: str = "", name: str = "", config: Optional[StrategyConfig] = None, market_env: Optional[dict] = None, fund_data: Optional[dict] = None) -> tuple[Optional[Signal], str]:
+def _weekly_trend_data_ok(weekly_df: Optional[pd.DataFrame], config: StrategyConfig) -> bool:
+    """周线均线确认的数据是否充分：None/空/长度不足 → False（无法有效确认 → 待核验候选）"""
+    if weekly_df is None or weekly_df.empty or "close" not in weekly_df.columns: return False
+    return len(weekly_df) >= config.WEEKLY_MA_PERIOD + config.WEEKLY_SLOPE_LOOKBACK
+
+def _weekly_macd_data_ok(weekly_df: Optional[pd.DataFrame], config: StrategyConfig) -> bool:
+    """周线 MACD 确认的数据是否充分：None/空/长度不足 → False（无法有效确认 → 待核验候选）"""
+    if weekly_df is None or weekly_df.empty or "close" not in weekly_df.columns: return False
+    return len(weekly_df) >= config.WEEKLY_MACD_SLOW + config.WEEKLY_MACD_SIGNAL
+
+def _weekly_fresh_enough(weekly_df: Optional[pd.DataFrame], latest_trade_date: str) -> bool:
+    """周线数据截止日期须覆盖最新交易日所在周（最后一根周线 bar 日期 ≥ 该周周一），
+    停牌股的周线滞后时不足以作为「当前」趋势确认。基准日期无法解析时不做强校验。"""
+    if weekly_df is None or weekly_df.empty or "date" not in weekly_df.columns: return False
+    try:
+        d = datetime.strptime(str(latest_trade_date), _DATE_FMT)
+    except (TypeError, ValueError):
+        return True
+    week_start = (d - timedelta(days=d.weekday())).strftime(_DATE_FMT)
+    last = str(weekly_df.sort_values("date").iloc[-1]["date"])
+    return last >= week_start
+
+def evaluate(daily_df: Optional[pd.DataFrame], code: str = "", name: str = "", config: Optional[StrategyConfig] = None, market_env: Optional[dict] = None, fund_data: Optional[dict] = None, latest_trade_date: Optional[str] = None) -> tuple[Optional[Signal], str]:
+    """评估单只股票。
+
+    latest_trade_date：市场（沪深300）最新交易日，用于行情时效校验——
+    个股最新K线日期与之一致才评估（停牌/数据滞后 → 暂不推荐），None 时跳过校验。
+    """
     if config is None: config = StrategyConfig()
     regime = (market_env or {}).get("regime", "unknown")
-    grade_boost = config.BEAR_GRADE_BOOST if regime == "bear" else 0.0
 
     if not check_fundamentals(fund_data, config, code=code, name=name): return None, "FAIL_FUND"
 
@@ -1187,15 +1392,27 @@ def evaluate(daily_df: Optional[pd.DataFrame], code: str = "", name: str = "", c
 
     d_last = daily_out.iloc[-1]
 
-    # 防追高否决：当日涨幅过大（涨停买不进、大阳线次日易回调），数据缺失时放行不误杀
+    # 数据时效：个股最新K线须与市场最新交易日一致（停牌/数据滞后 → 暂不推荐）
+    if config.REQUIRE_FRESH_DAILY and latest_trade_date is not None \
+            and str(d_last["date"]) != str(latest_trade_date):
+        return None, "FAIL_STALE"
+
+    # 核验状态维度一：财务核验（核心项=ROE+负债率；商誉/扣非为可选项，缺失只记标签）
+    fund_status, fund_missing = _fund_verify_state(fund_data)
+    missing_tags: list[str] = list(fund_missing)
+
+    # 防追高否决：当日涨幅过大（涨停买不进、大阳线次日易回调），数据缺失时放行不误杀（记缺项）
     pct_chg_today = d_last.get("pct_chg")
-    if pct_chg_today is not None and not pd.isna(pct_chg_today) and float(pct_chg_today) > config.MAX_ENTRY_PCT_CHG:
+    if pct_chg_today is None or pd.isna(pct_chg_today):
+        missing_tags.append("pct_chg")
+    elif float(pct_chg_today) > config.MAX_ENTRY_PCT_CHG:
         return None, "FAIL_CHASE"
-    # 防跳空否决：开盘相对前收跳空高开过多，追买风险大
+    # 防跳空否决：开盘相对前收跳空高开过多，追买风险大（开盘价缺失记缺项）
     open_today = d_last.get("open")
     prev_close = float(daily_out.iloc[-2]["close"]) if len(daily_out) >= 2 else None
-    if (open_today is not None and not pd.isna(open_today) and prev_close and prev_close > 0
-            and (float(open_today) / prev_close - 1) * 100 > config.MAX_GAP_UP_PCT):
+    if open_today is None or pd.isna(open_today) or not prev_close or prev_close <= 0:
+        missing_tags.append("gap")
+    elif (float(open_today) / prev_close - 1) * 100 > config.MAX_GAP_UP_PCT:
         return None, "FAIL_GAP"
 
     # 已反弹一段否决：近 N 日累计涨幅过大，说明底部反弹可能已走完，此时介入性价比低。
@@ -1224,27 +1441,44 @@ def evaluate(daily_df: Optional[pd.DataFrame], code: str = "", name: str = "", c
     if high_n > 0 and drawdown > config.MAX_DRAWDOWN_FROM_HIGH:
         return None, "FAIL_DEEP_CRASH"
 
-    # 严格确认指标：低位/动能/KDJ 三重确认，任一不过即否决
+    # 严格确认指标：低位/动能/KDJ 三重确认，任一不过即否决；数据缺失放行但记缺项
     if not _range_position_ok(daily_out, config): return None, "FAIL_POSITION"
-    if config.REQUIRE_MACD_MOMENTUM and not _macd_momentum_ok(daily_out, config): return None, "FAIL_MACD_MOM"
-    if config.REQUIRE_KDJ_GOLDEN and not _kdj_ok(daily_out, config): return None, "FAIL_KDJ"
+    if config.REQUIRE_MACD_MOMENTUM:
+        if not _macd_momentum_ok(daily_out, config): return None, "FAIL_MACD_MOM"
+        n_mom = max(1, int(config.MACD_MOMENTUM_DAYS))
+        if len(daily_out) <= n_mom or daily_out["macd_histogram"].iloc[-(n_mom + 1):].isna().any():
+            missing_tags.append("macd_mom")
+    if config.REQUIRE_KDJ_GOLDEN:
+        if not _kdj_ok(daily_out, config): return None, "FAIL_KDJ"
+        if pd.isna(d_last.get("kdj_k")) or pd.isna(d_last.get("kdj_d")):
+            missing_tags.append("kdj")
 
     daily_score = float(d_last.get("daily_score", 0))
     has_div = bool(d_last.get("bottom_divergence", False))
-    # 准入门槛：按基础评级（分数扣除熊市加码后定级）判断，默认须达 B 级（≥60 分），
-    # 即趋势转折之外还需至少一个确认信号；设为 "C" 可恢复旧行为
-    base_grade = _grade_from_score(daily_score - grade_boost, config)
+    # 评级统一：等级与展示分数同源（均按原始技术分定级），分数与等级不再脱节；
+    # 熊市不再「扣分定级」，改为直接上浮准入分数线（效果等价、口径透明）；
+    # 底背离不提升评级，仅作形态标签参与展示与同分排序
+    grade = _grade_from_score(daily_score, config)
     min_grade = config.MIN_PASS_GRADE if config.MIN_PASS_GRADE in _GRADE_ORDER else "B"
-    if _GRADE_ORDER.index(base_grade) < _GRADE_ORDER.index(min_grade):
+    grade_floor = {"A": config.GRADE_A, "B": config.GRADE_B, "C": config.GRADE_C, "D": 0.0}[min_grade]
+    required_score = grade_floor + (config.BEAR_GRADE_BOOST if regime == "bear" else 0.0)
+    if daily_score < required_score:
         return None, "FAIL_TECH"
-    # 底背离：通过准入后评级提升一档（与基础分脱钩），仅用于展示/排序，不能绕过准入门槛
-    grade = _lift_grade(base_grade, config.DIVERGENCE_GRADE_LIFT) if has_div and config.DIVERGENCE_GRADE_LIFT > 0 else base_grade
 
     atr_val = d_last.get("atr")
     atr_val = float(atr_val) if atr_val is not None and not pd.isna(atr_val) else None
 
     rr = compute_risk_reward(entry_price=last_close, config=config, atr=atr_val)
     if not rr["passes"]: return None, "FAIL_RR"
+
+    # 入选依据：实际触发的技术条件（量价按质量分档区分措辞）
+    hits: list[str] = []
+    if bool(d_last.get("trend_turn", False)): hits.append("趋势转折")
+    if bool(d_last.get("rsi_rebound", False)): hits.append("RSI超卖反弹")
+    vp_label = str(d_last.get("vol_price_label", "") or "")
+    if bool(d_last.get("vol_price_coord", False)): hits.append(vp_label or "放量上涨")
+    if bool(d_last.get("multi_resonance", False)): hits.append("多周期共振")
+    if has_div: hits.append("底背离")
 
     sig = Signal(
         code=code, name=name, date=pd.to_datetime(d_last["date"]).strftime("%Y-%m-%d"),
@@ -1254,14 +1488,17 @@ def evaluate(daily_df: Optional[pd.DataFrame], code: str = "", name: str = "", c
         vol_ratio=round(float(d_last.get("daily_vol_ratio", 0)), 2),
         turnover_ratio=round(float(d_last.get("daily_turnover_ratio", 0)), 2),
         stop_loss=rr["stop_loss"], take_profit=rr["take_profit"], rr_ratio=rr["rr_ratio"],
-        market_env=regime, has_divergence=has_div
+        market_env=regime, has_divergence=has_div,
+        signals_hit=",".join(hits), fund_status=fund_status,
+        missing_tags=",".join(dict.fromkeys(t for t in missing_tags if t)),  # 去重保序
+        tier="formal" if fund_status == "verified" else "pending",
     )
     return sig, "PASS"
 
 def get_market_environment(config: StrategyConfig, cache: CacheManager) -> dict:
     if (cached := cache.get("market_env")) is not None: return cached
     df_index = get_index_daily(config, cache)
-    result = compute_market_environment(df_index, config) if df_index is not None and not df_index.empty else {"regime": "unknown", "description": "数据获取失败", "ma20": 0, "slope": 0, "close": 0}
+    result = compute_market_environment(df_index, config) if df_index is not None and not df_index.empty else {"regime": "unknown", "description": "未知（数据获取失败）", "ma20": 0, "slope": 0, "close": 0}
     cache.set("market_env", result)
     return result
 
@@ -1286,7 +1523,13 @@ def _dedup_by_industry(df: pd.DataFrame, config: StrategyConfig, cache: Optional
 # 编排函数
 # ===========================================================================
 
-def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] = None) -> Optional[pd.DataFrame]:
+def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] = None,
+         pending_out: Optional[list] = None) -> Optional[pd.DataFrame]:
+    """执行选股主流程，返回正式推荐（formal）DataFrame。
+
+    pending_out：可选 list，传出「待核验候选」（财务/周线数据缺失、不与正式推荐混排），
+    由调用方决定是否展示——数据缺失不等于筛选通过，宁可少荐。
+    """
     if config is None: config = StrategyConfig()
     if cache is None: cache = CacheManager(expire_hours=config.CACHE_EXPIRE_HOURS)
 
@@ -1307,6 +1550,13 @@ def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] 
         market_env = get_market_environment(config, cache)
         print(f"[INFO] 市场环境: {market_env.get('description', 'unknown')}")
 
+        # 数据时效基准：市场（沪深300）最新交易日，个股日线/周线截止日期均须与之一致
+        index_df = get_index_daily(config, cache)
+        latest_trade_date = str(index_df["date"].iloc[-1]) \
+            if index_df is not None and not index_df.empty and "date" in index_df.columns else None
+        if latest_trade_date is None:
+            print("[WARN] 无法获取指数行情，本次运行跳过行情时效校验（停牌股可能混入待核验流程）")
+
         stock_list = get_stock_list(config, cache)
         if not stock_list:
             print("[WARN] 无法获取股票列表")
@@ -1315,7 +1565,7 @@ def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] 
 
         signals: list[dict] = []
         processed, total = 0, len(stock_list)
-        stats = {"total": total, "error": 0, "fail_data": 0, "fail_fund": 0, "fail_tech": 0, "fail_rr": 0, "pass": 0}
+        stats = {"total": total, "error": 0, "fail_data": 0, "fail_stale": 0, "fail_fund": 0, "fail_tech": 0, "fail_rr": 0, "pass": 0}
 
         def _screen_one(stock: dict) -> tuple[Optional[Signal], str]:
             code, name = stock["code"], stock["name"]
@@ -1323,7 +1573,8 @@ def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] 
                 daily_df = get_daily_data(code, config, cache)
                 if daily_df is None: return None, "FAIL_DATA"
                 fund_data = get_fundamentals(code, cache, config)
-                return evaluate(daily_df, code, name, config, market_env, fund_data)
+                return evaluate(daily_df, code, name, config, market_env, fund_data,
+                                latest_trade_date=latest_trade_date)
             except Exception:
                 return None, "ERROR"
 
@@ -1339,6 +1590,7 @@ def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] 
                     signals.append(sig.to_dict())
                 elif reason == "FAIL_FUND": stats["fail_fund"] += 1
                 elif reason == "FAIL_DATA": stats["fail_data"] += 1
+                elif reason == "FAIL_STALE": stats["fail_stale"] += 1
                 # FAIL_CHASE（追高）/ FAIL_GAP（跳空）/ FAIL_RSI_HIGH（RSI过高）/ FAIL_CLIMAX_VOL（天量）/ FAIL_NOT_BOTTOM（非底部区域）
                 # / FAIL_POSITION（区间位置偏高）/ FAIL_MACD_MOM（动能未改善）/ FAIL_KDJ（KDJ未金叉）均属技术面入场质量层
                 elif reason in ("FAIL_TECH", "FAIL_CHASE", "FAIL_GAP", "FAIL_RSI_HIGH", "FAIL_CLIMAX_VOL",
@@ -1347,7 +1599,7 @@ def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] 
                 elif reason == "FAIL_RR": stats["fail_rr"] += 1
                 elif reason == "ERROR": stats["error"] += 1
 
-        pass_data = stats["total"] - stats["fail_data"] - stats["error"]
+        pass_data = stats["total"] - stats["fail_data"] - stats["fail_stale"] - stats["error"]
         pass_fund = pass_data - stats["fail_fund"]
         pass_tech = pass_fund - stats["fail_tech"]
         pass_rr = pass_tech - stats["fail_rr"]
@@ -1357,6 +1609,8 @@ def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] 
         print("="*50)
         print(f"1. 初始有效股票池: {stats['total']} 只")
         print(f"2. 获取数据并达标: {pass_data} 只 (淘汰/缺失 {stats['fail_data'] + stats['error']} 只)")
+        if stats["fail_stale"] > 0:
+            print(f"   其中行情时效不符（停牌/数据滞后）: {stats['fail_stale']} 只，暂不推荐")
         if pass_data > 0: print(f"3. 基本面防雷通过: {pass_fund} 只 (淘汰 {stats['fail_fund']} 只，通过率 {pass_fund/pass_data*100:.1f}%)")
         if pass_fund > 0: print(f"4. 日线技术面达标: {pass_tech} 只 (淘汰 {stats['fail_tech']} 只，通过率 {pass_tech/pass_fund*100:.1f}%)")
         if pass_tech > 0: print(f"5. 盈亏风控比达标: {pass_rr} 只 (淘汰 {stats['fail_rr']} 只，通过率 {pass_rr/pass_tech*100:.1f}%)")
@@ -1366,34 +1620,68 @@ def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] 
             print("[INFO] 未发现符合条件的信号")
             return None
 
-        # 排序：评分降序为主键；同分时依次用 底背离 > 盈亏比 打破并列，
-        # 避免同分股票之间的先后纯靠偶然顺序决定（原先仅按 score 排序）
-        df = pd.DataFrame(signals).sort_values(
-            SORT_BY + ["has_divergence", "rr_ratio"],
-            ascending=SORT_ASC + [False, False],
-        ).reset_index(drop=True)
+        # 确定性排序：评分降序 → 底背离优先 → 盈亏比 → 股票代码（末级键，结果可复现）
+        df = _rank_signals(pd.DataFrame(signals))
 
-        # 决赛圈周线确认 + 行业分散：按评分降序逐个拉周线确认，取满 MAX_PICKS 即止（只对决赛圈拉取，成本可控）；
-        # 周线不过或所属行业额度已满则跳过并继续向后面候补，保证最终名单仍然取满
-        if config.REQUIRE_WEEKLY_TREND and not df.empty:
+        # 决赛圈：周线确认 + 财务字段补齐 + 行业分散，逐个按评分降序处理，取满 MAX_PICKS 即止。
+        # 周线 MA 与周线 MACD 开关独立生效（任一启用即拉周线）；
+        # 周线数据缺失/截止过旧 → 不足以确认 → 进入待核验候选，不占正式推荐名额
+        weekly_enabled = config.REQUIRE_WEEKLY_TREND or config.REQUIRE_WEEKLY_MACD_STABLE
+        pending_list: list[dict] = []
+        if weekly_enabled and not df.empty:
             industry_map = get_stock_industry(config, cache) if config.USE_INDUSTRY_DEDUP else {}
-            confirmed = []
+            confirmed: list = []
             industry_used: dict[str, int] = {}
-            weekly_checked = weekly_dropped = industry_dropped = 0
+            weekly_checked = weekly_dropped = pending_weekly = industry_dropped = fund_late_dropped = pending_fund = 0
             for _, row in df.iterrows():
                 if len(confirmed) >= config.MAX_PICKS: break
-                wk = _fetch_weekly_dual(row["code"], config)
+                code = str(row["code"])
+                wk = _fetch_weekly_dual(code, config)
                 time.sleep(config.FETCH_DELAY)
                 weekly_checked += 1
-                weekly_ok = check_weekly_trend(wk, config)
+                weekly_status = "confirmed"
+                weekly_ok = True
+                if config.REQUIRE_WEEKLY_TREND:
+                    if not _weekly_trend_data_ok(wk, config): weekly_status = "unverified"
+                    weekly_ok = check_weekly_trend(wk, config)
                 if weekly_ok and config.REQUIRE_WEEKLY_MACD_STABLE:
+                    if not _weekly_macd_data_ok(wk, config): weekly_status = "unverified"
                     weekly_ok = check_weekly_macd(wk, config)
+                if weekly_status == "confirmed" and latest_trade_date is not None \
+                        and not _weekly_fresh_enough(wk, latest_trade_date):
+                    weekly_status = "unverified"   # 周线截止过旧（如停牌），不足以为当前趋势背书
                 if not weekly_ok:
                     weekly_dropped += 1
                     continue
-                industry = industry_map.get(str(row["code"]), "") or ""
+                row["weekly_status"] = weekly_status
+                if weekly_status == "unverified":
+                    row["tier"] = "pending"
+                    pending_list.append(row.to_dict())
+                    pending_weekly += 1
+                    continue
+                industry = industry_map.get(code, "") or ""
                 if industry and industry_used.get(industry, 0) >= config.MAX_PICKS_PER_INDUSTRY:
                     industry_dropped += 1
+                    continue
+                # 决赛圈财务补齐：主源不提供的商誉/扣非（及缺失核心项）用 AkShare 按字段补后终审
+                fund = get_fundamentals(code, cache, config)  # 命中内存缓存，无额外主源成本
+                if fund is None:
+                    row["tier"] = "pending"
+                    pending_list.append(row.to_dict())
+                    pending_fund += 1
+                    continue
+                fund = _fill_optional_fundamentals(code, fund, config)
+                if not check_fundamentals(fund, config, code=code, name=str(row["name"])):
+                    fund_late_dropped += 1
+                    continue
+                fund_status, fund_tags = _fund_verify_state(fund)
+                row["fund_status"] = fund_status
+                kept_tags = [t for t in str(row.get("missing_tags", "") or "").split(",") if t and not t.startswith("fund")]
+                row["missing_tags"] = ",".join(kept_tags + fund_tags)
+                if fund_status != "verified":
+                    row["tier"] = "pending"
+                    pending_list.append(row.to_dict())
+                    pending_fund += 1
                     continue
                 if industry: industry_used[industry] = industry_used.get(industry, 0) + 1
                 confirmed.append(row)
@@ -1401,17 +1689,53 @@ def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] 
                 conds = [f"周线MA{config.WEEKLY_MA_PERIOD}" + ("站上且上行" if config.WEEKLY_MA_BOTH_REQUIRED else "站上或上行")]
                 if config.REQUIRE_WEEKLY_MACD_STABLE: conds.append("周线MACD企稳")
                 print(f"[INFO] 周线确认：检查 {weekly_checked} 只，淘汰 {weekly_dropped} 只（未满足 {' + '.join(conds)}）")
+            if fund_late_dropped > 0:
+                print(f"[INFO] 决赛圈财务补齐后否决 {fund_late_dropped} 只（商誉/扣非/ROE/负债率超阈值）")
             if industry_dropped > 0:
                 print(f"[INFO] 行业分散：淘汰 {industry_dropped} 只（同一行业最多 {config.MAX_PICKS_PER_INDUSTRY} 只）")
+            if pending_list:
+                detail = "、".join(f"{r.get('name')}({r.get('code')})" for r in pending_list[:10])
+                more = f" 等 {len(pending_list)} 只" if len(pending_list) > 10 else ""
+                print(f"[INFO] 待核验候选：{detail}{more}（财务/周线数据待补全，未进正式推荐）")
             df = pd.DataFrame(confirmed).reset_index(drop=True) if confirmed else df.iloc[0:0]
-        elif config.USE_INDUSTRY_DEDUP and not df.empty:
-            df = _dedup_by_industry(df, config, cache)
+        else:
+            if config.USE_INDUSTRY_DEDUP and not df.empty:
+                df = _dedup_by_industry(df, config, cache)
+            if not df.empty:
+                df["weekly_status"] = "disabled"   # 周线确认未启用（两个开关均关闭）
+            # 推荐数量上限：评分降序截取前 MAX_PICKS 只（周线路径在循环内已取满即止）
+            if len(df) > config.MAX_PICKS:
+                print(f"[INFO] 通过 {len(df)} 只，按评分截取前 {config.MAX_PICKS} 只（淘汰 {len(df) - config.MAX_PICKS} 只低分信号）")
+                df = df.head(config.MAX_PICKS).reset_index(drop=True)
+            # 周线未启用时：对最终名单做财务字段补齐与终审（四项防雷口径与决赛圈一致）
+            if not df.empty:
+                keep_rows = []
+                for _, row in df.iterrows():
+                    code = str(row["code"])
+                    fund = get_fundamentals(code, cache, config)
+                    if fund is None:
+                        pending_list.append(row.to_dict())
+                        continue
+                    fund = _fill_optional_fundamentals(code, fund, config)
+                    if not check_fundamentals(fund, config, code=code, name=str(row["name"])):
+                        continue
+                    fund_status, fund_tags = _fund_verify_state(fund)
+                    row["fund_status"] = fund_status
+                    kept_tags = [t for t in str(row.get("missing_tags", "") or "").split(",") if t and not t.startswith("fund")]
+                    row["missing_tags"] = ",".join(kept_tags + fund_tags)
+                    if fund_status != "verified":
+                        row["tier"] = "pending"
+                        pending_list.append(row.to_dict())
+                        continue
+                    keep_rows.append(row)
+                if len(keep_rows) < len(df):
+                    print(f"[INFO] 财务核验后保留 {len(keep_rows)}/{len(df)} 只（未核验/补齐后被否决的不进入正式推荐）")
+                df = pd.DataFrame(keep_rows).reset_index(drop=True) if keep_rows else df.iloc[0:0]
 
-        # 推荐数量上限：评分降序截取前 MAX_PICKS 只（目标每日 3~5 只精推，其余评分靠后的不推荐）
-        if len(df) > config.MAX_PICKS:
-            print(f"[INFO] 通过 {len(df)} 只，按评分截取前 {config.MAX_PICKS} 只（淘汰 {len(df) - config.MAX_PICKS} 只低分信号）")
-            df = df.head(config.MAX_PICKS).reset_index(drop=True)
-        print(f"[INFO] 筛选完成，最终推荐 {len(df)} 只股票")
+        if pending_out is not None:
+            pending_out.extend(pending_list)
+        print(f"[INFO] 筛选完成，正式推荐 {len(df)} 只股票"
+              + (f"；待核验候选 {len(pending_list)} 只（数据待补全，未正式推荐）" if pending_list else ""))
         return df
 
     finally:

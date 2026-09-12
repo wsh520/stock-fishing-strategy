@@ -67,12 +67,16 @@ def notify_screening_result(
     df: Optional[pd.DataFrame],
     market_env: str = "unknown",
     error_msg: Optional[str] = None,
+    pending: Optional[pd.DataFrame] = None,
 ) -> None:
     """发送选股结果通知。
 
     参数匹配 run.py 中的调用:
-        notify_screening_result(output_df, market_env=market_env_desc)
+        notify_screening_result(output_df, market_env=market_env_desc, pending=pending_df)
         notify_screening_result(None, market_env=market_env_desc, error_msg=str(e))
+
+    分层展示：df 为正式推荐（低位企稳候选）；pending 为待核验候选
+    （财务/周线数据缺失，未正式推荐，不与正式推荐混排）。
     """
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
 
@@ -89,12 +93,42 @@ def notify_screening_result(
         _send_feishu(card)
         return
 
+    # 尝试导入 describe 函数
+    try:
+        from bottom_fishing_strategy import describe, describe_pending
+    except ImportError:
+        describe = None
+        describe_pending = None
+
+    def _pending_elements() -> list:
+        """待核验候选区块：与正式推荐分开，说明缺什么、为什么没进正式推荐"""
+        if pending is None or pending.empty:
+            return []
+        elems = [
+            _divider(),
+            _md_element(f"**待核验候选 {len(pending)} 只**（财务/周线数据待补全，未正式推荐，不参与追踪）"),
+        ]
+        for _, row in pending.head(5).iterrows():
+            r = row.to_dict()
+            if describe_pending:
+                text = describe_pending(r)
+            else:
+                text = f"**{r.get('name', '')} {r.get('code', '')}** | 缺项: {r.get('missing_tags', '-')}"
+            elems.append(_md_element(text))
+        if len(pending) > 5:
+            elems.append(_md_element(f"*...共 {len(pending)} 只，仅展示前5*"))
+        return elems
+
     # 无信号
     if df is None or df.empty:
+        no_signal_text = "今日无正式推荐（未发现数据完整且通过全部条件的标的），宁可少荐。"
+        if pending is not None and not pending.empty:
+            no_signal_text += f"\n另有待核验候选 {len(pending)} 只（数据待补全）。"
         card = {
             "header": _build_header("选股结果 - 今日无信号", color="grey"),
             "elements": [
-                _md_element(f"**时间:** {now}\n**市场环境:** {market_env}\n\n今日未发现符合5层过滤条件的标的。"),
+                _md_element(f"**时间:** {now}\n**市场环境:** {market_env}\n\n{no_signal_text}"),
+                *_pending_elements(),
             ],
         }
         _send_feishu(card)
@@ -102,15 +136,9 @@ def notify_screening_result(
 
     # 有信号
     elements = [
-        _md_element(f"**时间:** {now}\n**市场环境:** {market_env}\n**推荐数量:** {len(df)} 只"),
+        _md_element(f"**时间:** {now}\n**市场环境:** {market_env}\n**推荐数量:** {len(df)} 只（低位企稳候选）"),
         _divider(),
     ]
-
-    # 尝试导入 describe 函数
-    try:
-        from bottom_fishing_strategy import describe
-    except ImportError:
-        describe = None
 
     for _, row in df.head(10).iterrows():
         r = row.to_dict()
@@ -123,14 +151,15 @@ def notify_screening_result(
                 f"| 收盘: {r.get('close', 0)} "
                 f"| 止损: {r.get('stop_loss', 0)} "
                 f"| 止盈: {r.get('take_profit', 0)} "
-                f"| RR: {r.get('rr_ratio', 0)} "
-                f"| 日均额: {r.get('avg_amount', '-')}万"
+                f"| RR: {r.get('rr_ratio', 0)}"
             )
         elements.append(_md_element(text))
         elements.append(_divider())
 
     if len(df) > 10:
         elements.append(_md_element(f"*...共 {len(df)} 只，仅展示前10*"))
+
+    elements.extend(_pending_elements())
 
     card = {
         "header": _build_header(f"选股结果 - {len(df)}只信号", color="green"),

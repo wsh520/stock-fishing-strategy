@@ -50,8 +50,8 @@ CREATE TABLE IF NOT EXISTS stock_recommendation (
     code             VARCHAR(8)      NOT NULL COMMENT '股票代码（6位数字）',
     name             VARCHAR(32)     NOT NULL COMMENT '股票名称',
     rec_close        DECIMAL(10, 3)  NOT NULL COMMENT '推荐时收盘价（元）',
-    score            DECIMAL(5, 1)   NULL COMMENT '综合评分（含熊市加码）',
-    grade            VARCHAR(2)      NULL COMMENT '信号等级 A/B（底背离可升档）',
+    score            DECIMAL(5, 1)   NULL COMMENT '技术评分（与等级同源定级）',
+    grade            VARCHAR(2)      NULL COMMENT '信号等级 A/B/C/D（原始技术分定级，无升档）',
     daily_score      DECIMAL(5, 1)   NULL COMMENT '日线基础评分',
     rsi              DECIMAL(5, 1)   NULL COMMENT 'RSI14',
     rsi7             DECIMAL(5, 1)   NULL COMMENT 'RSI7',
@@ -61,8 +61,13 @@ CREATE TABLE IF NOT EXISTS stock_recommendation (
     stop_loss        DECIMAL(10, 3)  NULL COMMENT '止损价（2×ATR 或固定5%）',
     take_profit      DECIMAL(10, 3)  NULL COMMENT '止盈价（固定10%）',
     rr_ratio         DECIMAL(6, 2)   NULL COMMENT '风险收益比',
-    market_env       VARCHAR(16)     NULL COMMENT '市场环境 bull/bear/neutral/unknown',
-    has_divergence   TINYINT(1)      NOT NULL DEFAULT 0 COMMENT '是否底背离 1/0',
+    market_env       VARCHAR(16)      NULL COMMENT '市场环境 bull/bear/neutral/unknown',
+    has_divergence   TINYINT(1)      NOT NULL DEFAULT 0 COMMENT '是否底背离（双低点算法）1/0',
+    signals_hit      VARCHAR(255)    NULL COMMENT '入选依据（实际触发的技术条件，逗号分隔）',
+    fund_status      VARCHAR(16)     NULL COMMENT '财务核验 verified/partial/missing',
+    weekly_status    VARCHAR(16)     NULL COMMENT '周线核验 confirmed/unverified/disabled',
+    rec_tier         VARCHAR(8)      NULL COMMENT '推荐层级 formal/pending',
+    missing_tags     VARCHAR(255)    NULL COMMENT '缺失项标签（逗号分隔）',
     created_at       DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '写入时间',
     PRIMARY KEY (id),
     UNIQUE KEY uk_rec_date_code (rec_date, code),
@@ -91,6 +96,16 @@ CREATE TABLE IF NOT EXISTS stock_tracking (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='推荐个股周度表现追踪'
 """,
 )
+
+# 存量表补列（幂等）：CREATE TABLE IF NOT EXISTS 不会给已存在的表加新列，
+# 首次升级到「荐股质量分层」版本时按 information_schema 探测后 ALTER 补齐
+_RECOMMENDATION_ALTERS = {
+    "signals_hit": "ADD COLUMN signals_hit VARCHAR(255) NULL COMMENT '入选依据（实际触发的技术条件，逗号分隔）' AFTER has_divergence",
+    "fund_status": "ADD COLUMN fund_status VARCHAR(16) NULL COMMENT '财务核验 verified/partial/missing' AFTER signals_hit",
+    "weekly_status": "ADD COLUMN weekly_status VARCHAR(16) NULL COMMENT '周线核验 confirmed/unverified/disabled' AFTER fund_status",
+    "rec_tier": "ADD COLUMN rec_tier VARCHAR(8) NULL COMMENT '推荐层级 formal/pending' AFTER weekly_status",
+    "missing_tags": "ADD COLUMN missing_tags VARCHAR(255) NULL COMMENT '缺失项标签（逗号分隔）' AFTER rec_tier",
+}
 
 _tables_ready = False  # 进程内只确保一次建表
 
@@ -141,6 +156,16 @@ def _ensure_tables(conn) -> None:
     with conn.cursor() as cur:
         for stmt in _DDL:
             cur.execute(stmt)
+        # 存量表补列迁移（幂等）
+        cur.execute(
+            "SELECT COLUMN_NAME FROM information_schema.COLUMNS "
+            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'stock_recommendation'"
+        )
+        existing = {row[0] for row in cur.fetchall()}
+        for col, alter in _RECOMMENDATION_ALTERS.items():
+            if col not in existing:
+                cur.execute(f"ALTER TABLE stock_recommendation {alter}")
+                logger.info("stock_recommendation 已补充列: %s", col)
     _tables_ready = True
 
 
@@ -169,13 +194,19 @@ def save_recommendations(df: Optional[pd.DataFrame]) -> int:
             _f(r.get("stop_loss")), _f(r.get("take_profit")), _f(r.get("rr_ratio")),
             str(r.get("market_env", "") or "") or None,
             1 if bool(r.get("has_divergence")) else 0,
+            str(r.get("signals_hit", "") or "") or None,
+            str(r.get("fund_status", "") or "") or None,
+            str(r.get("weekly_status", "") or "") or None,
+            str(r.get("tier", "formal") or "formal") or None,
+            str(r.get("missing_tags", "") or "") or None,
         ))
 
     sql = """
         INSERT IGNORE INTO stock_recommendation
         (rec_date, code, name, rec_close, score, grade, daily_score, rsi, rsi7, rsi21,
-         vol_ratio, turnover_ratio, stop_loss, take_profit, rr_ratio, market_env, has_divergence)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+         vol_ratio, turnover_ratio, stop_loss, take_profit, rr_ratio, market_env, has_divergence,
+         signals_hit, fund_status, weekly_status, rec_tier, missing_tags)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     """
     try:
         conn = _connect()

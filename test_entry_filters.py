@@ -22,6 +22,7 @@ M  末端冲高 3.5% 后次日浅回落 3.0%：MACD 柱仍升但 KDJ 掉头     
 """
 import os
 import sys
+from dataclasses import replace
 from datetime import datetime
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
@@ -32,7 +33,8 @@ import pandas as pd
 import bottom_fishing_strategy as m
 
 
-def make_df(closes, last_vol_mult=3.0, last_open=None, vol_base=10_000_000):
+def make_df(closes, last_vol_mult=3.0, last_open=None, vol_base=10_000_000,
+            last_high=None, last_low=None):
     closes = np.asarray(closes, dtype=float)
     n = len(closes)
     dates = pd.date_range("2025-01-01", periods=n).strftime("%Y-%m-%d")
@@ -41,6 +43,10 @@ def make_df(closes, last_vol_mult=3.0, last_open=None, vol_base=10_000_000):
         open_[-1] = last_open
     high = np.maximum(open_, closes) * 1.01
     low = np.minimum(open_, closes) * 0.99
+    if last_high is not None:
+        high[-1] = last_high
+    if last_low is not None:
+        low[-1] = last_low
     volume = np.full(n, vol_base, dtype=float)
     volume[-1] = vol_base * last_vol_mult
     amount = closes * volume
@@ -228,6 +234,144 @@ checks.append(("周线站上MA10放行", m.check_weekly_trend(_w_up, cfg) is Tru
 checks.append(("周线主跌否决", m.check_weekly_trend(_w_down, cfg) is False))
 checks.append(("周线数据不足放行", m.check_weekly_trend(_w_up.head(5), cfg) is True))
 checks.append(("周线None放行", m.check_weekly_trend(None, cfg) is True))
+
+# ===========================================================================
+# TOP5 荐股质量改进验证
+# ===========================================================================
+_FUND_OK = {"roe": 12.0, "debt_ratio": 45.0, "goodwill_ratio": 3.0, "deducted_profit_ratio": 0.9}
+_NEUTRAL = {"regime": "neutral"}
+_A_DATE = str(df_a["date"].iloc[-1])
+
+# --- 1) 数据缺失分层：财务缺失不等于通过（技术面达标 → 待核验候选，不占正式推荐） ---
+_sig_nofund, _r_nofund = m.evaluate(df_a, code="600000", name="测试", config=cfg,
+                                    market_env=_NEUTRAL, fund_data=None)
+checks.append(("分层: 无财务数据仍技术达标(PASS)", _r_nofund == "PASS"))
+checks.append(("分层: 无财务数据 tier=pending", getattr(_sig_nofund, "tier", "") == "pending"))
+checks.append(("分层: 无财务数据 fund_status=missing", getattr(_sig_nofund, "fund_status", "") == "missing"))
+checks.append(("分层: missing_tags 含 fund", "fund" in str(getattr(_sig_nofund, "missing_tags", ""))))
+
+_sig_ok, _r_ok = m.evaluate(df_a, code="600000", name="测试", config=cfg,
+                            market_env=_NEUTRAL, fund_data=_FUND_OK)
+checks.append(("分层: 核心财务齐备 tier=formal", _r_ok == "PASS" and getattr(_sig_ok, "tier", "") == "formal"))
+# 主源 Baostock 的典型返回：只有 ROE+负债率，商誉/扣非缺失 → 仍为 formal，但标注缺项
+_sig_core, _r_core = m.evaluate(df_a, code="600000", name="测试", config=cfg,
+                                market_env=_NEUTRAL, fund_data={"roe": 12.0, "debt_ratio": 45.0})
+checks.append(("分层: core齐备但可选项缺失仅记标签",
+               _r_core == "PASS" and getattr(_sig_core, "tier", "") == "formal"
+               and "fund_goodwill" in str(getattr(_sig_core, "missing_tags", ""))
+               and "fund_deducted" in str(getattr(_sig_core, "missing_tags", ""))))
+
+_sig_partial, _r_partial = m.evaluate(df_a, code="600000", name="测试", config=cfg,
+                                      market_env=_NEUTRAL, fund_data={"roe": 12.0})
+checks.append(("分层: 核心项缺一 tier=pending",
+               _r_partial == "PASS" and getattr(_sig_partial, "tier", "") == "pending"))
+
+# --- 2) 数据时效：最新K线须与市场最新交易日一致，停牌/滞后 → 暂不推荐 ---
+_, _r_fresh = m.evaluate(df_a, code="600000", name="测试", config=cfg,
+                         market_env=_NEUTRAL, fund_data=None, latest_trade_date=_A_DATE)
+checks.append(("时效: 日期一致放行", _r_fresh == "PASS"))
+_, _r_stale = m.evaluate(df_a, code="600000", name="测试", config=cfg,
+                         market_env=_NEUTRAL, fund_data=None, latest_trade_date="2099-12-31")
+checks.append(("时效: 停牌/滞后 FAIL_STALE", _r_stale == "FAIL_STALE"))
+
+# --- 3) 底背离修正：指标比较锚定在「前一个价格低点」当根，而非指标自身最小值 ---
+def _div_frame(closes, rsis, confirm_at_end=True):
+    n = len(closes)
+    confirm = np.zeros(n, dtype=bool)
+    if confirm_at_end:
+        confirm[-1] = True  # MA5拐头确认（合成）
+    return pd.DataFrame({
+        "close": np.asarray(closes, dtype=float),
+        "rsi14": np.asarray(rsis, dtype=float),
+        "macd_diff": np.zeros(n, dtype=float),
+        "macd_golden_cross": np.zeros(n, dtype=bool),
+        "rsi_rebound": np.zeros(n, dtype=bool),
+        "ma5_turn": confirm,
+    })
+
+# 真背离：低点 10(RSI 20) → 反弹 → 新低 9.8(RSI 26.5)，两低点间隔足够
+_closes_t = [12, 12, 12, 12, 12, 10, 10, 10, 10.5, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11,
+             10.8, 10.5, 10.3, 9.95, 9.8, 9.8]
+_rsis_t = [50, 50, 50, 50, 50, 20, 20, 20, 30, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45,
+           40, 36, 33, 30, 26.5, 26.5]
+_out_t = None  # 底背离单测直接调用纯函数 _divergence_confirmed，不需要完整信号帧
+_div_true = m._divergence_confirmed(_div_frame(_closes_t, _rsis_t), cfg)
+checks.append(("底背离: 双低点价格降低+指标抬高 → 认定", bool(_div_true.iloc[-1]) is True))
+
+# 假背离（旧口径会误报）：价格低点处 RSI=30，窗口中段某日 RSI 低至 15（并非价格低点），
+# 今日新低 RSI=26 > 15+2（旧逻辑误报），但 26 < 30（新逻辑不认定）
+_closes_f = [12, 12, 12, 12, 12, 10, 10, 10, 10.4, 11, 11, 10.2, 11, 11, 11, 11, 11, 11, 10.8, 10.5,
+             10.3, 9.95, 9.8, 9.8, 9.8, 9.8]
+_rsis_f = [50, 50, 50, 50, 50, 30, 30, 30, 28, 45, 45, 15, 45, 45, 45, 45, 45, 45, 40, 36,
+           34, 32, 30, 28, 27, 26]
+_div_false = m._divergence_confirmed(_div_frame(_closes_f, _rsis_f), cfg)
+checks.append(("底背离: 指标最低点不在价格低点 → 不认定（修正误报）", bool(_div_false.iloc[-1]) is False))
+
+# --- 4) 量价质量分：收高位阳线满分；冲高回落降档 ---
+_q_a = m.compute_daily_signals(df_a, cfg).iloc[-1]
+checks.append(("量价: 放量阳线收高位=满分25", float(_q_a["vol_price_quality"]) == cfg.W_DAILY_VOL_PRICE))
+checks.append(("量价: 标签=放量企稳", str(_q_a["vol_price_label"]) == "放量企稳"))
+
+_closes_v = base_closes()
+_closes_v[-1] = _closes_v[-2] * 1.01      # 收盘仍略高于昨收（满足基础条件）
+_prev = _closes_v[-2]
+_df_v = make_df(_closes_v, last_vol_mult=3.0, last_open=_prev * 1.03,
+                last_high=_prev * 1.06, last_low=_prev * 0.995)
+_q_v = m.compute_daily_signals(_df_v, cfg).iloc[-1]
+checks.append(("量价: 冲高回落降档=10分", float(_q_v["vol_price_quality"]) == cfg.W_DAILY_VOL_PRICE_WEAK))
+checks.append(("量价: 标签=放量冲高回落", str(_q_v["vol_price_label"]) == "放量冲高回落"))
+
+# --- 5) 评级统一：等级=原始技术分定级（分数与等级同源），熊市只抬门槛不扣展示分 ---
+_sig_neu, _r_neu = m.evaluate(df_a, code="600000", name="测试", config=cfg,
+                              market_env=_NEUTRAL, fund_data=_FUND_OK)
+_sig_bear, _r_bear = m.evaluate(df_a, code="600000", name="测试", config=cfg,
+                                market_env={"regime": "bear"}, fund_data=_FUND_OK)
+checks.append(("评级: 中性通过", _r_neu == "PASS"))
+checks.append(("评级: 熊市高分仍通过", _r_bear == "PASS"))
+checks.append(("评级: 熊市等级与展示分数同源",
+               _r_bear == "PASS" and _sig_bear.grade == m._grade_from_score(_sig_bear.score, cfg)))
+
+# 恰好 60 分：中性达 B 级门槛放行、熊市门槛 +10=70 被否决（体现"门槛上浮"替代"扣分定级"）
+_cfg60 = replace(m.StrategyConfig(), W_DAILY_TREND_TURN=60.0, W_DAILY_RSI_REBOUND=0.0,
+                 DAILY_MULTI_RESONANCE_BONUS=0.0, DAILY_VOL_EXPAND=999.0)
+_sig60, _r60n = m.evaluate(df_a, code="600000", name="测试", config=_cfg60,
+                           market_env=_NEUTRAL, fund_data=_FUND_OK)
+_, _r60b = m.evaluate(df_a, code="600000", name="测试", config=_cfg60,
+                      market_env={"regime": "bear"}, fund_data=_FUND_OK)
+checks.append(("评级: 60分中性达B门槛放行", _r60n == "PASS" and _sig60.score == 60.0 and _sig60.grade == "B"))
+checks.append(("评级: 熊市60分<70被否决", _r60b == "FAIL_TECH"))
+
+# --- 6) 排序可复现：同分/同背离/同盈亏比时按股票代码升序（末级键） ---
+_rank_rows = pd.DataFrame([
+    {"code": "600001", "score": 65.0, "has_divergence": False, "rr_ratio": 1.6},
+    {"code": "000002", "score": 65.0, "has_divergence": False, "rr_ratio": 1.6},
+    {"code": "000003", "score": 70.0, "has_divergence": False, "rr_ratio": 1.5},
+])
+_ranked = m._rank_signals(_rank_rows)
+checks.append(("排序: 高分在前", _ranked.iloc[0]["code"] == "000003"))
+checks.append(("排序: 全同级按代码升序（可复现）", list(_ranked["code"])[1:] == ["000002", "600001"]))
+
+# --- 7) 周线数据充分性 / 时效（数据缺失 → 不可确认 → 待核验候选） ---
+checks.append(("周线: None数据不足→不可确认", m._weekly_trend_data_ok(None, cfg) is False))
+checks.append(("周线: 长度不足→不可确认", m._weekly_trend_data_ok(_w_up.head(5), cfg) is False))
+checks.append(("周线: 数据充分→可确认", m._weekly_trend_data_ok(_w_up, cfg) is True))
+checks.append(("周线MACD: None→不可确认", m._weekly_macd_data_ok(None, cfg) is False))
+checks.append(("周线MACD: 30根不足→不可确认", m._weekly_macd_data_ok(_w_up, cfg) is False))
+_w_long = pd.DataFrame({"date": pd.date_range("2025-01-01", periods=40, freq="W").strftime("%Y-%m-%d"),
+                        "close": np.linspace(10.0, 15.0, 40)})
+checks.append(("周线MACD: 充分(≥26+9根)→可确认", m._weekly_macd_data_ok(_w_long, cfg) is True))
+checks.append(("周线时效: 覆盖当周→新鲜", m._weekly_fresh_enough(_w_up, "2025-01-26") is True))
+checks.append(("周线时效: 截止过旧→不新鲜", m._weekly_fresh_enough(_w_up, "2026-09-11") is False))
+
+# --- 8) 三维展示（describe / describe_pending） ---
+_desc = m.describe(_sig_ok.to_dict())
+checks.append(("describe: 含基础评分等级", "评分:" in _desc and "级" in _desc))
+checks.append(("describe: 含入选依据", "入选依据" in _desc))
+checks.append(("describe: 含核验状态", "核验: 财务已核验" in _desc))
+_desc_p = m.describe_pending({"name": "测试", "code": "600000", "score": 65.0, "grade": "B",
+                              "fund_status": "missing", "weekly_status": "unverified",
+                              "missing_tags": "fund"})
+checks.append(("describe_pending: 说明财务/周线待核验", "财务" in _desc_p and "周线" in _desc_p))
 
 for label, ok in checks:
     print(f"[{'OK' if ok else 'FAIL'}] {label}")
