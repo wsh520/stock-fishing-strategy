@@ -26,6 +26,8 @@ Thumbs.db
 # Cache
 data_cache/
 cache/
+backtest_cache/
+backtest_output/
 
 # data/ 为 CI artifact 预留目录（当前策略不写入文件，见 README「运行方式」）
 !data/
