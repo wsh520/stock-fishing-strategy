@@ -110,7 +110,11 @@ def run(argv: list[str] | None = None):
         # Step 3: 推荐结果落库 MySQL（未配置环境变量时静默跳过，不影响主流程）
         t = time.time()
         logger.info("Step 3/4 推荐结果落库 MySQL...")
-        save_recommendations(output_df)
+        # 保底观察候选只用于通知/回测观察，不落库、不进入正式追踪归因
+        formal_output_df = output_df
+        if output_df is not None and not output_df.empty and "tier" in output_df.columns:
+            formal_output_df = output_df[output_df["tier"].fillna("formal") == "formal"].copy()
+        save_recommendations(formal_output_df)
         logger.info("Step 3/4 完成 (%.1f 秒)", time.time() - t)
 
         # Step 4: 发送选股结果通知

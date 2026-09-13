@@ -151,7 +151,7 @@ class StrategyConfig:
     MAX_VOL_RATIO: float = 4.0
     # 底部区域过滤：现价距近 N 日最高价回撤不足该比例，不符合抄底定位（可能只是上涨中继回调），直接否决
     DRAWDOWN_LOOKBACK: int = 60
-    MIN_DRAWDOWN_FROM_HIGH: float = 0.15
+    MIN_DRAWDOWN_FROM_HIGH: float = 0.10
     # 回撤上限：跌幅过深多为基本面恶化/退市风险（价值陷阱），并非健康底部，超过该比例则否决
     MAX_DRAWDOWN_FROM_HIGH: float = 0.70
     # 已反弹一段否决：近 N 日累计涨幅超过该值（%），说明底部反弹可能已走完，不再是介入点
@@ -159,6 +159,9 @@ class StrategyConfig:
     MAX_RECENT_GAIN_PCT: float = 12.0
     # 最终推荐数量上限：评分降序截取前 N 只（目标每日推荐 3~5 只）
     MAX_PICKS: int = 5
+    # 正式信号为空时，允许生成一只低置信度观察候选，避免每日完全无覆盖
+    ENABLE_DAILY_FALLBACK: bool = True
+    FALLBACK_MIN_SCORE: float = 40.0
     # 行业分散（组合层风控）：同一行业最多推荐的只数，避免 Top5 集中单一板块导致组合同涨同跌
     USE_INDUSTRY_DEDUP: bool = True
     MAX_PICKS_PER_INDUSTRY: int = 2
@@ -167,16 +170,16 @@ class StrategyConfig:
     # ===== 严格确认指标（提高胜率，进一步压缩低质量信号）=====
     # 区间位置过滤：现价在近 N 日价格区间（最低~最高）中的位置超过该比例，判定不够低位，否决
     RANGE_LOOKBACK: int = 20
-    POSITION_IN_RANGE_MAX: float = 0.35
+    POSITION_IN_RANGE_MAX: float = 0.50
     # MACD 动能确认：要求 MACD 柱当日较昨日改善（绿柱缩短或红柱放大）
     REQUIRE_MACD_MOMENTUM: bool = True
     # MACD 柱需连续改善的天数（1=仅当日较昨日；2=连续两日改善，过滤单日反抽）
-    MACD_MOMENTUM_DAYS: int = 2
+    MACD_MOMENTUM_DAYS: int = 1
     # KDJ 确认：要求 KDJ 处于金叉状态（K>D）且 K 值不高于该上限（避免高位接力）
     REQUIRE_KDJ_GOLDEN: bool = True
-    KDJ_K_MAX: float = 55.0
+    KDJ_K_MAX: float = 65.0
     # KDJ 动能：要求 K 值较昨日上行（仅 K>D 不够，K 掉头时容易误判为金叉）
-    REQUIRE_KDJ_RISING: bool = True
+    REQUIRE_KDJ_RISING: bool = False
     # 周线趋势确认：仅对通过全部日线筛选的决赛圈股票拉取周线；
     # WEEKLY_MA_BOTH_REQUIRED=True 时须同时满足「收盘站上周线 MA10（容忍 2%）」和「MA10 在上行」，
     # 设为 False 退回旧行为（两条件满足其一即可）
@@ -1616,7 +1619,39 @@ def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] 
         if pass_tech > 0: print(f"5. 盈亏风控比达标: {pass_rr} 只 (淘汰 {stats['fail_rr']} 只，通过率 {pass_rr/pass_tech*100:.1f}%)")
         print("="*50 + "\n")
 
-        if not signals:
+        # 正式技术信号为空时，使用放宽技术确认的观察候选模式。
+        # 核心行情安全条件仍由 evaluate() 保留；仅降低评分/确认门槛，明确标记 fallback。
+        if not signals and config.ENABLE_DAILY_FALLBACK:
+            relaxed = StrategyConfig(**{**asdict(config),
+                "MIN_PASS_GRADE": "C",
+                "REQUIRE_MACD_MOMENTUM": False,
+                "REQUIRE_KDJ_GOLDEN": False,
+                "POSITION_IN_RANGE_MAX": max(config.POSITION_IN_RANGE_MAX, 0.60),
+                "DAILY_RSI_ENTRY_MAX": max(config.DAILY_RSI_ENTRY_MAX, 65.0),
+            })
+            fallback_candidates: list[dict] = []
+            for stock in stock_list:
+                try:
+                    daily_df = get_daily_data(stock["code"], config, cache)
+                    if daily_df is None: continue
+                    sig, reason = evaluate(daily_df, stock["code"], stock["name"], relaxed,
+                                            market_env, get_fundamentals(stock["code"], cache, config),
+                                            latest_trade_date=latest_trade_date)
+                    if sig is not None:
+                        row = sig.to_dict()
+                        row["tier"] = "fallback"
+                        row["fallback_reason"] = "严格技术筛选无结果，使用放宽确认条件的最高分候选"
+                        fallback_candidates.append(row)
+                except Exception:
+                    continue
+            if fallback_candidates:
+                fallback_candidates.sort(key=lambda r: (-float(r.get("score", 0) or 0), str(r.get("code", ""))))
+                chosen = fallback_candidates[0]
+                print(f"[INFO] 保底观察候选：{chosen.get('name')}({chosen.get('code')})，"
+                      f"评分 {chosen.get('score')}，未计入正式推荐")
+                if pending_out is not None:
+                    pending_out.extend(fallback_candidates[1:])
+                return pd.DataFrame([chosen])
             print("[INFO] 未发现符合条件的信号")
             return None
 
@@ -1731,6 +1766,23 @@ def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] 
                 if len(keep_rows) < len(df):
                     print(f"[INFO] 财务核验后保留 {len(keep_rows)}/{len(df)} 只（未核验/补齐后被否决的不进入正式推荐）")
                 df = pd.DataFrame(keep_rows).reset_index(drop=True) if keep_rows else df.iloc[0:0]
+
+        # 保底观察候选：正式推荐为空时，从技术面已通过但周线/财务待核验的候选中选评分最高者。
+        # 该候选明确标记为 fallback，不改变正式推荐的严格口径，也不应直接用于实盘买入。
+        if df.empty and config.ENABLE_DAILY_FALLBACK and pending_list:
+            eligible = [r for r in pending_list
+                        if float(r.get("score", 0) or 0) >= config.FALLBACK_MIN_SCORE]
+            if eligible:
+                eligible.sort(key=lambda r: (-float(r.get("score", 0) or 0), str(r.get("code", ""))))
+                fallback = dict(eligible[0])
+                fallback["tier"] = "fallback"
+                fallback["fallback_reason"] = "正式推荐为空，技术面最高分待核验候选"
+                fallback["weekly_status"] = fallback.get("weekly_status", "unverified")
+                fallback["fund_status"] = fallback.get("fund_status", "missing")
+                df = pd.DataFrame([fallback])
+                pending_list = [r for r in pending_list if str(r.get("code")) != str(fallback.get("code"))]
+                print(f"[INFO] 保底观察候选：{fallback.get('name')}({fallback.get('code')})，"
+                      f"评分 {fallback.get('score')}，未计入正式推荐")
 
         if pending_out is not None:
             pending_out.extend(pending_list)

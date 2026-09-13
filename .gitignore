@@ -34,3 +34,4 @@ backtest_output/
 
 .cleanup_backup
 .workbuddy
+backtest_cache_ak/

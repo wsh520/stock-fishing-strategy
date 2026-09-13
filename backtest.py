@@ -64,6 +64,8 @@ from src.bottom_fishing_strategy import (  # noqa: E402
     StrategyConfig,
     _format_bs_code,
     _normalize_bs_hist,
+    _normalize_ak_hist,
+    _ak_symbol,
     _apply_pool_filters,
     _quarter_candidates,
     _rank_signals,
@@ -121,6 +123,9 @@ class BacktestConfig:
     WORKERS: int = 6                   # prefetch 进程数 / replay 线程数
     FILL_OPTIONAL_FUNDAMENTALS: bool = False   # 决赛圈是否用 AkShare 补齐商誉/扣非（慢，默认关）
     LIMIT: int = 0                     # >0 时只取股票池前 N 只（冒烟测试用）
+    # 行情数据源：baostock（默认）/ akshare（东财+新浪，独立通道，baostock 被限流时用）
+    DATA_SOURCE: str = "baostock"
+    REFRESH: bool = False              # True 时预取忽略已有缓存，全部重新从接口拉取
 
     def data_end(self) -> str:
         return self.DATA_END or datetime.now().strftime("%Y-%m-%d")
@@ -189,6 +194,142 @@ def _fetch_hist(code: str, start: str, end: str, freq: str = "d", fields: str = 
     return None
 
 
+# ---------------------------------------------------------------------------
+# 数据抓取（AkShare 直连：东财 + 新浪双通道，独立于 baostock，不受其限流影响）
+# ---------------------------------------------------------------------------
+
+def _ak_import():
+    try:
+        import akshare as ak  # noqa: PLC0415
+        return ak
+    except ImportError:
+        logger.error("未安装 akshare，无法使用 --source akshare")
+        return None
+
+
+def _fetch_hist_ak(code: str, start: str, end: str, adjust: str = "qfq",
+                   max_retry: int = 4) -> Optional[pd.DataFrame]:
+    """AkShare 按显式日期区间取个股日线，标准化为与 baostock 缓存同构的列。
+    通道1=东方财富 stock_zh_a_hist（含 pct_chg/turnover）；通道2=新浪 stock_zh_a_daily 兜底。"""
+    ak = _ak_import()
+    if ak is None:
+        return None
+    symbol = _ak_symbol(code)
+    s, e = start.replace("-", ""), end.replace("-", "")
+    for attempt in range(max_retry):
+        try:
+            raw = ak.stock_zh_a_hist(symbol=symbol, period="daily",
+                                     start_date=s, end_date=e, adjust=adjust)
+            df = _normalize_ak_hist(raw)
+            if df is not None and not df.empty:
+                return df
+        except Exception as ex:  # noqa: BLE001
+            if attempt == max_retry - 1:
+                logger.debug("ak(东财)取数失败 %s(%s~%s): %s", code, start, end, ex)
+        time.sleep(0.4 * (attempt + 1))
+    # 新浪兜底（返回全量历史，需截窗；无 pct_chg，用收盘价自算）
+    try:
+        sina_sym = f"sh{symbol}" if symbol.startswith("6") else f"sz{symbol}"
+        raw = ak.stock_zh_a_daily(symbol=sina_sym, adjust=adjust)
+        if raw is not None and not raw.empty and "date" in raw.columns:
+            keep = [c for c in ("date", "open", "high", "low", "close", "volume", "amount", "turnover") if c in raw.columns]
+            df = raw[keep].copy()
+            df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+            for col in ("open", "high", "low", "close", "volume", "amount", "turnover"):
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
+            df = df.dropna(subset=["date", "close"]).sort_values("date")
+            df["pct_chg"] = df["close"].pct_change() * 100
+            df = df[(df["date"] >= start) & (df["date"] <= end)].reset_index(drop=True)
+            return df if not df.empty else None
+    except Exception as ex:  # noqa: BLE001
+        logger.debug("ak(新浪)取数失败 %s: %s", code, ex)
+    return None
+
+
+def _fetch_index_ak(start: str, end: str, symbol: str = "sh000300",
+                    max_retry: int = 4) -> Optional[pd.DataFrame]:
+    """AkShare 取沪深300指数日线（stock_zh_index_daily 返回全量历史，截取到 [start,end]）。
+    指数无 pct_chg/turnover，pct_chg 用收盘价自算；市场环境仅需 close。"""
+    ak = _ak_import()
+    if ak is None:
+        return None
+    for attempt in range(max_retry):
+        try:
+            raw = ak.stock_zh_index_daily(symbol=symbol)
+            if raw is not None and "date" in raw.columns and "close" in raw.columns:
+                df = raw.copy()
+                df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+                for col in ("open", "high", "low", "close", "volume"):
+                    if col in df.columns:
+                        df[col] = pd.to_numeric(df[col], errors="coerce")
+                df = df.dropna(subset=["date", "close"]).sort_values("date")
+                df["pct_chg"] = df["close"].pct_change() * 100
+                df = df[(df["date"] >= start) & (df["date"] <= end)].reset_index(drop=True)
+                if not df.empty:
+                    return df
+        except Exception as ex:  # noqa: BLE001
+            if attempt == max_retry - 1:
+                logger.debug("ak 指数取数失败 %s: %s", symbol, ex)
+        time.sleep(0.5 * (attempt + 1))
+    return None
+
+
+def _fetch_pool_ak(config: StrategyConfig, max_retry: int = 4) -> Optional[pd.DataFrame]:
+    """AkShare 取全 A 股代码/名称列表，复用实盘 _apply_pool_filters 过滤到主板非 ST。
+    注意：为当前快照（非严格 as-of BT_START），退市股可能缺失，属可接受的轻微幸存者偏差。"""
+    ak = _ak_import()
+    if ak is None:
+        return None
+    for attempt in range(max_retry):
+        try:
+            raw = ak.stock_info_a_code_name()
+            if raw is not None and "code" in raw.columns and "name" in raw.columns:
+                df = raw[["code", "name"]].copy()
+                df["code"] = df["code"].astype(str).str.zfill(6)
+                df["name"] = df["name"].astype(str)
+                return _apply_pool_filters(df, config)
+        except Exception as ex:  # noqa: BLE001
+            if attempt == max_retry - 1:
+                logger.debug("ak 股票池取数失败: %s", ex)
+        time.sleep(1.0 * (attempt + 1))
+    return None
+
+
+def _fetch_industry_ak(max_retry: int = 3) -> dict:
+    """AkShare 构建 6 位代码 -> 行业名 映射（东财行业板块 + 成分股）。
+    仅用于决赛圈行业分散；失败时返回空 dict，调用方降级为不做行业去重（不阻断选股）。"""
+    ak = _ak_import()
+    if ak is None:
+        return {}
+    out: dict[str, str] = {}
+    names: list = []
+    for attempt in range(max_retry):
+        try:
+            boards = ak.stock_board_industry_name_em()
+            if boards is not None and "板块名称" in boards.columns:
+                names = boards["板块名称"].dropna().astype(str).tolist()
+                break
+        except Exception as ex:  # noqa: BLE001
+            logger.debug("ak 行业板块列表失败(%d/%d): %s", attempt + 1, max_retry, ex)
+        time.sleep(1.0 * (attempt + 1))
+    if not names:
+        return {}
+    for i, nm in enumerate(names, 1):
+        for attempt in range(2):
+            try:
+                cons = ak.stock_board_industry_cons_em(symbol=nm)
+                if cons is not None and "代码" in cons.columns:
+                    for c in cons["代码"].astype(str).str.zfill(6):
+                        out.setdefault(c, nm)
+                break
+            except Exception:  # noqa: BLE001
+                time.sleep(0.5 * (attempt + 1))
+        if i % 20 == 0:
+            logger.info("  行业映射进度 %d/%d 板块，累计 %d 条", i, len(names), len(out))
+    return out
+
+
 # ---- prefetch 子进程 worker（每个进程独立登录 baostock）----
 
 _W_BC: Optional[BacktestConfig] = None
@@ -225,12 +366,15 @@ def _worker_fetch_panel(code: str) -> tuple[str, bool]:
 def fetch_index_panel(bc: BacktestConfig) -> pd.DataFrame:
     """沪深300日线面板（市场环境 + 交易日历 + 数据时效基准）。"""
     path = _meta_path(bc, f"index_{bc.DATA_START}_{bc.data_end()}.csv")
-    if os.path.exists(path):
+    if os.path.exists(path) and not bc.REFRESH:
         df = pd.read_csv(path, dtype={"date": str})
         if not df.empty:
             return df
-    df = _fetch_hist("000300", bc.DATA_START, bc.data_end(), freq="d",
-                     fields="date,open,high,low,close,volume,amount,pctChg")
+    if bc.DATA_SOURCE == "akshare":
+        df = _fetch_index_ak(bc.DATA_START, bc.data_end())
+    else:
+        df = _fetch_hist("000300", bc.DATA_START, bc.data_end(), freq="d",
+                         fields="date,open,high,low,close,volume,amount,pctChg")
     if df is None or df.empty:
         raise RuntimeError("无法获取沪深300指数行情，回测终止")
     df.to_csv(path, index=False)
@@ -240,10 +384,17 @@ def fetch_index_panel(bc: BacktestConfig) -> pd.DataFrame:
 def fetch_pool(bc: BacktestConfig, config: StrategyConfig) -> pd.DataFrame:
     """股票池（as-of BT_START 最近的交易日，减少幸存者偏差），复用实盘 _apply_pool_filters。"""
     path = _meta_path(bc, f"pool_{bc.BT_START}.csv")
-    if os.path.exists(path):
+    if os.path.exists(path) and not bc.REFRESH:
         df = pd.read_csv(path, dtype={"code": str, "name": str})
         if not df.empty:
             return df
+    if bc.DATA_SOURCE == "akshare":
+        df = _fetch_pool_ak(config)
+        if df is None or df.empty:
+            raise RuntimeError("无法获取股票列表（AkShare），回测终止")
+        logger.info("股票池（AkShare 当前快照，主板非 ST）：%d 只", len(df))
+        df.to_csv(path, index=False)
+        return df
     # 从 BT_START 向前找最近的交易日拉取当日全部证券
     raw = None
     start = datetime.strptime(bc.BT_START, "%Y-%m-%d")
@@ -272,12 +423,20 @@ def fetch_pool(bc: BacktestConfig, config: StrategyConfig) -> pd.DataFrame:
 def fetch_industry(bc: BacktestConfig) -> dict:
     """行业分类（6位代码 -> 行业名），用于行业分散。一次性拉取。"""
     path = _meta_path(bc, "industry.json")
-    if os.path.exists(path):
+    if os.path.exists(path) and not bc.REFRESH:
         try:
             with open(path, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception:  # noqa: BLE001
             pass
+    if bc.DATA_SOURCE == "akshare":
+        out = _fetch_industry_ak()
+        if out:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(out, f, ensure_ascii=False)
+        else:
+            logger.warning("AkShare 行业映射获取失败，降级为不做行业分散（不影响其余筛选）")
+        return out
     out: dict[str, str] = {}
     with bs_lock:
         rs = bs.query_stock_industry()
@@ -392,9 +551,69 @@ def fetch_fundamentals_asof(bc: BacktestConfig, code: str, as_of: str) -> Option
 # prefetch 编排
 # ---------------------------------------------------------------------------
 
+def _ak_fetch_panel(bc: BacktestConfig, code: str) -> tuple[str, bool]:
+    """AkShare 抓取单只股票日线面板并落盘缓存。返回 (code, ok)。"""
+    path = _daily_cache_path(bc, code)
+    df = _fetch_hist_ak(code, bc.DATA_START, bc.data_end(), adjust=StrategyConfig().ADJUST)
+    if df is None or df.empty:
+        try:
+            pd.DataFrame(columns=["date"]).to_csv(path, index=False)
+        except Exception:  # noqa: BLE001
+            pass
+        return code, False
+    try:
+        df.to_csv(path, index=False)
+    except Exception:  # noqa: BLE001
+        return code, False
+    return code, True
+
+
+def _cmd_prefetch_ak(bc: BacktestConfig, config: StrategyConfig) -> None:
+    """AkShare 直连预取：指数 / 股票池 / 行业 + 全池日线面板（多线程，无需 baostock 登录）。"""
+    logger.info("[AkShare] 预取指数面板 / 股票池 / 行业分类 ...")
+    idx = fetch_index_panel(bc)
+    pool = fetch_pool(bc, config)
+    ind = fetch_industry(bc)
+    logger.info("[AkShare] 指数 %d 根；股票池 %d 只；行业映射 %d 条", len(idx), len(pool), len(ind))
+
+    codes = pool["code"].astype(str).tolist()
+    if bc.LIMIT > 0:
+        codes = codes[: bc.LIMIT]
+    if bc.REFRESH:
+        todo = list(codes)
+    else:
+        todo = [c for c in codes if not (os.path.exists(_daily_cache_path(bc, c)) and os.path.getsize(_daily_cache_path(bc, c)) > 0)]
+    logger.info("[AkShare] 需抓取日线面板 %d 只（跳过已缓存 %d 只），线程数 %d",
+                len(todo), len(codes) - len(todo), bc.WORKERS)
+    if not todo:
+        logger.info("[AkShare] 全部面板已缓存，prefetch 完成")
+        return
+
+    t0 = time.time()
+    done = ok = 0
+    with ThreadPoolExecutor(max_workers=bc.WORKERS) as ex:
+        futures = [ex.submit(_ak_fetch_panel, bc, c) for c in todo]
+        for fut in as_completed(futures):
+            try:
+                _code, good = fut.result()
+                ok += 1 if good else 0
+            except Exception:  # noqa: BLE001
+                pass
+            done += 1
+            if done % 200 == 0 or done == len(todo):
+                el = time.time() - t0
+                eta = el / done * (len(todo) - done)
+                logger.info("  [AkShare] 面板抓取进度 %d/%d（有数据 %d）已用 %.1f 分钟，预计剩余 %.1f 分钟",
+                            done, len(todo), ok, el / 60, eta / 60)
+    logger.info("[AkShare] prefetch 完成：成功 %d / %d，用时 %.1f 分钟", ok, len(todo), (time.time() - t0) / 60)
+
+
 def cmd_prefetch(bc: BacktestConfig) -> None:
     _ensure_dirs(bc)
     config = StrategyConfig()
+    if bc.DATA_SOURCE == "akshare":
+        _cmd_prefetch_ak(bc, config)
+        return
     if not _bs_login_safe():
         raise RuntimeError("baostock 登录失败，无法预取数据")
     try:
@@ -608,12 +827,16 @@ def replay(bc: BacktestConfig, config: StrategyConfig) -> tuple[list, list, pd.D
     _ensure_dirs(bc)
     # 行情面板走磁盘缓存，筛选阶段无需联网；baostock 仅决赛圈拉基本面时需要。
     # 登录失败（如被限流/黑名单）不致命：继续重放，决赛圈基本面缺失的候选降级为待核验。
-    bs_ok = _bs_login_safe(max_retry=2)
     global _BS_OK
-    _BS_OK = bs_ok
-    if not bs_ok:
-        logger.warning("baostock 登录失败（可能被限流/黑名单）；行情走缓存继续重放，"
-                       "决赛圈基本面将尝试 AkShare 兜底，仍缺失则相关候选降级为待核验")
+    if bc.DATA_SOURCE == "akshare":
+        _BS_OK = False
+        logger.info("数据源=AkShare：跳过 baostock 登录，决赛圈基本面走 AkShare as-of 兜底")
+    else:
+        bs_ok = _bs_login_safe(max_retry=2)
+        _BS_OK = bs_ok
+        if not bs_ok:
+            logger.warning("baostock 登录失败（可能被限流/黑名单）；行情走缓存继续重放，"
+                           "决赛圈基本面将尝试 AkShare 兜底，仍缺失则相关候选降级为待核验")
     try:
         index = fetch_index_panel(bc)
         pool = fetch_pool(bc, config)
@@ -1089,6 +1312,13 @@ def _apply_args(bc: BacktestConfig, args: argparse.Namespace) -> BacktestConfig:
         bc.ENTRY_MODE = args.entry
     if getattr(args, "fill_fund", False):
         bc.FILL_OPTIONAL_FUNDAMENTALS = True
+    if getattr(args, "source", None):
+        bc.DATA_SOURCE = args.source
+    if getattr(args, "refresh", False):
+        bc.REFRESH = True
+    if bc.DATA_SOURCE == "akshare":
+        # 与 baostock 旧缓存物理隔离，确保本次数据全部来自 akshare 接口
+        bc.CACHE_DIR = os.path.join(_PROJECT_ROOT, "backtest_cache_ak")
     return bc
 
 
@@ -1101,6 +1331,8 @@ def _add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--max-hold-days", dest="max_hold_days", type=int, help="最多持有 N 个交易日（默认 0=持有到数据期末）")
     p.add_argument("--entry", choices=["next_open", "rec_close"], help="买入价口径")
     p.add_argument("--fill-fund", action="store_true", help="决赛圈用 AkShare 补齐商誉/扣非（慢）")
+    p.add_argument("--source", choices=["baostock", "akshare"], help="行情数据源（baostock 被限流时用 akshare 直连）")
+    p.add_argument("--refresh", action="store_true", help="忽略已有缓存，全部重新从接口拉取")
 
 
 def main(argv: Optional[list] = None) -> None:
