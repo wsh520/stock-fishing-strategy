@@ -7,6 +7,7 @@
 """
 import os
 import sys
+import tempfile
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
 
@@ -16,6 +17,10 @@ import pandas as pd
 import bottom_fishing_strategy as m
 
 LATEST = "2025-06-27"  # 基准交易日（周五）
+
+# regime 滞回状态会写入 CACHE_DIR/market_regime_state.json——测试改用独立临时目录，
+# 避免污染生产缓存影响下一次真实运行
+_TMP_CACHE = tempfile.TemporaryDirectory(prefix="bf_test_cache_")
 
 _FAILS: list[str] = []
 
@@ -87,6 +92,7 @@ def main() -> int:
     cfg = m.StrategyConfig()
     cfg.FETCH_DELAY = 0.0
     cfg.MAX_WORKERS = 1
+    cfg.CACHE_DIR = _TMP_CACHE.name
     pending: list[dict] = []
     df = m.main(config=cfg, cache=m.CacheManager(), pending_out=pending)
     check("周线路径: 正式推荐 1 只（财务完整者）",
@@ -113,6 +119,7 @@ def main() -> int:
     cfg2 = m.StrategyConfig()
     cfg2.FETCH_DELAY = 0.0
     cfg2.MAX_WORKERS = 1
+    cfg2.CACHE_DIR = _TMP_CACHE.name
     cfg2.REQUIRE_WEEKLY_TREND = False
     cfg2.REQUIRE_WEEKLY_MACD_STABLE = False
     pending2: list[dict] = []

@@ -162,6 +162,7 @@ def run(argv: list[str] | None = None):
                     report_rows.append({
                         "name": name,
                         "code": code,
+                        "strategy": str(rec.get("strategy") or "bottom_fishing"),
                         "status": f"第{week_no}/{TRACK_MAX_WEEKS}周",
                         "rec_price": float(rec["rec_close"]),
                         "current_price": close_price,

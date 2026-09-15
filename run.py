@@ -114,14 +114,15 @@ def run(argv: list[str] | None = None):
         formal_output_df = output_df
         if output_df is not None and not output_df.empty and "tier" in output_df.columns:
             formal_output_df = output_df[output_df["tier"].fillna("formal") == "formal"].copy()
-        save_recommendations(formal_output_df)
+        save_recommendations(formal_output_df, strategy="bottom_fishing")
         logger.info("Step 3/4 完成 (%.1f 秒)", time.time() - t)
 
         # Step 4: 发送选股结果通知
         t = time.time()
         logger.info("Step 4/4 发送飞书通知...")
         pending_df = pd.DataFrame(pending_rows) if pending_rows else None
-        notify_screening_result(output_df, market_env=market_env_desc, pending=pending_df)
+        notify_screening_result(output_df, market_env=market_env_desc, pending=pending_df,
+                                strategy="bottom_fishing")
         logger.info("Step 4/4 完成 (%.1f 秒)", time.time() - t)
 
         logger.info("任务全部完成，总耗时 %.1f 分钟", (time.time() - t_start) / 60)

@@ -31,17 +31,15 @@ from __future__ import annotations
 
 import logging
 import sys
-import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, asdict
-from datetime import datetime
 from typing import Optional
 
 import numpy as np
 import pandas as pd
+from numpy.lib.stride_tricks import sliding_window_view
 
-# 复用抄底策略的数据层、市场环境、基本面、周线确认、Baostock 生命周期
+# 复用抄底策略的数据层、市场环境、基本面、周线确认、Baostock 生命周期、并发筛选骨架
 from src.bottom_fishing_strategy import (
     StrategyConfig,
     CacheManager,
@@ -50,25 +48,22 @@ from src.bottom_fishing_strategy import (
     _bs_logout,
     _bs_state,
     _AK_AVAILABLE,
+    _beijing_now,
     _effective_regime,
     _fetch_weekly_dual,
+    _fmt_cell,
     _GRADE_ORDER,
     _grade_from_score,
     check_fundamentals,
     check_weekly_macd,
     check_weekly_trend,
+    fetch_stats,
     get_daily_data,
     get_fundamentals,
     get_market_environment,
     get_stock_list,
+    run_concurrent_screen,
 )
-
-# Older bottom-fishing revisions do not expose the shared fetch counters. Keep
-# the breakout module importable for offline backtests in that case.
-try:
-    from src.bottom_fishing_strategy import fetch_stats  # type: ignore
-except ImportError:
-    fetch_stats = {"bs_ok": 0, "ak_ok": 0, "fail": 0}
 
 logger = logging.getLogger("strategy.breakout")
 
@@ -160,7 +155,8 @@ class VolumeBreakoutConfig(StrategyConfig):
     FIXED_STOP_LOSS_PCT_BREAKOUT: float = 6.0
     FIXED_TAKE_PROFIT_PCT_BREAKOUT: float = 15.0
     ATR_STOP_MULT_BREAKOUT: float = 1.0
-    MIN_RR_RATIO_BREAKOUT: float = 1.5       # 计划收益风险比下限
+    # （已删除 MIN_RR_RATIO_BREAKOUT：止损≤6%/止盈15% 下 RR≥2.5 恒成立，检查永不触发；
+    #   rr_ratio 仅作展示与落库，波动率风控由 MAX_ATR_PCT_BREAKOUT 承担）
     ATR_TAKE_PROFIT_MULT: float = 5.0        # ATR 目标与固定目标取较近者
     TIME_STOP_DAYS: int = 5                 # 回测中无延续的时间止损
     TRAILING_ATR_MULT: float = 2.0          # 回测移动止损倍数
@@ -177,7 +173,7 @@ class VolumeBreakoutConfig(StrategyConfig):
     BEAR_GRADE_BOOST_BREAKOUT: float = 15.0  # 熊市评分门槛提升（比抄底 10 严）
 
     # ===== 评分权重（合计 100）=====
-    W_BREAKOUT: float = 35.0                 # 突破强度
+    W_BREAKOUT: float = 35.0                 # 突破强度（0.55×级别 + 0.45×幅度 加法混合）
     W_VOLUME_BR: float = 25.0                # 量能质量
     W_PATTERN: float = 15.0                  # 平台整理
     W_TREND_BR: float = 15.0                 # 趋势背景
@@ -243,9 +239,12 @@ def compute_breakout_signals(df: pd.DataFrame, config: VolumeBreakoutConfig) -> 
     # 盘中运行时，数据源可能已经返回当天尚未收盘的日 bar。该 bar 的
     # high/low/volume/pct_chg 会继续变化，若参与突破判断会产生盘中漂移。
     # 15:00 前剔除日期为今天的最后一根；收盘后保留已完成 bar。
+    # 注意必须用北京时间：GitHub Actions runner 为 UTC，若用本地时区，
+    # UTC 15:00（= 北京 23:00）前的所有运行都会把「当日已收盘 bar」误剔除，
+    # 导致信号系统性滞后一天（北京 15:25 = UTC 07:25 的定时运行曾中招）。
     if "date" in out.columns and not out.empty:
         _dates = pd.to_datetime(out["date"], errors="coerce")
-        _now = datetime.now()
+        _now = _beijing_now()
         if (_now.hour < 15 and pd.notna(_dates.iloc[-1])
                 and _dates.iloc[-1].date() == _now.date()):
             out = out.iloc[:-1].reset_index(drop=True)
@@ -295,8 +294,20 @@ def compute_breakout_signals(df: pd.DataFrame, config: VolumeBreakoutConfig) -> 
     out["daily_vol_base"] = out["volume"].shift(1).rolling(20).mean()
     out["daily_vol_ratio"] = out["volume"] / out["daily_vol_base"].replace(0, np.nan)
     # 自身历史分位数与相对成交额补充固定量比，避免只看绝对规模。
-    out["volume_percentile"] = out["volume"].rolling(config.ADAPTIVE_VOLUME_LOOKBACK + 1).apply(
-        lambda x: float(np.mean(x[:-1] <= x[-1])), raw=True)
+    # 向量化实现（sliding_window_view）：等价于 rolling(w).apply(np.mean(x[:-1] <= x[-1]))，
+    # 但避免逐窗口 Python 回调——全市场 5000+ 股票 × 120 根 × 61 窗的回调是主要 CPU 热点。
+    # NaN 语义与原实现一致（NaN 参与比较恒为 False）。
+    _vol_arr = out["volume"].to_numpy(dtype=float)
+    _w = config.ADAPTIVE_VOLUME_LOOKBACK + 1
+    if len(_vol_arr) >= _w:
+        _win = sliding_window_view(_vol_arr, _w)
+        _pct = (_win[:, :-1] <= _win[:, -1:]).mean(axis=1)
+        # 与 pandas rolling 语义平价：min_periods 按非 NaN 观测数计数，
+        # 窗口内含任意 NaN（有效观测 < 窗口长度）→ 结果为 NaN
+        _pct = np.where((~np.isnan(_win)).all(axis=1), _pct, np.nan)
+        out["volume_percentile"] = np.concatenate([np.full(_w - 1, np.nan), _pct])
+    else:
+        out["volume_percentile"] = np.nan
     out["amount_ratio"] = out["amount"] / out["amount"].shift(1).rolling(20).median().replace(0, np.nan)
     if "turnover" in out.columns:
         out["daily_to_base"] = out["turnover"].shift(1).rolling(config.DAILY_TURNOVER_LOOKBACK).mean()
@@ -348,32 +359,30 @@ def compute_breakout_signals(df: pd.DataFrame, config: VolumeBreakoutConfig) -> 
     )
 
     # ----- 近期假突破过滤：近 N 日是否曾「突破 L1 后 3 日内收盘跌回 L1 下方」-----
-    # 触发条件：某日 close > L1 × (1+margin)，但随后 3 日内出现 close < L1
-    broke_l1 = brk_l1.astype(int)
-    # 滚动窗口：近 FAILED_BREAKOUT_LOOKBACK 日内，存在「突破日 + 之后跌回日」配对
-    failed_pattern = pd.Series(False, index=out.index)
-    lookback = config.FAILED_BREAKOUT_LOOKBACK
-    # 事件锚定在突破日的 L1，而不是把每个后续交易日的动态 L1
-    # 当作回测基准。只有突破后 3 个交易日内收盘跌回该突破日 L1 下方，
-    # 才算一次失败突破；该事件在随后 lookback 日内抑制新的信号。
-    for i in range(len(out)):
-        start = max(0, i - lookback)
-        for j in range(start, i):
-            if not broke_l1.iloc[j]:
-                continue
-            anchor = out["level_l1"].iloc[j]
-            if pd.isna(anchor):
-                continue
-            # 仅检查突破后第 1~3 个交易日，且失败事件发生后 lookback
-            # 天内才抑制；这样不会因“突破日距今很近”而缩短冷却期。
-            end = min(len(out), j + config.FAILED_BREAKOUT_CONFIRM_DAYS + 1)
-            for k in range(j + 1, end):
-                if k <= i and out["close"].iloc[k] < float(anchor) and i - k < lookback:
-                    failed_pattern.iloc[i] = True
-                    break
-            if failed_pattern.iloc[i]:
+    # 事件锚定在突破日的 L1（而非后续交易日的动态 L1）：突破日 j 之后 1~CONFIRM_DAYS
+    # 个交易日内收盘价跌回 anchor 下方 → 记一次失败事件（发生于 k）；
+    # 该事件在区间 [k, j+LOOKBACK] 内抑制新信号（含两端，与原三重循环逐日口径等价：
+    # 原条件 j∈[i-LOOKBACK, i) 且 k≤i 且 i-k<LOOKBACK ⟺ i∈[k, j+LOOKBACK]）。
+    # 向量化实现：突破日逐一定位失败日（通常 <10 个），用差分数组标记抑制区间，
+    # 替代原 O(n×LOOKBACK×CONFIRM_DAYS) 三重 Python 循环（全市场扫描的主要 CPU 热点）。
+    _broke = brk_l1.to_numpy(dtype=bool)
+    _anchor = out["level_l1"].to_numpy(dtype=float)
+    _close_arr = out["close"].to_numpy(dtype=float)
+    _n = len(out)
+    _lookback = config.FAILED_BREAKOUT_LOOKBACK
+    _confirm = config.FAILED_BREAKOUT_CONFIRM_DAYS
+    _diff = np.zeros(_n + 1, dtype=float)
+    for _j in np.flatnonzero(_broke):
+        _a = _anchor[_j]
+        if np.isnan(_a):
+            continue
+        _end = min(_n, _j + _confirm + 1)
+        for _k in range(_j + 1, _end):
+            if _close_arr[_k] < _a:
+                _diff[_k] += 1
+                _diff[min(_n, _j + _lookback + 1)] -= 1
                 break
-    out["recent_failed_breakout"] = failed_pattern
+    out["recent_failed_breakout"] = pd.Series(np.cumsum(_diff)[:_n] > 0, index=out.index)
 
     # ----- 平台整理判定 -----
     # 近 PLATFORM_LOOKBACK 日振幅（不含当日，用 shift(1) 避免当日突破被计入平台）
@@ -421,10 +430,14 @@ def compute_breakout_signals(df: pd.DataFrame, config: VolumeBreakoutConfig) -> 
     # 评分维度（合计 100）
     # =========================================================================
 
-    # ----- W_BREAKOUT=35：突破级别 × 突破幅度 -----
+    # ----- W_BREAKOUT=35：突破级别与突破幅度（加法混合，替代旧纯乘法）-----
+    # 旧实现 level_factor × margin_factor：L2/L3 的级别系数（0.75/0.5）把幅度分压得
+    # 极低（常规 1-2% 幅度下 L2 仅 ~4 分），B 级 60 准入下 L2/L3 事实上无法通过，
+    # 等于只推 L1，信号稀疏。改为 0.55×级别 + 0.45×幅度 的加法混合：
+    # L1 深度突破仍最高（~30 分），L2 常规突破 ~18 分，配合其他维度可达成 B 级准入。
     level_factor = out["breakout_level"].map({3: 1.0, 2: 0.75, 1: 0.5}).fillna(0.0)
     margin_factor = _smoothstep(out["breakout_margin"], config.BREAKOUT_MIN_MARGIN * 100, 5.0)
-    out["breakout_score"] = config.W_BREAKOUT * level_factor * margin_factor
+    out["breakout_score"] = config.W_BREAKOUT * (0.55 * level_factor + 0.45 * margin_factor)
 
     # ----- W_VOLUME_BR=25：放量倍数 + 突破前整理充分度（加权加法，避免单维度归零拖垮整体）-----
     # 旧实现用乘法 vol_quality × compression_quality，多日突破行情下 compression_quality
@@ -651,13 +664,12 @@ def evaluate_breakout(
     if _GRADE_ORDER.index(base_grade) < _GRADE_ORDER.index(min_grade):
         return None, "FAIL_TECH"
 
-    # 交易计划
+    # 交易计划（rr_ratio 仅展示与落库：止损≤6%/止盈15% 下 RR≥2.5 恒成立，
+    # 旧 MIN_RR_RATIO_BREAKOUT≥1.5 检查永不触发，已删除；波动率风控见层 4）
     breakout_ref_map = {3: d_last.get("level_l1"), 2: d_last.get("level_l2"), 1: d_last.get("level_l3")}
     breakout_ref = breakout_ref_map.get(breakout_level)
     breakout_ref = float(breakout_ref) if breakout_ref is not None and not pd.isna(breakout_ref) else last_close
     rr = compute_breakout_risk_reward(last_close, breakout_ref, config, atr_val)
-    if rr["rr_ratio"] < config.MIN_RR_RATIO_BREAKOUT:
-        return None, "FAIL_TECH"
 
     _amt = pd.to_numeric(out["amount"], errors="coerce").tail(20).mean() if "amount" in out.columns else float("nan")
 
@@ -687,6 +699,27 @@ def evaluate_breakout(
 # ===========================================================================
 # 编排函数：main_breakout
 # ===========================================================================
+
+def describe_breakout(row: dict) -> str:
+    """把一条放量突破推荐格式化为飞书卡片文本（notify/feishu.py 按 strategy 选择调用）。"""
+    lvl = {3: "L1·60日新高", 2: "L2·20日新高", 1: "L3·MA60"}.get(
+        int(row.get("breakout_level") or 0), "-")
+    lines = [
+        f"**{row.get('name', '')} {row.get('code', '')}**（放量突破候选）",
+        f"评分: {_fmt_cell(row.get('score'))} ({row.get('grade') or '-'}级)"
+        f" | 突破: {lvl} +{_fmt_cell(row.get('breakout_margin'))}%"
+        f" | 收盘: {_fmt_cell(row.get('close'))}"
+        f" | 止损: {_fmt_cell(row.get('stop_loss'))}"
+        f" | 止盈: {_fmt_cell(row.get('take_profit'))}"
+        f" | RR: {_fmt_cell(row.get('rr_ratio'))}",
+        f"量比: {_fmt_cell(row.get('vol_ratio'))}"
+        f" | RSI14: {_fmt_cell(row.get('rsi'))}"
+        f" | 平台振幅: {_fmt_cell(row.get('platform_range'))}%"
+        f" | 日均额: {_fmt_cell(row.get('avg_amount'))}万"
+        f" | 市场: {row.get('market_env') or '-'}",
+    ]
+    return "\n".join(lines)
+
 
 def main_breakout(
     config: Optional[VolumeBreakoutConfig] = None,
@@ -742,8 +775,9 @@ def main_breakout(
             return None
         logger.info("待筛选股票数: %d", len(stock_list))
 
+        fetch_stats["bs_ok"] = fetch_stats["ak_ok"] = fetch_stats["fail"] = 0
         signals: list[dict] = []
-        processed, total = 0, len(stock_list)
+        total = len(stock_list)
         stats = {
             "total": total, "error": 0, "fail_data": 0, "fail_liq": 0, "fail_fund": 0,
             "fail_breakout": 0, "fail_vol": 0, "fail_pattern": 0, "fail_trend": 0,
@@ -763,72 +797,31 @@ def main_breakout(
                 logger.debug("%s(%s) 筛选异常: %s", name, code, e)
                 return None, "ERROR"
 
+        # 并发筛选（共享骨架：线程池 + 心跳看门狗 + 时间预算，与抄底策略同一模板）
         screen_start = time.time()
-        budget_sec = config.SCREEN_TIME_BUDGET_MIN * 60
-        progress = {"done": 0, "t": screen_start}
-        stop_watch = threading.Event()
-
-        def _watchdog() -> None:
-            while not stop_watch.wait(180):
-                idle = time.time() - progress["t"]
-                if idle >= 240:
-                    hanging = [futures[f]["code"] for f in futures if not f.done()][:8]
-                    logger.warning("已 %d 秒无任务完成，疑似数据源卡住：%d/%d 完成，在途代码: %s",
-                                   int(idle), progress["done"], total, ",".join(hanging) or "-")
-                else:
-                    logger.info("心跳：%d/%d 完成，已运行 %.1f 分钟，当前通过 %d 只",
-                                progress["done"], total, (time.time() - screen_start) / 60, stats["pass"])
-
-        logger.info("开始并发筛选：%d 只股票，%d 线程，时间预算 %.0f 分钟",
-                    total, config.MAX_WORKERS, config.SCREEN_TIME_BUDGET_MIN)
-        pool = ThreadPoolExecutor(max_workers=config.MAX_WORKERS)
-        futures = {pool.submit(_screen_one, s): s for s in stock_list}
-        watchdog = threading.Thread(target=_watchdog, daemon=True)
-        watchdog.start()
-        time_budget_hit = False
-        try:
-            for future in as_completed(futures):
-                processed += 1
-                progress["done"] = processed
-                progress["t"] = time.time()
-                sig, reason = future.result()
-                if reason == "PASS" and sig is not None:
-                    stats["pass"] += 1
-                    signals.append(sig.to_dict())
-                    logger.info("[通过] %s(%s) 评分 %.1f %s级 L%d 突破幅度 %.2f%%",
-                                sig.name, sig.code, sig.score, sig.grade, sig.breakout_level, sig.breakout_margin)
-                elif reason == "FAIL_FUND": stats["fail_fund"] += 1
-                elif reason == "FAIL_DATA": stats["fail_data"] += 1
-                elif reason == "FAIL_LIQUIDITY": stats["fail_liq"] += 1
-                elif reason == "FAIL_NO_BREAKOUT": stats["fail_breakout"] += 1
-                elif reason in ("FAIL_VOL_INSUFFICIENT", "FAIL_CLIMAX_VOL", "FAIL_AMOUNT_INSUFFICIENT"): stats["fail_vol"] += 1
-                elif reason in ("FAIL_NO_PLATFORM", "FAIL_PLATFORM_LOOSE"): stats["fail_pattern"] += 1
-                elif reason in ("FAIL_TREND_DOWN", "FAIL_BELOW_MA20"): stats["fail_trend"] += 1
-                elif reason == "FAIL_FAKE_BREAKOUT": stats["fail_fake"] += 1
-                elif reason in ("FAIL_CHASE", "FAIL_GAP", "FAIL_BREAKOUT_WEAK"): stats["fail_chase"] += 1
-                elif reason == "FAIL_RECENT_FAILED_BREAKOUT": stats["fail_chase"] += 1
-                elif reason == "FAIL_RSI_HIGH": stats["fail_rsi"] += 1
-                elif reason == "FAIL_VOLATILE": stats["fail_volatile"] += 1
-                elif reason == "FAIL_TECH": stats["fail_tech"] += 1
-                elif reason == "ERROR": stats["error"] += 1
-
-                if processed % config.PROGRESS_LOG_EVERY == 0 or processed == total:
-                    elapsed = time.time() - screen_start
-                    rate = processed / elapsed if elapsed > 0 else 0
-                    eta_min = (total - processed) / rate / 60 if rate > 0 else 0
-                    logger.info("进度: %d/%d (%.0f%%)，已用 %.1f 分钟，预计剩余 %.1f 分钟",
-                                processed, total, processed / total * 100, elapsed / 60, eta_min)
-                if time.time() - screen_start > budget_sec:
-                    time_budget_hit = True
-                    remaining = sum(1 for f in futures if not f.done())
-                    logger.warning("已达筛选时间预算 %.0f 分钟，取消剩余 %d 只未完成任务，基于已完成 %d/%d 只出结果",
-                                   config.SCREEN_TIME_BUDGET_MIN, remaining, processed, total)
-                    break
-        finally:
-            stop_watch.set()
-            pool.shutdown(wait=True, cancel_futures=True)
-
+        results, processed, time_budget_hit = run_concurrent_screen(stock_list, _screen_one, config, logger)
         screen_minutes = (time.time() - screen_start) / 60
+
+        for sig, reason in results:
+            if reason == "PASS" and sig is not None:
+                stats["pass"] += 1
+                signals.append(sig.to_dict())
+                logger.info("[通过] %s(%s) 评分 %.1f %s级 L%d 突破幅度 %.2f%%",
+                            sig.name, sig.code, sig.score, sig.grade, sig.breakout_level, sig.breakout_margin)
+            elif reason == "FAIL_FUND": stats["fail_fund"] += 1
+            elif reason == "FAIL_DATA": stats["fail_data"] += 1
+            elif reason == "FAIL_LIQUIDITY": stats["fail_liq"] += 1
+            elif reason == "FAIL_NO_BREAKOUT": stats["fail_breakout"] += 1
+            elif reason in ("FAIL_VOL_INSUFFICIENT", "FAIL_CLIMAX_VOL", "FAIL_AMOUNT_INSUFFICIENT"): stats["fail_vol"] += 1
+            elif reason in ("FAIL_NO_PLATFORM", "FAIL_PLATFORM_LOOSE"): stats["fail_pattern"] += 1
+            elif reason in ("FAIL_TREND_DOWN", "FAIL_BELOW_MA20"): stats["fail_trend"] += 1
+            elif reason == "FAIL_FAKE_BREAKOUT": stats["fail_fake"] += 1
+            elif reason in ("FAIL_CHASE", "FAIL_GAP", "FAIL_BREAKOUT_WEAK"): stats["fail_chase"] += 1
+            elif reason == "FAIL_RECENT_FAILED_BREAKOUT": stats["fail_chase"] += 1
+            elif reason == "FAIL_RSI_HIGH": stats["fail_rsi"] += 1
+            elif reason == "FAIL_VOLATILE": stats["fail_volatile"] += 1
+            elif reason == "FAIL_TECH": stats["fail_tech"] += 1
+            elif reason == "ERROR": stats["error"] += 1
 
         # 漏斗日志
         logger.info("=" * 50)

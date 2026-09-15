@@ -2,10 +2,14 @@
 精简版日线选股策略（Baostock 主数据源 + AkShare 备用数据源 + 底背离 + 漏斗日志版）
 
 仅使用日线数据进行选股，简化策略逻辑：
-1. 市场环境过滤（沪深300日线MA20斜率；数据不足时明示「未知」，不隐含为正常）
-2. 基本面防雷（ROE/负债率核心否决；商誉/扣非为可选否决，主源不提供时决赛圈用 AkShare 按字段补齐）
+1. 市场环境过滤（沪深300日线MA20斜率 + regime 滞回；数据不足时明示「未知」，不隐含为正常）
+2. 基本面防雷（年化ROE/负债率核心否决；商誉/扣非为可选否决，主源不提供时决赛圈用 AkShare 按字段补齐）
 3. 日线技术指标筛选（底背离 + MA5拐头 + EMA金叉 + RSI超卖反弹 + 量价质量分）
-4. 风险收益比过滤（固定止损止盈）+ 决赛圈周线确认 + 行业分散
+4. 波动率风控（ATR% 超上限否决，止损/止盈/盈亏比仅作展示与落库）+ 决赛圈周线确认 + 行业分散
+
+运行保障：全模块统一 logging；socket 全局默认超时 20s 防数据源假死；并发筛选带
+心跳看门狗（连续 4 分钟无完成打印在途代码）与时间预算（SCREEN_TIME_BUDGET_MIN，
+超时按已完成结果出报告）。
 
 荐股质量分层（数据缺失不等于筛选通过）：
 - 正式推荐（formal）：财务核心项已核验、启用的周线确认已确认、行情日期与市场最新交易日一致
@@ -23,16 +27,36 @@ from __future__ import annotations
 import json
 import logging
 import os
+import socket
 import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, asdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Optional
 
 import numpy as np
 import pandas as pd
+
+logger = logging.getLogger("strategy")
+
+# 全局 socket 默认超时：baostock/akshare 底层 socket 默认无超时，曾在持有 bs_lock
+# 的线程上永久阻塞导致全池假死（GitHub Actions 跑满 6h 被取消）。勿删。
+SOCKET_TIMEOUT = 20
+socket.setdefaulttimeout(SOCKET_TIMEOUT)
+
+# 北京时间（东八区）：GitHub Actions runner 为 UTC，凡涉及「今日是否收盘 /
+# 本周是否完结」的判断都必须用该时区，禁止直接使用 datetime.now() 的本地时区。
+BEIJING_TZ = timezone(timedelta(hours=8))
+
+def _beijing_now() -> datetime:
+    """当前北京时间（感知时区的 datetime）。"""
+    return datetime.now(BEIJING_TZ)
+
+# 日线取数来源统计（本次运行）：Baostock 命中 / AkShare 兜底命中 / 双源均失败。
+# 多线程下简单自增在 GIL 保护下安全（与 _bs_state 同一约定）。
+fetch_stats = {"bs_ok": 0, "ak_ok": 0, "fail": 0}
 
 try:
     import baostock as bs
@@ -95,6 +119,13 @@ class StrategyConfig:
     MARKET_SLOPE_LOOKBACK: int = 4
     MARKET_BULL_SLOPE: float = 0.01
     MARKET_BEAR_SLOPE: float = -0.01
+    # 指数数据缺失（regime=unknown）时按熊市保守处理：推荐上限收缩、评分门槛上浮
+    UNKNOWN_AS_BEAR: bool = True
+    # regime 滞回：牛/熊/中性的切换须连续 MARKET_REGIME_CONFIRM_DAYS 个交易日同向确认，
+    # 避免 MA20 斜率在 ±0.01 阈值附近小幅抖动导致 regime 逐日跳变；状态持久化在
+    # cache/market_regime_state.json（超 10 天未更新自动重置）。unknown 不改变已确认状态。
+    MARKET_REGIME_HYSTERESIS: bool = True
+    MARKET_REGIME_CONFIRM_DAYS: int = 2
 
     MIN_ROE: float = 5.0
     MAX_DEBT_RATIO: float = 70.0
@@ -131,10 +162,14 @@ class StrategyConfig:
 
     FIXED_STOP_LOSS_PCT: float = 5.0
     FIXED_TAKE_PROFIT_PCT: float = 10.0
-    MIN_RR_RATIO: float = 1.5
     ATR_PERIOD: int = 14
     ATR_STOP_MULT: float = 2.0
     USE_ATR_STOP: bool = True
+    # 波动率风控：ATR 占现价百分比超过该值直接否决（FAIL_VOLATILE）。
+    # 该阈值与旧「RR≥1.5」数学等价（2×ATR止损+10%止盈下 RR≥1.5 ⟺ ATR≤3.33%现价），
+    # 但语义直白、且 ATR 缺失时不再隐含放行（旧实现 RR 恒 2.0 永不否决）。
+    # 止损/止盈/盈亏比（rr_ratio）仅作展示与落库，不参与否决。
+    MAX_ATR_PCT: float = 3.33
 
     MIN_AMOUNT: float = 30_000_000.0  # 近 20 日日均成交额下限（元）；原 500 万对主板几乎无筛选力，上调至 3000 万过滤低流动性标的
     MIN_DAYS: int = 60
@@ -164,8 +199,13 @@ class StrategyConfig:
     MAX_RECENT_GAIN_PCT: float = 12.0
     # 最终推荐数量上限：评分降序截取前 N 只（目标每日推荐 3~5 只）
     MAX_PICKS: int = 5
-    # 正式信号为空时，允许生成一只低置信度观察候选，避免每日完全无覆盖
-    ENABLE_DAILY_FALLBACK: bool = True
+    # 组合层：两套策略（抄底 + 放量突破）同一交易日合计推荐数上限，
+    # 由后运行的策略在落库前去重并截取（见 run_breakout.py）
+    DAILY_TOTAL_MAX_PICKS: int = 7
+    # 正式信号为空时，允许生成一只低置信度观察候选。
+    # 默认关闭：与「宁可少荐」哲学一致，避免每天硬推一只低置信度票诱导实盘；
+    # 需要时设为 True 恢复旧行为（候选明确标记 tier=fallback，仅作观察）。
+    ENABLE_DAILY_FALLBACK: bool = False
     FALLBACK_MIN_SCORE: float = 40.0
     # 行业分散（组合层风控）：同一行业最多推荐的只数，避免 Top5 集中单一板块导致组合同涨同跌
     USE_INDUSTRY_DEDUP: bool = True
@@ -179,12 +219,12 @@ class StrategyConfig:
     # MACD 动能确认：要求 MACD 柱当日较昨日改善（绿柱缩短或红柱放大）
     REQUIRE_MACD_MOMENTUM: bool = True
     # MACD 柱需连续改善的天数（1=仅当日较昨日；2=连续两日改善，过滤单日反抽）
-    MACD_MOMENTUM_DAYS: int = 1
+    MACD_MOMENTUM_DAYS: int = 2
     # KDJ 确认：要求 KDJ 处于金叉状态（K>D）且 K 值不高于该上限（避免高位接力）
     REQUIRE_KDJ_GOLDEN: bool = True
-    KDJ_K_MAX: float = 65.0
+    KDJ_K_MAX: float = 55.0
     # KDJ 动能：要求 K 值较昨日上行（仅 K>D 不够，K 掉头时容易误判为金叉）
-    REQUIRE_KDJ_RISING: bool = False
+    REQUIRE_KDJ_RISING: bool = True
     # 周线趋势确认：仅对通过全部日线筛选的决赛圈股票拉取周线；
     # WEEKLY_MA_BOTH_REQUIRED=True 时须同时满足「收盘站上周线 MA10（容忍 2%）」和「MA10 在上行」，
     # 设为 False 退回旧行为（两条件满足其一即可）
@@ -199,6 +239,11 @@ class StrategyConfig:
     WEEKLY_MACD_FAST: int = 12
     WEEKLY_MACD_SLOW: int = 26
     WEEKLY_MACD_SIGNAL: int = 9
+    # 周线确认只使用已收盘的周 bar：数据源周线按「周内最新交易日」标注，周中运行时
+    # 末根为未收盘的半成品 bar，参与 MA10/MACD 判断会造成口径漂移。开启后，
+    # 末 bar 日期落在本 ISO 周且不是周五即剔除（节假日周四收周也保守剔除，
+    # 代价是确认滞后一周）。判断基准为北京时间。
+    WEEKLY_REQUIRE_CLOSED_BAR: bool = True
 
     # 趋势转折（MA5拐头 或 EMA金叉，同源信号合并计分，避免右侧拐点同日触发导致分数通胀）
     W_DAILY_TREND_TURN: float = 40.0
@@ -212,7 +257,8 @@ class StrategyConfig:
     VOLP_CLOSE_POS_MIN: float = 0.35       # 收盘位置低于该值判定冲高回落
     VOLP_MAX_UPPER_SHADOW: float = 0.35    # 满分档允许的上影线占日内区间比例上限
     DAILY_MULTI_RESONANCE_BONUS: float = 10.0
-    DAILY_RSI_OVERBOUGHT_PENALTY: float = 3.0
+    # （已删除 DAILY_RSI_OVERBOUGHT_PENALTY：RSI14>60 已被 DAILY_RSI_ENTRY_MAX 否决，
+    #   超买 -3 惩罚实际不可达，属死代码）
     # 底背离不参与评级升降（评级统一：等级=原始技术分定级），仅作形态标签与同分排序优先项
 
     GRADE_A: float = 80.0
@@ -230,6 +276,10 @@ class StrategyConfig:
     DAILY_BARS: int = 120
     WEEKLY_BARS: int = 60
     FETCH_DELAY: float = 0.05
+    # 并发筛选时间预算（分钟）：超时取消未完成任务，按已完成结果出报告
+    SCREEN_TIME_BUDGET_MIN: float = 240.0
+    # 筛选进度日志间隔（每处理 N 只打印一次进度与 ETA）
+    PROGRESS_LOG_EVERY: int = 500
 
     ADJUST: str = "qfq"
     USE_CACHE: bool = True
@@ -237,7 +287,8 @@ class StrategyConfig:
     CACHE_TTL_DAYS: float = 6.0
     FUND_CACHE_TTL_DAYS: float = 7.0
     # 财报季度回溯次数：从「已披露窗口」的最新一季开始向前找，最多尝试几个季度
-    FUND_QUARTER_LOOKBACK: int = 3
+    # （覆盖跨年披露空窗：1-4 月依赖上年年报，未出则需回退到三季报甚至半年报）
+    FUND_LOOKBACK_QUARTERS: int = 4
     FUND_START_YEAR: str = "2023"
     MAX_RETRY: int = 2
     LIST_MAX_RETRY: int = 4
@@ -333,7 +384,7 @@ def _bs_mark_failure() -> None:
     _bs_state["logged_in"] = False  # 可能连接已断开，下次查询前触发重新登录
     if _bs_state["consecutive_failures"] >= _BS_CIRCUIT_THRESHOLD and not _bs_state["circuit_open"]:
         _bs_state["circuit_open"] = True
-        print(f"[WARN] Baostock 连续失败 {_BS_CIRCUIT_THRESHOLD} 次，已熔断，本次运行后续请求切换至 AkShare 备用数据源")
+        logger.warning("Baostock 连续失败 %d 次，已熔断，本次运行后续请求切换至 AkShare 备用数据源", _BS_CIRCUIT_THRESHOLD)
 
 def _bs_available() -> bool:
     return not _bs_state["circuit_open"]
@@ -532,7 +583,7 @@ def _fetch_index_weekly_bs(symbol: str, weeks: int = 60, config: Optional[Strate
     weekly["date"] = weekly["_dt"].dt.strftime(_DATE_FMT)
     return weekly.drop(columns=["_dt"])
 
-def _quarter_candidates(now: datetime, n: int = 3) -> list[tuple[int, int]]:
+def _quarter_candidates(now: datetime, n: int = 4) -> list[tuple[int, int]]:
     """按交易所披露截止日推算「已确定公开」的财报季度候选（由新到旧，最多 n 个）。
 
     披露截止：一季报 4/30、半年报 8/31、三季报 10/31、年报次年 4/30 前披露完毕。
@@ -553,19 +604,34 @@ def _quarter_candidates(now: datetime, n: int = 3) -> list[tuple[int, int]]:
     return out
 
 
+def _annualize_roe(roe_ytd: float, quarter: int) -> float:
+    """把年初至今累计 ROE 线性年化为全年口径，与 MIN_ROE（年化阈值）可比。
+
+    Baostock/AkShare 的 ROE 均为「报告期累计值」（如 Q2 = 半年报累计），
+    直接拿单季/累计值与年化阈值比较会让门槛随财报日历漂移（Q1 数据天然只有
+    全年的 1/4，极严；Q4 又等于年化值）。线性年化：Q1×4 / Q2×2 / Q3×4/3 / Q4×1。
+    """
+    factor = {1: 4.0, 2: 2.0, 3: 4.0 / 3.0, 4: 1.0}.get(int(quarter), 1.0)
+    return roe_ytd * factor
+
+
 def _fetch_fundamentals_bs(code: str, config: Optional[StrategyConfig] = None) -> Optional[dict]:
     config = config or StrategyConfig()
     bs_code = _format_bs_code(code)
-    quarters = _quarter_candidates(datetime.now(), n=config.FUND_QUARTER_LOOKBACK)
+    quarters = _quarter_candidates(datetime.now(), n=config.FUND_LOOKBACK_QUARTERS)
     path = ""
     if config.USE_CACHE:
-        # 缓存名带起始季度标签：财报窗口滚动后自动失效，避免复用上一季的旧数据
-        path = _cache_path(config, f"fund_{bs_code}_{quarters[0][0]}Q{quarters[0][1]}.json")
+        # 缓存名带起始季度标签：财报窗口滚动后自动失效，避免复用上一季的旧数据。
+        # fund_v2_ 前缀：v2 起 ROE 为年化口径且含 report_period，与旧 fund_* 缓存隔离。
+        path = _cache_path(config, f"fund_v2_{bs_code}_{quarters[0][0]}Q{quarters[0][1]}.json")
         if _cache_fresh(path, config.FUND_CACHE_TTL_DAYS):
             if (cached := _read_cache_json(path)) is not None: return cached
 
-    # 商誉与扣非净利润在 Baostock 中缺失，置为 None
-    result: dict[str, Optional[float]] = {"roe": None, "debt_ratio": None, "goodwill_ratio": None, "deducted_profit_ratio": None}
+    # 商誉与扣非净利润在 Baostock 中缺失，置为 None；report_period 记录数据实际所属报告期
+    result: dict[str, Optional[float] | Optional[str]] = {
+        "roe": None, "debt_ratio": None, "goodwill_ratio": None, "deducted_profit_ratio": None,
+        "report_period": None,
+    }
 
     # 逐季回溯：从已披露窗口的最新一季往前找，取到数据即停
     for (year, quarter) in quarters:
@@ -589,20 +655,28 @@ def _fetch_fundamentals_bs(code: str, config: Optional[StrategyConfig] = None) -
                 break  # 已熔断，继续回溯只是无效重试，直接放弃让上层降级 AkShare
             continue
         p_rs, b_rs = rs
+        got = False
         if p_rs.error_code == '0' and len(p_rs.data) > 0 and result["roe"] is None:
             df = p_rs.get_data()
             if "roeAvg" in df.columns:
                 roe = pd.to_numeric(df["roeAvg"].iloc[0], errors="coerce")
-                if not pd.isna(roe): result["roe"] = roe * 100  # Baostock 返回小数(如0.05)
+                if not pd.isna(roe):
+                    # Baostock 返回累计小数(如0.05)：×100 转百分比后按报告期线性年化
+                    result["roe"] = _annualize_roe(float(roe) * 100, quarter)
+                    got = True
         if b_rs.error_code == '0' and len(b_rs.data) > 0 and result["debt_ratio"] is None:
             df = b_rs.get_data()
             # Baostock 资产负债率字段为 liabilityToAsset（小数形式，兼容其他可能的字段名）
             debt_col = next((c for c in ("liabilityToAsset", "liabToAsset", "liabRate") if c in df.columns), None)
             if debt_col:
                 debt = pd.to_numeric(df[debt_col].iloc[0], errors="coerce")
-                if not pd.isna(debt): result["debt_ratio"] = debt * 100
+                if not pd.isna(debt):
+                    result["debt_ratio"] = float(debt) * 100
+                    got = True
+        if got and result["report_period"] is None:
+            result["report_period"] = f"{year}Q{quarter}"
 
-    if not any(v is not None for v in result.values()): return None
+    if result["roe"] is None and result["debt_ratio"] is None: return None
     if path: _write_cache_json(result, path)
     return result
 
@@ -629,7 +703,7 @@ def _fetch_stock_pool_bs(config: Optional[StrategyConfig] = None) -> list[dict]:
                 _bs_mark_success()
                 if len(rs.data) > 0:
                     if i > 0:
-                        print(f"[INFO] 今日非交易日，股票列表回退至最近交易日 {day}")
+                        logger.info("今日非交易日，股票列表回退至最近交易日 %s", day)
                     return rs.get_data()
             return None  # 连续 10 天均为空（极端异常）
         
@@ -810,29 +884,48 @@ def _fetch_index_daily_ak(symbol: str, config: StrategyConfig) -> Optional[pd.Da
     return df
 
 def _fetch_fundamentals_ak(code: str, config: Optional[StrategyConfig] = None) -> Optional[dict]:
-    """AkShare 基本面：相比 Baostock 额外补齐商誉占比与扣非利润占比"""
+    """AkShare 基本面：相比 Baostock 额外补齐商誉占比与扣非利润占比。
+
+    口径与主源一致（v2）：ROE 取「显式按日期列排序后的最大报告期」累计值并按
+    该报告期线性年化，结果带 report_period。旧 fund_* 缓存（单季未年化口径）隔离废弃。
+    """
     if not _AK_AVAILABLE: return None
     config = config or StrategyConfig()
     symbol = _ak_symbol(code)
     path = ""
     if config.USE_CACHE:
-        path = _cache_path(config, f"fund_{symbol}.json")
+        path = _cache_path(config, f"fund_v2_{symbol}.json")
         if _cache_fresh(path, config.FUND_CACHE_TTL_DAYS):
             if (cached := _read_cache_json(path)) is not None: return cached
 
-    result: dict[str, Optional[float]] = {"roe": None, "debt_ratio": None, "goodwill_ratio": None, "deducted_profit_ratio": None}
+    result: dict[str, Optional[float] | Optional[str]] = {
+        "roe": None, "debt_ratio": None, "goodwill_ratio": None, "deducted_profit_ratio": None,
+        "report_period": None,
+    }
 
     df_fin = _fetch_with_retry(lambda: ak.stock_financial_analysis_indicator(symbol=symbol, start_year=config.FUND_START_YEAR), config.MAX_RETRY, f"ak_fund({symbol})")
     if df_fin is not None and not df_fin.empty:
-        row = df_fin.iloc[0]
-        for col in df_fin.columns:
-            col_str, col_lower = str(col), str(col).lower()
-            if "净资产收益率" in col_str or "roe" in col_lower:
-                val = pd.to_numeric(row[col], errors="coerce")
-                if not pd.isna(val): result["roe"] = float(val)
-            if "资产负债率" in col_str or "debt" in col_lower:
-                val = pd.to_numeric(row[col], errors="coerce")
-                if not pd.isna(val): result["debt_ratio"] = float(val)
+        # 显式按日期列取最大报告期，不假定接口返回顺序
+        date_col = next((c for c in df_fin.columns if "日期" in str(c) or "报告期" in str(c)), None)
+        if date_col is not None:
+            df_fin = df_fin.copy()
+            df_fin["_dt"] = pd.to_datetime(df_fin[date_col], errors="coerce")
+            df_fin = df_fin.dropna(subset=["_dt"]).sort_values("_dt", ascending=False)
+        if not df_fin.empty:
+            row = df_fin.iloc[0]
+            report_dt = row["_dt"] if date_col is not None else pd.NaT
+            report_quarter = int((int(report_dt.month) - 1) // 3 + 1) if pd.notna(report_dt) else None
+            for col in df_fin.columns:
+                col_str, col_lower = str(col), str(col).lower()
+                if "净资产收益率" in col_str or "roe" in col_lower:
+                    val = pd.to_numeric(row[col], errors="coerce")
+                    if not pd.isna(val):
+                        result["roe"] = _annualize_roe(float(val), report_quarter) if report_quarter else float(val)
+                if "资产负债率" in col_str or "debt" in col_lower:
+                    val = pd.to_numeric(row[col], errors="coerce")
+                    if not pd.isna(val): result["debt_ratio"] = float(val)
+            if pd.notna(report_dt) and (result["roe"] is not None or result["debt_ratio"] is not None):
+                result["report_period"] = f"{int(report_dt.year)}Q{report_quarter}"
 
     df_bs = _fetch_with_retry(lambda: ak.stock_balance_sheet_by_report_em(symbol=symbol), config.MAX_RETRY, f"ak_bs({symbol})")
     if df_bs is not None and not df_bs.empty:
@@ -861,7 +954,9 @@ def _fetch_fundamentals_ak(code: str, config: Optional[StrategyConfig] = None) -
                 if not pd.isna(val): deducted_profit = float(val)
         if net_profit > 0: result["deducted_profit_ratio"] = deducted_profit / net_profit
 
-    if not any(v is not None for v in result.values()): return None
+    if result["roe"] is None and result["debt_ratio"] is None \
+            and result["goodwill_ratio"] is None and result["deducted_profit_ratio"] is None:
+        return None
     if path: _write_cache_json(result, path)
     return result
 
@@ -892,8 +987,15 @@ def _fetch_stock_pool_ak(config: Optional[StrategyConfig] = None) -> list[dict]:
 def _fetch_daily_dual(code: str, days: int, config: StrategyConfig) -> Optional[pd.DataFrame]:
     if _bs_available():
         df = _fetch_daily_bs(code, days=days, config=config)
-        if df is not None: return df
-    return _fetch_daily_ak(code, days=days, config=config)
+        if df is not None:
+            fetch_stats["bs_ok"] += 1
+            return df
+    df = _fetch_daily_ak(code, days=days, config=config)
+    if df is not None:
+        fetch_stats["ak_ok"] += 1
+    else:
+        fetch_stats["fail"] += 1
+    return df
 
 def _fetch_weekly_dual(code: str, config: StrategyConfig) -> Optional[pd.DataFrame]:
     """周线双源拉取（仅决赛圈周线趋势确认使用）：Baostock 优先，失败降级 AkShare"""
@@ -993,6 +1095,57 @@ def _effective_regime(regime: str, config: StrategyConfig) -> str:
     if value == "unknown" and getattr(config, "UNKNOWN_AS_BEAR", True):
         return "bear"
     return value if value in {"bull", "neutral", "bear"} else "neutral"
+
+
+def _apply_regime_hysteresis(result: dict, config: StrategyConfig) -> dict:
+    """regime 滞回：牛/熊/中性切换须连续 MARKET_REGIME_CONFIRM_DAYS 日同向确认。
+
+    单一沪深300 MA20 斜率代理在 ±0.01 阈值附近会逐日跳变（今天 bull 明天 neutral），
+    导致推荐数量上限与评分门槛跟着抖动。此处引入磁盘状态（cache/market_regime_state.json，
+    超 10 天未更新自动重置）：
+    - 无历史状态时直接采用当期 raw regime（启动期不加延迟）；
+    - raw 与已确认状态不同 → 记为待确认，连续确认达天数才翻转；
+    - raw=unknown（指数数据缺失）→ 沿用已确认状态，不污染计数；
+      无已确认状态时保持 unknown（由 _effective_regime 保守视同 bear）。
+    """
+    if not getattr(config, "MARKET_REGIME_HYSTERESIS", True):
+        return result
+    raw = str(result.get("regime", "unknown")).lower()
+    path = _cache_path(config, "market_regime_state.json")
+    state = _read_cache_json(path) or {}
+    updated = state.get("updated")
+    if updated:
+        try:
+            if (datetime.now() - datetime.strptime(str(updated), _DATE_FMT)).days > 10:
+                state = {}
+        except (TypeError, ValueError):
+            state = {}
+    confirmed = state.get("confirmed")
+    pending, count = state.get("pending"), int(state.get("count", 0) or 0)
+
+    if raw == "unknown":
+        eff = confirmed or "unknown"
+    elif confirmed is None or raw == confirmed:
+        confirmed, pending, count = raw, None, 0
+        eff = raw
+    elif raw == pending:
+        count += 1
+        if count >= int(getattr(config, "MARKET_REGIME_CONFIRM_DAYS", 2)):
+            confirmed, pending, count = raw, None, 0
+        eff = confirmed
+    else:
+        pending, count = raw, 1
+        eff = confirmed
+
+    if raw != "unknown":
+        _write_cache_json({"confirmed": confirmed, "pending": pending, "count": count,
+                           "updated": datetime.now().strftime(_DATE_FMT)}, path)
+    if eff != raw:
+        result = dict(result)
+        result["regime_raw"] = raw
+        result["regime"] = eff
+        result["description"] = f"{result.get('description', '')}（滞回：原始 {raw}，采用 {eff}）"
+    return result
 
 def _is_financial_stock(code: str, name: str, config: StrategyConfig) -> bool:
     """金融业（银行/保险/券商/信托/期货）识别：名称关键词 + 代码白名单（覆盖无关键词的知名金融股）"""
@@ -1121,8 +1274,8 @@ def _vol_price_quality(out: pd.DataFrame, config: StrategyConfig) -> tuple[pd.Se
 
 def compute_daily_signals(df: pd.DataFrame, config: StrategyConfig) -> Optional[pd.DataFrame]:
     if df is None or df.empty or not _DAILY_NEED_COLS.issubset(df.columns) or len(df) < config.MIN_DAYS: return None
-    # 流动性过滤：近 20 日日均成交额低于下限，判定为僵尸股直接否决
-    if df["amount"].tail(20).mean() < config.MIN_AMOUNT: return None
+    # 注：流动性否决（近20日日均成交额 < MIN_AMOUNT → FAIL_LIQUIDITY）已上移到
+    # evaluate() 前置层，与数据缺失（FAIL_DATA）分开归因，此处不再检查。
     out = df.copy().reset_index(drop=True)
     out["ma5"] = out["close"].rolling(config.DAILY_MA5).mean()
     out["ma10"] = out["close"].rolling(config.DAILY_MA10).mean()
@@ -1192,19 +1345,19 @@ def compute_daily_signals(df: pd.DataFrame, config: StrategyConfig) -> Optional[
         out["trend_turn"].astype(float) * config.W_DAILY_TREND_TURN +
         out["rsi_rebound"].astype(float) * config.W_DAILY_RSI_REBOUND +
         out["vol_price_quality"].astype(float) +
-        out["multi_resonance"].astype(float) * config.DAILY_MULTI_RESONANCE_BONUS +
-        (out["rsi14"] >= config.DAILY_RSI_OVERBOUGHT).astype(float) * (-config.DAILY_RSI_OVERBOUGHT_PENALTY)
+        out["multi_resonance"].astype(float) * config.DAILY_MULTI_RESONANCE_BONUS
     ).fillna(0).clip(0, 100).round(1)
 
     return out
 
 def compute_risk_reward(entry_price: float, config: StrategyConfig, atr: Optional[float] = None) -> dict:
+    """止损/止盈/盈亏比计算（仅展示与落库，不参与否决——波动率风控见 MAX_ATR_PCT）。"""
     if config.USE_ATR_STOP and atr is not None and atr > 0: stop_loss = entry_price - config.ATR_STOP_MULT * atr
     else: stop_loss = entry_price * (1 - config.FIXED_STOP_LOSS_PCT / 100)
     take_profit = entry_price * (1 + config.FIXED_TAKE_PROFIT_PCT / 100)
     risk, reward = entry_price - stop_loss, take_profit - entry_price
     rr_ratio = reward / risk if risk > 0 else 0.0
-    return {"stop_loss": round(stop_loss, 2), "take_profit": round(take_profit, 2), "rr_ratio": round(rr_ratio, 2), "passes": rr_ratio >= config.MIN_RR_RATIO}
+    return {"stop_loss": round(stop_loss, 2), "take_profit": round(take_profit, 2), "rr_ratio": round(rr_ratio, 2)}
 
 def _fmt_cell(v: Any, default: str = "-") -> Any:
     """展示用取值：None/NaN 统一回退默认值，避免卡片出现 None 或 nan。"""
@@ -1345,9 +1498,35 @@ def _kdj_ok(daily_out: pd.DataFrame, config: StrategyConfig) -> bool:
         if not pd.isna(k_prev) and float(k) <= float(k_prev): return False
     return True
 
+def _drop_incomplete_weekly_bar(weekly_df: Optional[pd.DataFrame], config: StrategyConfig) -> Optional[pd.DataFrame]:
+    """剔除未收盘的周 bar（WEEKLY_REQUIRE_CLOSED_BAR 开启时）。
+
+    数据源周线按「周内最新交易日」标注：周中运行时末根为未收盘的半成品 bar，
+    其 close/MA10/MACD 会随周内行情继续变化，参与确认会造成口径漂移。
+    规则：末 bar 日期落在本 ISO 周（北京时间）且不是周五 → 剔除；
+    节假日周四收周也保守剔除（无法区分「周四提前收周」与「周中半成品」，
+    代价是确认滞后一周）。
+    """
+    if weekly_df is None or weekly_df.empty or "date" not in weekly_df.columns:
+        return weekly_df
+    if not getattr(config, "WEEKLY_REQUIRE_CLOSED_BAR", True):
+        return weekly_df
+    w = weekly_df.sort_values("date").reset_index(drop=True)
+    last = pd.to_datetime(w["date"].iloc[-1], errors="coerce")
+    if pd.isna(last):
+        return w
+    today = _beijing_now().date()
+    last_d = last.date()
+    if last_d.isocalendar()[:2] == today.isocalendar()[:2] and last_d.weekday() != 4:
+        w = w.iloc[:-1].reset_index(drop=True)
+    return w
+
+
 def check_weekly_trend(weekly_df: Optional[pd.DataFrame], config: StrategyConfig) -> bool:
     """周线趋势确认：收盘价站上周线 MA10（容忍 WEEKLY_TOLERANCE）且 MA10 在上行；
-    WEEKLY_MA_BOTH_REQUIRED=False 退回旧行为（两条件满足其一即可）；数据不足放行"""
+    WEEKLY_MA_BOTH_REQUIRED=False 退回旧行为（两条件满足其一即可）；数据不足放行。
+    仅使用已收盘周 bar（见 _drop_incomplete_weekly_bar）。"""
+    weekly_df = _drop_incomplete_weekly_bar(weekly_df, config)
     if weekly_df is None or weekly_df.empty or "close" not in weekly_df.columns: return True
     if len(weekly_df) < config.WEEKLY_MA_PERIOD + config.WEEKLY_SLOPE_LOOKBACK: return True
     w = weekly_df.sort_values("date").reset_index(drop=True) if "date" in weekly_df.columns else weekly_df.reset_index(drop=True)
@@ -1360,7 +1539,9 @@ def check_weekly_trend(weekly_df: Optional[pd.DataFrame], config: StrategyConfig
 
 def check_weekly_macd(weekly_df: Optional[pd.DataFrame], config: StrategyConfig) -> bool:
     """周线 MACD 企稳确认：柱值翻红（含金叉当周及之后的红柱状态，动能占优），
-    或绿柱连续 2 周收窄（柱值连续两周改善，下跌动能衰减企稳）；数据不足或 NaN 放行不误杀"""
+    或绿柱连续 2 周收窄（柱值连续两周改善，下跌动能衰减企稳）；数据不足或 NaN 放行不误杀。
+    仅使用已收盘周 bar（见 _drop_incomplete_weekly_bar）。"""
+    weekly_df = _drop_incomplete_weekly_bar(weekly_df, config)
     if weekly_df is None or weekly_df.empty or "close" not in weekly_df.columns: return True
     if len(weekly_df) < config.WEEKLY_MACD_SLOW + config.WEEKLY_MACD_SIGNAL: return True
     w = weekly_df.sort_values("date").reset_index(drop=True) if "date" in weekly_df.columns else weekly_df.reset_index(drop=True)
@@ -1403,6 +1584,14 @@ def evaluate(daily_df: Optional[pd.DataFrame], code: str = "", name: str = "", c
     regime = (market_env or {}).get("regime", "unknown")
 
     if not check_fundamentals(fund_data, config, code=code, name=name): return None, "FAIL_FUND"
+
+    # 流动性前置检查（独立于数据缺失归因）：近 20 日日均成交额低于下限判僵尸股。
+    # 放在 compute_daily_signals 之前，避免低流动性标的白算一遍指标。
+    if daily_df is None or daily_df.empty: return None, "FAIL_DATA"
+    if "amount" in daily_df.columns and len(daily_df) >= 20:
+        _avg_amt = pd.to_numeric(daily_df["amount"], errors="coerce").tail(20).mean()
+        if pd.isna(_avg_amt): return None, "FAIL_DATA"
+        if float(_avg_amt) < config.MIN_AMOUNT: return None, "FAIL_LIQUIDITY"
 
     daily_out = compute_daily_signals(daily_df, config)
     if daily_out is None or daily_out.empty: return None, "FAIL_DATA"
@@ -1485,8 +1674,13 @@ def evaluate(daily_df: Optional[pd.DataFrame], code: str = "", name: str = "", c
     atr_val = d_last.get("atr")
     atr_val = float(atr_val) if atr_val is not None and not pd.isna(atr_val) else None
 
+    # 波动率风控：ATR 占现价百分比超上限直接否决。
+    # 替代旧「RR≥1.5 否决」：2×ATR止损+10%止盈下 RR≥1.5 与 ATR≤3.33% 数学等价，
+    # 但旧实现在 ATR 缺失时 RR 恒 2.0 永不否决（静默放行），现已修复该漏洞。
+    if atr_val is not None and last_close > 0 and (atr_val / last_close * 100) > config.MAX_ATR_PCT:
+        return None, "FAIL_VOLATILE"
+
     rr = compute_risk_reward(entry_price=last_close, config=config, atr=atr_val)
-    if not rr["passes"]: return None, "FAIL_RR"
 
     # 入选依据：实际触发的技术条件（量价按质量分档区分措辞）
     hits: list[str] = []
@@ -1516,6 +1710,7 @@ def get_market_environment(config: StrategyConfig, cache: CacheManager) -> dict:
     if (cached := cache.get("market_env")) is not None: return cached
     df_index = get_index_daily(config, cache)
     result = compute_market_environment(df_index, config) if df_index is not None and not df_index.empty else {"regime": "unknown", "description": "未知（数据获取失败）", "ma20": 0, "slope": 0, "close": 0}
+    result = _apply_regime_hysteresis(result, config)
     cache.set("market_env", result)
     return result
 
@@ -1533,12 +1728,80 @@ def _dedup_by_industry(df: pd.DataFrame, config: StrategyConfig, cache: Optional
         kept.append(row)
     dropped = len(df) - len(kept)
     if dropped:
-        print(f"[INFO] 行业分散：淘汰 {dropped} 只（同一行业最多 {config.MAX_PICKS_PER_INDUSTRY} 只）")
+        logger.info("行业分散：淘汰 %d 只（同一行业最多 %d 只）", dropped, config.MAX_PICKS_PER_INDUSTRY)
     return pd.DataFrame(kept).reset_index(drop=True) if kept else df.iloc[0:0]
 
 # ===========================================================================
 # 编排函数
 # ===========================================================================
+
+def run_concurrent_screen(
+    stock_list: list[dict],
+    screen_one: Callable[[dict], tuple],
+    config: StrategyConfig,
+    log: logging.Logger,
+) -> tuple[list[tuple], int, bool]:
+    """并发筛选骨架（抄底/突破两策略共用的漏斗模板）：线程池 + 心跳看门狗 + 时间预算。
+
+    - 看门狗：筛选期每 3 分钟心跳；连续 4 分钟无任务完成则打印在途股票代码定位卡点
+      （数据源假死排查手段，bs_lock 持有期间卡死曾致全池阻塞）。
+    - 时间预算：超过 SCREEN_TIME_BUDGET_MIN 取消未完成任务，按已完成结果出报告，
+      漏斗统计按 processed 计（预算截断时不失真）。
+    - 进度日志：每 PROGRESS_LOG_EVERY 只打印一次进度与 ETA。
+
+    返回 (results, processed, time_budget_hit)：results 为已完成任务的
+    (sig, reason) 列表（完成顺序，调用方自行做确定性排序）。
+    """
+    results: list[tuple] = []
+    processed, total = 0, len(stock_list)
+    screen_start = time.time()
+    budget_sec = float(getattr(config, "SCREEN_TIME_BUDGET_MIN", 240.0)) * 60
+    progress_every = int(getattr(config, "PROGRESS_LOG_EVERY", 500))
+    progress = {"done": 0, "t": screen_start}
+    stop_watch = threading.Event()
+
+    pool = ThreadPoolExecutor(max_workers=config.MAX_WORKERS)
+    futures = {pool.submit(screen_one, s): s for s in stock_list}
+
+    def _watchdog() -> None:
+        while not stop_watch.wait(180):
+            idle = time.time() - progress["t"]
+            if idle >= 240:
+                hanging = [futures[f]["code"] for f in futures if not f.done()][:8]
+                log.warning("已 %d 秒无任务完成，疑似数据源卡住：%d/%d 完成，在途代码: %s",
+                            int(idle), progress["done"], total, ",".join(hanging) or "-")
+            else:
+                log.info("心跳：%d/%d 完成，已运行 %.1f 分钟",
+                         progress["done"], total, (time.time() - screen_start) / 60)
+
+    log.info("开始并发筛选：%d 只股票，%d 线程，时间预算 %.0f 分钟",
+             total, config.MAX_WORKERS, budget_sec / 60)
+    watchdog = threading.Thread(target=_watchdog, daemon=True)
+    watchdog.start()
+    time_budget_hit = False
+    try:
+        for future in as_completed(futures):
+            processed += 1
+            progress["done"] = processed
+            progress["t"] = time.time()
+            results.append(future.result())
+            if processed % progress_every == 0 or processed == total:
+                elapsed = time.time() - screen_start
+                rate = processed / elapsed if elapsed > 0 else 0
+                eta_min = (total - processed) / rate / 60 if rate > 0 else 0
+                log.info("进度: %d/%d (%.0f%%)，已用 %.1f 分钟，预计剩余 %.1f 分钟",
+                         processed, total, processed / total * 100, elapsed / 60, eta_min)
+            if time.time() - screen_start > budget_sec:
+                time_budget_hit = True
+                remaining = sum(1 for f in futures if not f.done())
+                log.warning("已达筛选时间预算 %.0f 分钟，取消剩余 %d 只未完成任务，基于已完成 %d/%d 只出结果",
+                            budget_sec / 60, remaining, processed, total)
+                break
+    finally:
+        stop_watch.set()
+        pool.shutdown(wait=True, cancel_futures=True)
+    return results, processed, time_budget_hit
+
 
 def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] = None,
          pending_out: Optional[list] = None) -> Optional[pd.DataFrame]:
@@ -1550,39 +1813,41 @@ def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] 
     if config is None: config = StrategyConfig()
     if cache is None: cache = CacheManager(expire_hours=config.CACHE_EXPIRE_HOURS)
 
+    fetch_stats["bs_ok"] = fetch_stats["ak_ok"] = fetch_stats["fail"] = 0
+
     # ==========================
     # 初始化数据源：Baostock 优先，登录失败降级 AkShare
     # ==========================
     if not _bs_login(max_retry=5):
         if _AK_AVAILABLE:
-            print("[WARN] Baostock 登录失败（已重试 5 次），本次运行降级为 AkShare 备用数据源")
+            logger.warning("Baostock 登录失败（已重试 5 次），本次运行降级为 AkShare 备用数据源")
             _bs_state["circuit_open"] = True
         else:
-            print("[ERROR] Baostock 登录失败，且未安装 AkShare（pip install akshare），无可用数据源")
+            logger.error("Baostock 登录失败，且未安装 AkShare（pip install akshare），无可用数据源")
             return None
     else:
-        print(f"[INFO] 数据源: Baostock（备用: {'AkShare' if _AK_AVAILABLE else '未安装 akshare，无备用'}）")
+        logger.info("数据源: Baostock（备用: %s）", "AkShare" if _AK_AVAILABLE else "未安装 akshare，无备用")
 
     try:
         market_env = get_market_environment(config, cache)
-        print(f"[INFO] 市场环境: {market_env.get('description', 'unknown')}")
+        logger.info("市场环境: %s", market_env.get("description", "unknown"))
 
         # 数据时效基准：市场（沪深300）最新交易日，个股日线/周线截止日期均须与之一致
         index_df = get_index_daily(config, cache)
         latest_trade_date = str(index_df["date"].iloc[-1]) \
             if index_df is not None and not index_df.empty and "date" in index_df.columns else None
         if latest_trade_date is None:
-            print("[WARN] 无法获取指数行情，本次运行跳过行情时效校验（停牌股可能混入待核验流程）")
+            logger.warning("无法获取指数行情，本次运行跳过行情时效校验（停牌股可能混入待核验流程）")
 
         stock_list = get_stock_list(config, cache)
         if not stock_list:
-            print("[WARN] 无法获取股票列表")
+            logger.warning("无法获取股票列表")
             return None
-        print(f"[INFO] 待筛选股票数: {len(stock_list)}")
+        logger.info("待筛选股票数: %d", len(stock_list))
 
         signals: list[dict] = []
-        processed, total = 0, len(stock_list)
-        stats = {"total": total, "error": 0, "fail_data": 0, "fail_stale": 0, "fail_fund": 0, "fail_tech": 0, "fail_rr": 0, "pass": 0}
+        stats = {"total": len(stock_list), "error": 0, "fail_data": 0, "fail_liq": 0,
+                 "fail_stale": 0, "fail_fund": 0, "fail_tech": 0, "fail_volatile": 0, "pass": 0}
 
         def _screen_one(stock: dict) -> tuple[Optional[Signal], str]:
             code, name = stock["code"], stock["name"]
@@ -1592,49 +1857,60 @@ def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] 
                 fund_data = get_fundamentals(code, cache, config)
                 return evaluate(daily_df, code, name, config, market_env, fund_data,
                                 latest_trade_date=latest_trade_date)
-            except Exception:
+            except Exception as e:
+                logger.debug("%s(%s) 筛选异常: %s", name, code, e)
                 return None, "ERROR"
 
-        # 并发执行 (依靠 bs_lock 保证 Baostock 查询不会互相踩踏)
-        with ThreadPoolExecutor(max_workers=config.MAX_WORKERS) as pool:
-            futures = {pool.submit(_screen_one, s): s for s in stock_list}
-            for future in as_completed(futures):
-                processed += 1
-                if processed % 500 == 0: print(f"[INFO] 进度: {processed}/{total}")
-                sig, reason = future.result()
-                if reason == "PASS" and sig is not None:
-                    stats["pass"] += 1
-                    signals.append(sig.to_dict())
-                elif reason == "FAIL_FUND": stats["fail_fund"] += 1
-                elif reason == "FAIL_DATA": stats["fail_data"] += 1
-                elif reason == "FAIL_STALE": stats["fail_stale"] += 1
-                # FAIL_CHASE（追高）/ FAIL_GAP（跳空）/ FAIL_RSI_HIGH（RSI过高）/ FAIL_CLIMAX_VOL（天量）/ FAIL_NOT_BOTTOM（非底部区域）
-                # / FAIL_POSITION（区间位置偏高）/ FAIL_MACD_MOM（动能未改善）/ FAIL_KDJ（KDJ未金叉）均属技术面入场质量层
-                elif reason in ("FAIL_TECH", "FAIL_CHASE", "FAIL_GAP", "FAIL_RSI_HIGH", "FAIL_CLIMAX_VOL",
-                                "FAIL_NOT_BOTTOM", "FAIL_DEEP_CRASH", "FAIL_RECENT_RALLY",
-                                "FAIL_POSITION", "FAIL_MACD_MOM", "FAIL_KDJ"): stats["fail_tech"] += 1
-                elif reason == "FAIL_RR": stats["fail_rr"] += 1
-                elif reason == "ERROR": stats["error"] += 1
+        # 并发筛选（共享骨架：线程池 + 心跳看门狗 + 时间预算；bs_lock 保证 Baostock 查询不互踩）
+        screen_start = time.time()
+        results, processed, time_budget_hit = run_concurrent_screen(stock_list, _screen_one, config, logger)
+        screen_minutes = (time.time() - screen_start) / 60
 
-        pass_data = stats["total"] - stats["fail_data"] - stats["fail_stale"] - stats["error"]
-        pass_fund = pass_data - stats["fail_fund"]
+        for sig, reason in results:
+            if reason == "PASS" and sig is not None:
+                stats["pass"] += 1
+                signals.append(sig.to_dict())
+            elif reason == "FAIL_FUND": stats["fail_fund"] += 1
+            elif reason == "FAIL_DATA": stats["fail_data"] += 1
+            elif reason == "FAIL_LIQUIDITY": stats["fail_liq"] += 1
+            elif reason == "FAIL_STALE": stats["fail_stale"] += 1
+            elif reason == "FAIL_VOLATILE": stats["fail_volatile"] += 1
+            # FAIL_CHASE（追高）/ FAIL_GAP（跳空）/ FAIL_RSI_HIGH（RSI过高）/ FAIL_CLIMAX_VOL（天量）/ FAIL_NOT_BOTTOM（非底部区域）
+            # / FAIL_POSITION（区间位置偏高）/ FAIL_MACD_MOM（动能未改善）/ FAIL_KDJ（KDJ未金叉）均属技术面入场质量层
+            elif reason in ("FAIL_TECH", "FAIL_CHASE", "FAIL_GAP", "FAIL_RSI_HIGH", "FAIL_CLIMAX_VOL",
+                            "FAIL_NOT_BOTTOM", "FAIL_DEEP_CRASH", "FAIL_RECENT_RALLY",
+                            "FAIL_POSITION", "FAIL_MACD_MOM", "FAIL_KDJ"): stats["fail_tech"] += 1
+            elif reason == "ERROR": stats["error"] += 1
+
+        # 漏斗日志（按已处理数计，预算截断时不失真）
+        pass_data = processed - stats["fail_data"] - stats["fail_stale"] - stats["error"]
+        pass_liq = pass_data - stats["fail_liq"]
+        pass_fund = pass_liq - stats["fail_fund"]
         pass_tech = pass_fund - stats["fail_tech"]
-        pass_rr = pass_tech - stats["fail_rr"]
+        pass_vol = pass_tech - stats["fail_volatile"]
 
-        print("\n" + "="*50)
-        print("📊 选股漏斗数据分析 (Funnel Log)")
-        print("="*50)
-        print(f"1. 初始有效股票池: {stats['total']} 只")
-        print(f"2. 获取数据并达标: {pass_data} 只 (淘汰/缺失 {stats['fail_data'] + stats['error']} 只)")
+        logger.info("=" * 50)
+        logger.info("[FUNNEL] 选股漏斗数据分析   筛选耗时 %.1f 分钟", screen_minutes)
+        logger.info("=" * 50)
+        if time_budget_hit:
+            logger.warning("[WARN] 因达到时间预算，以下漏斗仅统计已完成的 %d/%d 只", processed, stats["total"])
+        logger.info("1. 初始有效股票池: %d 只 (完成处理 %d 只)", stats["total"], processed)
+        logger.info("2. 获取数据并达标: %d 只 (淘汰/缺失 %d 只)", pass_data, stats["fail_data"] + stats["error"])
         if stats["fail_stale"] > 0:
-            print(f"   其中行情时效不符（停牌/数据滞后）: {stats['fail_stale']} 只，暂不推荐")
-        if pass_data > 0: print(f"3. 基本面防雷通过: {pass_fund} 只 (淘汰 {stats['fail_fund']} 只，通过率 {pass_fund/pass_data*100:.1f}%)")
-        if pass_fund > 0: print(f"4. 日线技术面达标: {pass_tech} 只 (淘汰 {stats['fail_tech']} 只，通过率 {pass_tech/pass_fund*100:.1f}%)")
-        if pass_tech > 0: print(f"5. 盈亏风控比达标: {pass_rr} 只 (淘汰 {stats['fail_rr']} 只，通过率 {pass_rr/pass_tech*100:.1f}%)")
-        print("="*50 + "\n")
+            logger.info("   其中行情时效不符（停牌/数据滞后）: %d 只，暂不推荐", stats["fail_stale"])
+        logger.info("3. 流动性达标: %d 只 (僵尸股淘汰 %d 只)", pass_liq, stats["fail_liq"])
+        if pass_liq > 0: logger.info("4. 基本面防雷通过: %d 只 (淘汰 %d 只，通过率 %.1f%%)",
+                                     pass_fund, stats["fail_fund"], pass_fund / pass_liq * 100)
+        if pass_fund > 0: logger.info("5. 日线技术面达标: %d 只 (淘汰 %d 只，通过率 %.1f%%)",
+                                      pass_tech, stats["fail_tech"], pass_tech / pass_fund * 100)
+        if pass_tech > 0: logger.info("6. 波动率风控达标: %d 只 (淘汰 %d 只，通过率 %.1f%%)",
+                                      pass_vol, stats["fail_volatile"], pass_vol / pass_tech * 100)
+        logger.info("日线取数来源: Baostock %d 只，AkShare 兜底 %d 只，双源均失败 %d 只",
+                    fetch_stats["bs_ok"], fetch_stats["ak_ok"], fetch_stats["fail"])
+        logger.info("=" * 50)
 
-        # 正式技术信号为空时，使用放宽技术确认的观察候选模式。
-        # 核心行情安全条件仍由 evaluate() 保留；仅降低评分/确认门槛，明确标记 fallback。
+        # 正式技术信号为空时，使用放宽技术确认的观察候选模式（默认关闭，ENABLE_DAILY_FALLBACK
+        # 开启时恢复）。核心行情安全条件仍由 evaluate() 保留；仅降低评分/确认门槛，明确标记 fallback。
         if not signals and config.ENABLE_DAILY_FALLBACK:
             relaxed = StrategyConfig(**{**asdict(config),
                 "MIN_PASS_GRADE": "C",
@@ -1661,12 +1937,12 @@ def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] 
             if fallback_candidates:
                 fallback_candidates.sort(key=lambda r: (-float(r.get("score", 0) or 0), str(r.get("code", ""))))
                 chosen = fallback_candidates[0]
-                print(f"[INFO] 保底观察候选：{chosen.get('name')}({chosen.get('code')})，"
-                      f"评分 {chosen.get('score')}，未计入正式推荐")
+                logger.info("保底观察候选：%s(%s)，评分 %s，未计入正式推荐",
+                            chosen.get("name"), chosen.get("code"), chosen.get("score"))
                 if pending_out is not None:
                     pending_out.extend(fallback_candidates[1:])
                 return pd.DataFrame([chosen])
-            print("[INFO] 未发现符合条件的信号")
+            logger.info("未发现符合条件的信号")
             return None
 
         # 确定性排序：评分降序 → 底背离优先 → 盈亏比 → 股票代码（末级键，结果可复现）
@@ -1737,15 +2013,15 @@ def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] 
             if weekly_dropped > 0:
                 conds = [f"周线MA{config.WEEKLY_MA_PERIOD}" + ("站上且上行" if config.WEEKLY_MA_BOTH_REQUIRED else "站上或上行")]
                 if config.REQUIRE_WEEKLY_MACD_STABLE: conds.append("周线MACD企稳")
-                print(f"[INFO] 周线确认：检查 {weekly_checked} 只，淘汰 {weekly_dropped} 只（未满足 {' + '.join(conds)}）")
+                logger.info("周线确认：检查 %d 只，淘汰 %d 只（未满足 %s）", weekly_checked, weekly_dropped, " + ".join(conds))
             if fund_late_dropped > 0:
-                print(f"[INFO] 决赛圈财务补齐后否决 {fund_late_dropped} 只（商誉/扣非/ROE/负债率超阈值）")
+                logger.info("决赛圈财务补齐后否决 %d 只（商誉/扣非/ROE/负债率超阈值）", fund_late_dropped)
             if industry_dropped > 0:
-                print(f"[INFO] 行业分散：淘汰 {industry_dropped} 只（同一行业最多 {config.MAX_PICKS_PER_INDUSTRY} 只）")
+                logger.info("行业分散：淘汰 %d 只（同一行业最多 %d 只）", industry_dropped, config.MAX_PICKS_PER_INDUSTRY)
             if pending_list:
                 detail = "、".join(f"{r.get('name')}({r.get('code')})" for r in pending_list[:10])
                 more = f" 等 {len(pending_list)} 只" if len(pending_list) > 10 else ""
-                print(f"[INFO] 待核验候选：{detail}{more}（财务/周线数据待补全，未进正式推荐）")
+                logger.info("待核验候选：%s%s（财务/周线数据待补全，未进正式推荐）", detail, more)
             df = pd.DataFrame(confirmed).reset_index(drop=True) if confirmed else df.iloc[0:0]
         else:
             if config.USE_INDUSTRY_DEDUP and not df.empty:
@@ -1754,7 +2030,8 @@ def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] 
                 df["weekly_status"] = "disabled"   # 周线确认未启用（两个开关均关闭）
             # 推荐数量上限：评分降序截取前 MAX_PICKS 只（周线路径在循环内已取满即止）
             if len(df) > config.MAX_PICKS:
-                print(f"[INFO] 通过 {len(df)} 只，按评分截取前 {config.MAX_PICKS} 只（淘汰 {len(df) - config.MAX_PICKS} 只低分信号）")
+                logger.info("通过 %d 只，按评分截取前 %d 只（淘汰 %d 只低分信号）",
+                            len(df), config.MAX_PICKS, len(df) - config.MAX_PICKS)
                 df = df.head(config.MAX_PICKS).reset_index(drop=True)
             # 周线未启用时：对最终名单做财务字段补齐与终审（四项防雷口径与决赛圈一致）
             if not df.empty:
@@ -1778,11 +2055,11 @@ def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] 
                         continue
                     keep_rows.append(row)
                 if len(keep_rows) < len(df):
-                    print(f"[INFO] 财务核验后保留 {len(keep_rows)}/{len(df)} 只（未核验/补齐后被否决的不进入正式推荐）")
+                    logger.info("财务核验后保留 %d/%d 只（未核验/补齐后被否决的不进入正式推荐）", len(keep_rows), len(df))
                 df = pd.DataFrame(keep_rows).reset_index(drop=True) if keep_rows else df.iloc[0:0]
 
-        # 保底观察候选：正式推荐为空时，从技术面已通过但周线/财务待核验的候选中选评分最高者。
-        # 该候选明确标记为 fallback，不改变正式推荐的严格口径，也不应直接用于实盘买入。
+        # 保底观察候选（默认关闭）：正式推荐为空时，从技术面已通过但周线/财务待核验的候选中选
+        # 评分最高者。该候选明确标记为 fallback，不改变正式推荐的严格口径，也不应直接用于实盘买入。
         if df.empty and config.ENABLE_DAILY_FALLBACK and pending_list:
             eligible = [r for r in pending_list
                         if float(r.get("score", 0) or 0) >= config.FALLBACK_MIN_SCORE]
@@ -1795,20 +2072,32 @@ def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] 
                 fallback["fund_status"] = fallback.get("fund_status", "missing")
                 df = pd.DataFrame([fallback])
                 pending_list = [r for r in pending_list if str(r.get("code")) != str(fallback.get("code"))]
-                print(f"[INFO] 保底观察候选：{fallback.get('name')}({fallback.get('code')})，"
-                      f"评分 {fallback.get('score')}，未计入正式推荐")
+                logger.info("保底观察候选：%s(%s)，评分 %s，未计入正式推荐",
+                            fallback.get("name"), fallback.get("code"), fallback.get("score"))
 
         if pending_out is not None:
             pending_out.extend(pending_list)
-        print(f"[INFO] 筛选完成，正式推荐 {len(df)} 只股票"
-              + (f"；待核验候选 {len(pending_list)} 只（数据待补全，未正式推荐）" if pending_list else ""))
+        logger.info("筛选完成，正式推荐 %d 只股票%s", len(df),
+                    f"；待核验候选 {len(pending_list)} 只（数据待补全，未正式推荐）" if pending_list else "")
         return df
 
     finally:
         # 无论发生什么异常，确保安全退出 Baostock（未登录时自动跳过）
         _bs_logout()
 
+def _setup_logging() -> None:
+    """统一日志格式：时间戳 + 级别 + 模块名，与 run.py / run_weekly_tracking.py 一致。"""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        stream=sys.stdout,
+        force=True,
+    )
+
+
 if __name__ == "__main__":
+    _setup_logging()
     mode = sys.argv[1] if len(sys.argv) > 1 else "full"
     if mode == "screen":
         result = main()

@@ -111,8 +111,33 @@ def run(argv: list[str] | None = None):
         t = time.time()
         logger.info("Step 2/4 执行放量突破选股策略（明细见 strategy.breakout 日志）...")
         output_df = main_breakout(config=config, cache=cache)
+        logger.info("Step 2/4 完成 (%.1f 分钟)，推荐 %d 只", (time.time() - t) / 60,
+                    0 if output_df is None else len(output_df))
+
+        # 组合层：同一交易日已被其他策略推荐的个股不再重复推荐（同股去重），
+        # 且两策略合计推荐数不超过 DAILY_TOTAL_MAX_PICKS（依赖运行顺序：后运行者去重）。
+        if output_df is not None and not output_df.empty:
+            try:
+                from store.mysql_store import fetch_rec_codes_for_date, is_configured as _ms_configured
+                if _ms_configured():
+                    sig_date = str(output_df.iloc[0].get("date", ""))
+                    existing = fetch_rec_codes_for_date(sig_date) if sig_date else set()
+                    if existing:
+                        before = len(output_df)
+                        output_df = output_df[~output_df["code"].astype(str).isin(existing)].reset_index(drop=True)
+                        if len(output_df) < before:
+                            logger.info("组合层去重：%d 只今日已被其他策略推荐，剔除后剩 %d 只",
+                                        before - len(output_df), len(output_df))
+                    cap = int(getattr(config, "DAILY_TOTAL_MAX_PICKS", 7))
+                    room = max(0, cap - len(existing))
+                    if len(output_df) > room:
+                        logger.info("组合层总量上限：今日已推 %d 只，本策略截取前 %d 只（合计 ≤%d）",
+                                    len(existing), room, cap)
+                        output_df = output_df.head(room).reset_index(drop=True)
+            except Exception as e:
+                logger.warning("组合层去重/上限检查失败（按原结果继续）: %s", e)
+
         n_picks = 0 if output_df is None else len(output_df)
-        logger.info("Step 2/4 完成 (%.1f 分钟)，推荐 %d 只", (time.time() - t) / 60, n_picks)
         if output_df is not None and not output_df.empty:
             for _, r in output_df.iterrows():
                 logger.info("  推荐: %s(%s) 评分 %s %s级 L%s 突破幅度 %s%% 收盘 %s",
@@ -120,12 +145,12 @@ def run(argv: list[str] | None = None):
                             r.get("breakout_level"), r.get("breakout_margin"), r.get("close"))
 
         # Step 3: 推荐结果落库 MySQL。stock_recommendation 的唯一键为
-        # (rec_date, code)，同日同股重复推荐由 INSERT IGNORE 跳过。
+        # (rec_date, code, strategy)，同一股票同日可被两套策略分别推荐并存。
         if not args.no_save:
             t = time.time()
             logger.info("Step 3/4 推荐结果落库 MySQL...")
             try:
-                save_recommendations(output_df)
+                save_recommendations(output_df, strategy="volume_breakout")
             except Exception as e:
                 logger.warning("Step 3/4 落库失败（不影响通知）: %s", e)
             logger.info("Step 3/4 完成 (%.1f 秒)", time.time() - t)
@@ -136,9 +161,7 @@ def run(argv: list[str] | None = None):
         if not args.no_notify:
             t = time.time()
             logger.info("Step 4/4 发送飞书通知...")
-            # 复用 notify_screening_result，标题通过 output_df 的元数据区分
-            # 若需独立标题，可扩展 feishu.py 的 notify_screening_result 增加 strategy 参数
-            notify_screening_result(output_df, market_env=market_env_desc)
+            notify_screening_result(output_df, market_env=market_env_desc, strategy="volume_breakout")
             logger.info("Step 4/4 完成 (%.1f 秒)", time.time() - t)
         else:
             logger.info("Step 4/4 已跳过（--no-notify）")

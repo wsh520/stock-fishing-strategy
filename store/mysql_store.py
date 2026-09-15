@@ -67,10 +67,11 @@ CREATE TABLE IF NOT EXISTS stock_recommendation (
     fund_status      VARCHAR(16)     NULL COMMENT '财务核验 verified/partial/missing',
     weekly_status    VARCHAR(16)     NULL COMMENT '周线核验 confirmed/unverified/disabled',
     rec_tier         VARCHAR(8)      NULL COMMENT '推荐层级 formal/pending',
+    strategy         VARCHAR(16)     NOT NULL DEFAULT 'bottom_fishing' COMMENT '策略来源 bottom_fishing/volume_breakout',
     missing_tags     VARCHAR(255)    NULL COMMENT '缺失项标签（逗号分隔）',
     created_at       DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '写入时间',
     PRIMARY KEY (id),
-    UNIQUE KEY uk_rec_date_code (rec_date, code),
+    UNIQUE KEY uk_rec_date_code_strategy (rec_date, code, strategy),
     KEY idx_code (code),
     KEY idx_rec_date (rec_date)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='每日选股推荐记录'
@@ -104,8 +105,14 @@ _RECOMMENDATION_ALTERS = {
     "fund_status": "ADD COLUMN fund_status VARCHAR(16) NULL COMMENT '财务核验 verified/partial/missing' AFTER signals_hit",
     "weekly_status": "ADD COLUMN weekly_status VARCHAR(16) NULL COMMENT '周线核验 confirmed/unverified/disabled' AFTER fund_status",
     "rec_tier": "ADD COLUMN rec_tier VARCHAR(8) NULL COMMENT '推荐层级 formal/pending' AFTER weekly_status",
+    "strategy": "ADD COLUMN strategy VARCHAR(16) NOT NULL DEFAULT 'bottom_fishing' COMMENT '策略来源 bottom_fishing/volume_breakout' AFTER rec_tier",
     "missing_tags": "ADD COLUMN missing_tags VARCHAR(255) NULL COMMENT '缺失项标签（逗号分隔）' AFTER rec_tier",
 }
+
+# 策略来源合法值（落库前校验，防止脏数据污染按策略分列的追踪/归因）
+STRATEGY_BOTTOM_FISHING = "bottom_fishing"
+STRATEGY_VOLUME_BREAKOUT = "volume_breakout"
+KNOWN_STRATEGIES = (STRATEGY_BOTTOM_FISHING, STRATEGY_VOLUME_BREAKOUT)
 
 _tables_ready = False  # 进程内只确保一次建表
 
@@ -166,6 +173,21 @@ def _ensure_tables(conn) -> None:
             if col not in existing:
                 cur.execute(f"ALTER TABLE stock_recommendation {alter}")
                 logger.info("stock_recommendation 已补充列: %s", col)
+        # 存量表唯一键升级（幂等）：(rec_date, code) → (rec_date, code, strategy)，
+        # 允许同一股票同日被两套策略分别推荐并存；须在 strategy 列补齐之后执行。
+        # 历史存量行 strategy 回填默认值 'bottom_fishing'，与原唯一键语义兼容。
+        cur.execute(
+            "SELECT DISTINCT INDEX_NAME FROM information_schema.STATISTICS "
+            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'stock_recommendation'"
+        )
+        indexes = {row[0] for row in cur.fetchall()}
+        if "uk_rec_date_code" in indexes and "uk_rec_date_code_strategy" not in indexes:
+            cur.execute(
+                "ALTER TABLE stock_recommendation "
+                "DROP INDEX uk_rec_date_code, "
+                "ADD UNIQUE KEY uk_rec_date_code_strategy (rec_date, code, strategy)"
+            )
+            logger.info("stock_recommendation 唯一键已升级为 (rec_date, code, strategy)")
     _tables_ready = True
 
 
@@ -176,13 +198,20 @@ def _f(v: Any) -> Optional[float]:
     return float(v)
 
 
-def save_recommendations(df: Optional[pd.DataFrame]) -> int:
-    """将选股结果写入 stock_recommendation，(rec_date, code) 重复时忽略。返回新插入行数。"""
+def save_recommendations(df: Optional[pd.DataFrame], strategy: str = STRATEGY_BOTTOM_FISHING) -> int:
+    """将选股结果写入 stock_recommendation，(rec_date, code, strategy) 重复时忽略。
+
+    strategy：策略来源（bottom_fishing / volume_breakout）。同一股票同日可被两套
+    策略分别推荐并存，周度追踪与归因按来源分列。返回新插入行数。
+    """
     if df is None or df.empty:
         return 0
     if not is_configured():
         logger.info("MySQL 未配置（MYSQL_HOST/USER/PASSWORD/DATABASE），跳过推荐结果落库")
         return 0
+    if strategy not in KNOWN_STRATEGIES:
+        logger.warning("未知策略来源 %r，按 %r 落库", strategy, STRATEGY_BOTTOM_FISHING)
+        strategy = STRATEGY_BOTTOM_FISHING
 
     rows = []
     for _, r in df.iterrows():
@@ -198,6 +227,7 @@ def save_recommendations(df: Optional[pd.DataFrame]) -> int:
             str(r.get("fund_status", "") or "") or None,
             str(r.get("weekly_status", "") or "") or None,
             str(r.get("tier", "formal") or "formal") or None,
+            strategy,
             str(r.get("missing_tags", "") or "") or None,
         ))
 
@@ -205,8 +235,8 @@ def save_recommendations(df: Optional[pd.DataFrame]) -> int:
         INSERT IGNORE INTO stock_recommendation
         (rec_date, code, name, rec_close, score, grade, daily_score, rsi, rsi7, rsi21,
          vol_ratio, turnover_ratio, stop_loss, take_profit, rr_ratio, market_env, has_divergence,
-         signals_hit, fund_status, weekly_status, rec_tier, missing_tags)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+         signals_hit, fund_status, weekly_status, rec_tier, strategy, missing_tags)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     """
     try:
         conn = _connect()
@@ -214,7 +244,7 @@ def save_recommendations(df: Optional[pd.DataFrame]) -> int:
             _ensure_tables(conn)
             with conn.cursor() as cur:
                 inserted = cur.executemany(sql, rows)
-            logger.info("推荐结果已落库：新增 %d 条（共提交 %d 条，重复自动忽略）", inserted or 0, len(rows))
+            logger.info("推荐结果已落库[%s]：新增 %d 条（共提交 %d 条，重复自动忽略）", strategy, inserted or 0, len(rows))
             return int(inserted or 0)
         finally:
             conn.close()
@@ -232,12 +262,12 @@ def get_active_recommendations(max_age_days: int = TRACK_MAX_AGE_DAYS,
         return []
 
     sql = """
-        SELECT r.id, r.rec_date, r.code, r.name, r.rec_close,
+        SELECT r.id, r.rec_date, r.code, r.name, r.rec_close, r.strategy,
                COALESCE(MAX(t.week_no), 0) AS tracked_weeks
         FROM stock_recommendation r
         LEFT JOIN stock_tracking t ON t.rec_id = r.id
         WHERE r.rec_date >= CURDATE() - INTERVAL %s DAY
-        GROUP BY r.id, r.rec_date, r.code, r.name, r.rec_close
+        GROUP BY r.id, r.rec_date, r.code, r.name, r.rec_close, r.strategy
         HAVING tracked_weeks < %s
         ORDER BY r.rec_date DESC, r.id
     """
@@ -254,6 +284,30 @@ def get_active_recommendations(max_age_days: int = TRACK_MAX_AGE_DAYS,
     except Exception as e:
         logger.warning("查询追踪期推荐记录失败: %s", e)
         return []
+
+
+def fetch_rec_codes_for_date(rec_date: str) -> set[str]:
+    """查询某日已落库推荐的股票代码集合（跨全部策略），供组合层同股去重。
+
+    后运行的策略在落库前调用：剔除当日已被其他策略推荐的个股，
+    避免两套策略同日重复推荐同一标的。未配置 MySQL 或查询失败时返回空集
+    （降级为不去重，与落库可选哲学一致）。
+    """
+    if not is_configured():
+        return set()
+    sql = "SELECT DISTINCT code FROM stock_recommendation WHERE rec_date = %s"
+    try:
+        conn = _connect()
+        try:
+            _ensure_tables(conn)
+            with conn.cursor() as cur:
+                cur.execute(sql, (str(rec_date),))
+                return {str(row[0]) for row in cur.fetchall()}
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.warning("查询当日已推荐代码失败（降级为不去重）: %s", e)
+        return set()
 
 
 def save_tracking(rec_id: int, rec_date: Any, code: str, week_no: int,
@@ -305,7 +359,7 @@ def get_attribution_rows(days: int = 90) -> list[dict]:
 
     sql = """
         SELECT r.id, r.rec_date, r.code, r.name, r.grade, r.has_divergence, r.market_env,
-               r.score, r.daily_score, t.week_no, t.return_pct
+               r.score, r.daily_score, r.strategy, t.week_no, t.return_pct
         FROM stock_recommendation r
         JOIN stock_tracking t ON t.rec_id = r.id
         WHERE r.rec_date >= CURDATE() - INTERVAL %s DAY

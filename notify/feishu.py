@@ -63,27 +63,36 @@ def _divider() -> dict:
     return {"tag": "hr"}
 
 
+_STRATEGY_ZH = {"bottom_fishing": "抄底", "volume_breakout": "突破"}
+
+
 def notify_screening_result(
     df: Optional[pd.DataFrame],
     market_env: str = "unknown",
     error_msg: Optional[str] = None,
     pending: Optional[pd.DataFrame] = None,
+    strategy: str = "bottom_fishing",
 ) -> None:
     """发送选股结果通知。
 
-    参数匹配 run.py 中的调用:
-        notify_screening_result(output_df, market_env=market_env_desc, pending=pending_df)
+    参数匹配 run.py / run_breakout.py 中的调用:
+        notify_screening_result(output_df, market_env=market_env_desc, pending=pending_df, strategy="bottom_fishing")
+        notify_screening_result(output_df, market_env=market_env_desc, strategy="volume_breakout")
         notify_screening_result(None, market_env=market_env_desc, error_msg=str(e))
 
-    分层展示：df 为正式推荐（低位企稳候选）；pending 为待核验候选
+    分层展示：df 为正式推荐；pending 为待核验候选
     （财务/周线数据缺失，未正式推荐，不与正式推荐混排）。
+    strategy 决定卡片标题措辞与单票描述格式（抄底=低位企稳候选 / 突破=放量突破候选）。
     """
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    is_breakout = strategy == "volume_breakout"
+    candidate_label = "放量突破候选" if is_breakout else "低位企稳候选"
+    card_title = "放量突破选股结果" if is_breakout else "选股结果"
 
     # 异常通知
     if error_msg:
         card = {
-            "header": _build_header("选股策略执行异常", color="red"),
+            "header": _build_header(f"{card_title}执行异常", color="red"),
             "elements": [
                 _md_element(f"**时间:** {now}\n**市场环境:** {market_env}"),
                 _divider(),
@@ -93,12 +102,17 @@ def notify_screening_result(
         _send_feishu(card)
         return
 
-    # 尝试导入 describe 函数
+    # 尝试导入 describe 函数（按策略来源选择卡片格式）
     try:
         from bottom_fishing_strategy import describe, describe_pending
     except ImportError:
         describe = None
         describe_pending = None
+    try:
+        from volume_breakout_strategy import describe_breakout
+    except ImportError:
+        describe_breakout = None
+    describe_fn = (describe_breakout or describe) if is_breakout else describe
 
     def _pending_elements() -> list:
         """待核验候选区块：与正式推荐分开，说明缺什么、为什么没进正式推荐"""
@@ -125,7 +139,7 @@ def notify_screening_result(
         if pending is not None and not pending.empty:
             no_signal_text += f"\n另有待核验候选 {len(pending)} 只（数据待补全）。"
         card = {
-            "header": _build_header("选股结果 - 今日无信号", color="grey"),
+            "header": _build_header(f"{card_title} - 今日无信号", color="grey"),
             "elements": [
                 _md_element(f"**时间:** {now}\n**市场环境:** {market_env}\n\n{no_signal_text}"),
                 *_pending_elements(),
@@ -136,14 +150,14 @@ def notify_screening_result(
 
     # 有信号
     elements = [
-        _md_element(f"**时间:** {now}\n**市场环境:** {market_env}\n**推荐数量:** {len(df)} 只（低位企稳候选）"),
+        _md_element(f"**时间:** {now}\n**市场环境:** {market_env}\n**推荐数量:** {len(df)} 只（{candidate_label}）"),
         _divider(),
     ]
 
     for _, row in df.head(10).iterrows():
         r = row.to_dict()
-        if describe:
-            text = describe(r)
+        if describe_fn:
+            text = describe_fn(r)
         else:
             text = (
                 f"**{r.get('name', '')} {r.get('code', '')}**\n"
@@ -162,7 +176,7 @@ def notify_screening_result(
     elements.extend(_pending_elements())
 
     card = {
-        "header": _build_header(f"选股结果 - {len(df)}只信号", color="green"),
+        "header": _build_header(f"{card_title} - {len(df)}只信号", color="green"),
         "elements": elements,
     }
     _send_feishu(card)
@@ -171,8 +185,11 @@ def notify_screening_result(
 def notify_tracking_result(report: Optional[pd.DataFrame]) -> None:
     """发送周度追踪报告。
 
-    参数匹配 run.py 中的调用:
+    参数匹配 run_weekly_tracking.py 中的调用:
         notify_tracking_result(report)
+
+    report 含 strategy 列时按策略来源分列统计（抄底/突破各自的数量/胜率/平均收益），
+    逐只明细行也带 [抄底]/[突破] 前缀标签。
     """
     if report is None or report.empty:
         return
@@ -187,6 +204,20 @@ def notify_tracking_result(report: Optional[pd.DataFrame]) -> None:
     status_counts = report["status"].value_counts().to_dict()
     status_text = " | ".join([f"{k}: {v}只" for k, v in status_counts.items()])
 
+    # 按策略来源分列（无 strategy 列的旧调用保持单段汇总）
+    strategy_lines = ""
+    if "strategy" in report.columns:
+        parts = []
+        for strat, grp in report.groupby(report["strategy"].fillna("bottom_fishing")):
+            g_total = len(grp)
+            g_win = len(grp[grp["return_pct"] > 0])
+            g_wr = g_win / g_total * 100 if g_total > 0 else 0
+            g_avg = grp["return_pct"].mean()
+            label = _STRATEGY_ZH.get(str(strat), str(strat))
+            parts.append(f"**{label}**: {g_total} 只 | 胜率 {g_wr:.1f}% | 平均收益 {'+' if g_avg >= 0 else ''}{g_avg:.2f}%")
+        if parts:
+            strategy_lines = "\n" + "\n".join(parts)
+
     elements = [
         _md_element(
             f"**时间:** {now}\n"
@@ -194,6 +225,7 @@ def notify_tracking_result(report: Optional[pd.DataFrame]) -> None:
             f"**胜率:** {win_rate:.1f}% ({win}/{total})\n"
             f"**平均收益:** {avg_return:.2f}%\n"
             f"**状态分布:** {status_text}"
+            f"{strategy_lines}"
         ),
         _divider(),
     ]
@@ -203,8 +235,10 @@ def notify_tracking_result(report: Optional[pd.DataFrame]) -> None:
         r = row.to_dict()
         ret = r.get("return_pct", 0)
         emoji = "+" if ret >= 0 else ""
+        strat_tag = f"[{_STRATEGY_ZH.get(str(r.get('strategy') or 'bottom_fishing'), '?')}] " \
+            if "strategy" in r else ""
         elements.append(_md_element(
-            f"**{r.get('name', '')} {r.get('code', '')}** "
+            f"{strat_tag}**{r.get('name', '')} {r.get('code', '')}** "
             f"| {r.get('status', '')} "
             f"| 推荐价 {r.get('rec_price', 0)} → 现价 {r.get('current_price', 0)} "
             f"| 收益 {emoji}{ret:.2f}%"
