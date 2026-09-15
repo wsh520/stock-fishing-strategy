@@ -34,7 +34,12 @@ from typing import Any, Callable, Optional
 import numpy as np
 import pandas as pd
 
-import baostock as bs
+try:
+    import baostock as bs
+    _BS_AVAILABLE = True
+except ImportError:  # 允许只使用本地 CSV 的独立回测模块在无 Baostock 环境下运行
+    bs = None
+    _BS_AVAILABLE = False
 
 # Baostock (0.9.0, 已停更) 的 ResultData.get_data() 翻页时内部使用 DataFrame.append，
 # 该方法在 pandas 2.0 中被移除。数据量小（个股日线/指数/基本面，单页装下）时不触发，
@@ -287,6 +292,8 @@ _BS_CIRCUIT_THRESHOLD = 8  # 连续失败达到该次数后熔断（单次取数
 
 def _bs_login(max_retry: int = 5) -> bool:
     """Baostock 登录。bs.login 失败时也返回对象，必须检查 error_code 才算真正重试。"""
+    if not _BS_AVAILABLE:
+        return False
     if _bs_state["logged_in"]:
         return True  # 幂等：已登录直接返回，避免 run.py 预取市场环境后 main() 重复登录
     for attempt in range(max_retry):
@@ -979,6 +986,13 @@ def compute_market_environment(df_index: pd.DataFrame, config: StrategyConfig) -
     elif slope < config.MARKET_BEAR_SLOPE: regime, desc = "bear", f"偏空（MA20斜率 {slope:.4f}，沪深300收于 {close_now:.0f}）"
     else: regime, desc = "neutral", f"中性（MA20斜率 {slope:.4f}，沪深300收于 {close_now:.0f}）"
     return {"regime": regime, "description": desc, "ma20": round(ma_now, 2), "slope": round(slope, 6), "close": round(close_now, 2)}
+
+def _effective_regime(regime: str, config: StrategyConfig) -> str:
+    """Map unavailable market state to the configured conservative regime."""
+    value = str(regime or "unknown").lower()
+    if value == "unknown" and getattr(config, "UNKNOWN_AS_BEAR", True):
+        return "bear"
+    return value if value in {"bull", "neutral", "bear"} else "neutral"
 
 def _is_financial_stock(code: str, name: str, config: StrategyConfig) -> bool:
     """金融业（银行/保险/券商/信托/期货）识别：名称关键词 + 代码白名单（覆盖无关键词的知名金融股）"""
