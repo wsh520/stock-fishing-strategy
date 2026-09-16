@@ -43,7 +43,7 @@
 
 ---
 
-### 二、五层过滤漏斗
+### 二、七层过滤漏斗
 
 沿用 `evaluate()` 的原因码风格，每层单独归因，日志漏斗可看到各层淘汰量。
 
@@ -51,8 +51,9 @@
 直接调用 `check_fundamentals(fund_data, config, code, name)`。ROE 年化 ≥ 5%、非金融负债率 ≤ 70%、金融负债率 ≤ 97%、商誉/净资产 ≤ 20%、扣非净利/净利 ≥ 0.5。数据缺失放行不误杀。失败码 `FAIL_FUND`。
 
 #### 层 2｜流动性 & 数据完整性（继承）
-- 近 20 日日均成交额 ≥ 5000 万（`MIN_AMOUNT`），僵尸股淘汰，失败码 `FAIL_LIQUIDITY`
+- 近 20 日日均成交额 ≥ `MIN_AMOUNT`（3000 万，与抄底策略同一常量；原 500 万对主板几乎无筛选力），僵尸股淘汰，失败码 `FAIL_LIQUIDITY`
 - K 线数不足 `MIN_DAYS=60` 直接 `FAIL_DATA`
+- 停牌缺口 `FAIL_HALT_GAP`（相邻 bar 自然日间隔 > `MAX_BAR_GAP_DAYS=12`）：突破位（60/20 日最高价）、平台振幅、量比窗口都会跨缺口取值，判定失去意义
 
 #### 层 3｜日线技术面（本策略核心）
 
@@ -80,7 +81,7 @@
 - **收盘接近最高**：`close / high` ≥ `MIN_CLOSE_TO_HIGH=0.97`（避免尾盘跳水）
 - **当日涨幅下限**：`pct_chg` ≥ `MIN_BREAKOUT_PCT=2.0`%（有效突破幅度）
 - **当日涨幅上限**：`pct_chg` ≤ `MAX_BREAKOUT_PCT=7.0`%（涨停/接近涨停买不进，且次日易回调）
-- **跳空高开上限**：`open / prev_close − 1` ≤ `MAX_GAP_UP_PCT=3.0`%（大幅跳空追买风险大，继承）
+- **跳空高开上限**：`open / prev_close − 1` ≤ `MAX_GAP_UP_PCT=2.0`%（大幅跳空追买风险大，沿用抄底策略阈值）
 
 失败码 `FAIL_FAKE_BREAKOUT`（上影长/尾盘跳水）/ `FAIL_CHASE`（追高）/ `FAIL_GAP`（跳空）。
 
@@ -127,10 +128,10 @@ ATR / 现价 ≤ `MAX_ATR_PCT_BREAKOUT=4.0`%。突破股天然波动更大，比
 
 评分维度（合计 100 分，`W_*` 与抄底风格对齐）：
 
-- **W_BREAKOUT=35**：突破级别（L1=1.0 / L2=0.75 / L3=0.5）× 突破幅度 smoothstep（0.5%–5% 从 0 到 1）
+- **W_BREAKOUT=35**：`0.55 × 级别系数（L1=1.0 / L2=0.75 / L3=0.5）+ 0.45 × 幅度 smoothstep（0.5%–5% 从 0 到 1）`。初版为纯乘法 `级别 × 幅度`，L2/L3 的级别系数把幅度分压得极低（常规 1–2% 幅度下 L2 仅约 4 分），B 级 60 分准入下 L2/L3 事实上无法通过、等于只推 L1，信号稀疏；改为加法混合后 L2 常规突破约 18 分，配合其他维度可达成准入
 - **W_VOLUME=25**：`0.7 × 放量质量 + 0.3 × 整理质量`（加权加法，避免单维度归零拖垮整体）。放量质量 = 量比 smoothstep（1.8–2.5 上升到峰、2.5–4.0 平滑下降、>4 归零）；整理质量 = platform_tightness 反向 smoothstep（std/mean 越小分越高）。初版用乘法 `vol_quality × compression_quality`，合成数据测试发现多日突破行情下 compression_quality 恒为 0（突破本身抬高 ATR），导致 volume_br_score 整体归零，改为加权加法
-- **W_PATTERN=15**：平台振幅越小分越高（0–18% 反向 smoothstep）+ 波动率压缩比
-- **W_TREND=15**：MA20 斜率 + MA60 斜率 + 多头排列加分（close > MA20 > MA60）
+- **W_PATTERN=15**：平台振幅越小分越高（5%–18% 反向 smoothstep）
+- **W_TREND=15**：`0.5 × MA20 斜率 + 0.3 × MA60 斜率 + 0.2 × 多头排列（close > MA20 > MA60）`
 - **W_MOMENTUM=10**：MACD 金叉/柱体放大 + KDJ 未高位钝化（K ≤ 80）+ RSI 未在超买
 
 等级门槛 `MIN_PASS_GRADE="B"`（≥60 分）；熊市 `BEAR_GRADE_BOOST=15`（比抄底 10 更严，因为突破在熊市胜率显著更低）。
@@ -159,9 +160,9 @@ ATR / 现价 ≤ `MAX_ATR_PCT_BREAKOUT=4.0`%。突破股天然波动更大，比
 - **止损**：`max(突破位 Lk − 1×ATR, 现价 × (1 − FIXED_STOP_LOSS_PCT_BREAKOUT=6%))`
   - 取两者较高值，既尊重技术位又保证止损不会低于固定 6% 风险上限
   - ATR 缺失时退回固定 6%
-- **止盈**：`现价 × (1 + FIXED_TAKE_PROFIT_PCT_BREAKOUT=15%)`
-  - 比抄底 10% 高，趋势启动目标盈利更大
-- **风险收益比**：要求 `MIN_RR_RATIO_BREAKOUT=1.5`，避免止损过宽而收益不足的交易计划
+- **止盈**：`min(现价 × (1 + FIXED_TAKE_PROFIT_PCT_BREAKOUT=15%), 现价 + ATR_TAKE_PROFIT_MULT(5) × ATR)`
+  - 比抄底 10% 高，趋势启动目标盈利更大；加入 ATR 目标并取更近者，避免高波动股把止盈挂得离场太远
+- **风险收益比**：`MIN_RR_RATIO_BREAKOUT` 检查已删除——止损 ≤6%/止盈 15% 下 RR ≥2.5 恒成立，检查永不触发；`rr_ratio` 仅作展示与落库，波动率风控由层 4 的 `MAX_ATR_PCT_BREAKOUT` 承担
 
 ---
 
@@ -185,7 +186,7 @@ ATR / 现价 ≤ `MAX_ATR_PCT_BREAKOUT=4.0`%。突破股天然波动更大，比
 - `main_breakout(...)`：编排函数，替代 `main`
 - `BreakoutSignal` dataclass：与 `Signal` 字段兼容（保证 `save_recommendations` 直接可用），额外携带 `breakout_level`、`breakout_margin`、`platform_range` 用于排序与展示
 
-**MySQL 落库**：`run_breakout.py` 当前复用现有 `stock_recommendation` 表和周度追踪链路。该表唯一键是 `(rec_date, code)`，若同一天同一只股票同时被抄底与突破策略选中，后写入的一条会由 `INSERT IGNORE` 跳过；若需要分别统计两种策略，应后续增加 `strategy` 字段并同步迁移追踪查询。
+**MySQL 落库**：`run_breakout.py` 复用 `stock_recommendation` 表和周度追踪链路，落库时写入 `strategy='volume_breakout'`。唯一键已从 `(rec_date, code)` 升级为 `(rec_date, code, strategy)`（程序启动时幂等迁移，历史行 `strategy` 回填 `'bottom_fishing'`），因此同一股票同日可被抄底与突破分别推荐并存；`run_breakout.py` 在落库前额外调用 `fetch_rec_codes_for_date` 做组合层同股去重与 `DAILY_TOTAL_MAX_PICKS=7` 合计上限（依赖运行顺序，后运行者去重）。
 
 ---
 
@@ -222,7 +223,9 @@ ATR / 现价 ≤ `MAX_ATR_PCT_BREAKOUT=4.0`%。突破股天然波动更大，比
 | FIXED_STOP_LOSS_PCT_BREAKOUT | 6.0 | 固定止损（%，ATR 缺失时用） |
 | FIXED_TAKE_PROFIT_PCT_BREAKOUT | 15.0 | 固定止盈（%） |
 | ATR_STOP_MULT_BREAKOUT | 1.0 | 突破位下方 ATR 止损倍数 |
-| MIN_RR_RATIO_BREAKOUT | 1.5 | 计划收益风险比最低要求 |
+| ATR_TAKE_PROFIT_MULT | 5.0 | ATR 止盈倍数（与固定 15% 目标取更近者） |
+| REQUIRE_L1_OR_L2 | True | 开启后仅认 L1/L2 突破，L3（MA60）不触发信号 |
+| KDJ_K_MAX_BREAKOUT | 80.0 | 动能组 KDJ K 值上限（比抄底 55 放宽） |
 | ADAPTIVE_VOLUME_LOOKBACK | 60 | 个股历史量能分位数窗口 |
 | MIN_VOLUME_PERCENTILE | 0.80 | 突破日最低历史量能分位数 |
 | MIN_AMOUNT_RATIO | 1.5 | 突破日成交额/前20日中位数最低比率 |
