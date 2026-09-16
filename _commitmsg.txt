@@ -1,0 +1,46 @@
+P0 策略优化：修复双源 pct_chg 口径与停牌缺口 + 排序质量分 + 熊市减仓熔断
+
+数据正确性（bug 修复，非策略选择）：
+- A1 pct_chg 双源统一：Baostock pctChg / AkShare 东财「涨跌幅」不再透传，一律由 qfq
+  收盘价自算（_recompute_pct_chg）。原三条取数路径口径互不一致，而该字段直接驱动
+  MAX_ENTRY_PCT_CHG / MIN_BREAKOUT_PCT / MAX_BREAKOUT_PCT 三个硬否决——同一只股票会
+  因「本次由哪个数据源服务」而被不同判决，熔断切换时全池过滤行为漂移，除权日还会把
+  股息除权误报为暴跌。在 _normalize_* 与 _fetch_*_dual 出口双重覆盖，旧世代磁盘缓存
+  无需清理即自动生效。
+- A2 停牌缺口过滤 FAIL_HALT_GAP：MIN_DAYS 只数 bar 总数、REQUIRE_FRESH_DAILY 只看末根
+  日期，停牌 30~60 天的复牌股两者都能骗过，而其 ma20/rsi14/kdj/atr/60日高点/量比 全部
+  跨缺口计算（「近60日最高价」实际是 5 个月前的高点，量比把停牌前死量与复牌后爆量混进
+  同一窗口）。新增 has_halt_gap 按相邻 bar 最大自然日间隔判定，阈值 12 天可容纳春节
+  (约11天)/国庆(约8天)长假；抄底与突破两套策略共用同一守卫。
+
+排序层（B1）：
+- daily_score 由 40/25/25/10 四个布尔分项求和，通过者只落在 {60,65,68,75,83,90,93,100}
+  几个离散值上，号称 0~100 的评分实际是 3-bit 变量；大量并列时 _rank_signals 退化到用
+  rr_ratio（≡ 0.05/ATR%，固定止盈除以 ATR 止损的代数残留，从未被设计为排序键）乃至
+  code 字母序决定 Top5。
+- 新增 _rank_quality_score：低波动/回撤深度/区间位置三个连续维度，全部取自
+  compute_daily_signals 已算出的列，零额外取数。只作排序主键 rank_score，不参与任何
+  门槛判定，故「哪些股票通过」完全不变，只改变通过者之间的先后顺序。
+  RANK_QUALITY_WEIGHT=0 可完全退回旧行为；_rank_signals 在该列缺失时自动退回 score
+  （兼容 backtest 与既有单元测试手工构造的 DataFrame）。
+- 动能维度默认权重 0：REQUIRE_MACD_MOMENTUM + MACD_MOMENTUM_DAYS=2 已是硬闸门，通过者
+  在该维度实测恒为满分（无区分度），与已删除的 DAILY_RSI_OVERBOUGHT_PENALTY 同属被前置
+  闸门架空的死权重；实现与参数保留，便于关闭 MACD 闸门做 A/B 时重新启用。
+
+组合层（B2）：
+- 推荐数量按市场环境收缩（牛 5 / 中性 4 / 熊 2）。原实现 regime 的唯一作用是抬高准入
+  分数线 BEAR_GRADE_BOOST 分，推荐数量在牛/中/熊一律 MAX_PICKS，与 UNKNOWN_AS_BEAR
+  注释承诺的「推荐上限收缩」不符（该行为此前只在 main_breakout 实现）。
+- 新增市场级熔断：沪深300 近 5 个交易日累计跌幅 < -4% 时整日不推荐。急跌期间全市场同步
+  触发超卖/拐头/底背离，MA20_TREND_MIN_SLOPE 是个股级过滤，抓不到系统性风险。
+
+回测与可观测性：
+- backtest.py 改用 resolve_max_picks / market_crash_halt，与实盘口径一致（否则回测会
+  高估实盘表现）；_REASON_ZH 补全 FAIL_HALT_GAP / FAIL_LIQUIDITY / FAIL_VOLATILE，并
+  修正 FAIL_NOT_BOTTOM(10%) / FAIL_POSITION(50%) 两处与配置不符的过期标签。
+- run.py 推荐日志并列打印技术分与排序分，便于在 CI 日志核对「为什么是这几只入选」。
+
+测试：新增 test_optimizations_p0.py（75 项，覆盖 A1/A2/B1/B2 全部改动）。四套合计
+199/202——test_strategy_fixes 的 3 项滞回用例因本机沙箱禁止 tempfile 目录写入、状态
+JSON 无法落盘而失败；已用 git stash 跑 HEAD 基线对照，确认改动前同样 41/44 且失败项
+完全相同，非本次回归（同一序列改用工作区内可写目录重跑 6/6 全通过）。
