@@ -10,18 +10,20 @@
 3.  流动性否决独立归因 FAIL_LIQUIDITY（不再混入 FAIL_DATA）
 4.  波动率否决 FAIL_VOLATILE 替代旧 FAIL_RR；compute_risk_reward 不再返回 passes
 5.  周线未收盘 bar 剔除（本周内非周五的末根周线被剔除，上周五保留）
-6.  regime 滞回（切换须连续 2 日确认；unknown 沿用已确认状态）
+6.  regime 滞回（切换须连续 2 个交易日确认，且每自然日最多推进一次计数，
+    使同日内多策略依次运行不会把「连续 N 日」缩短为「同日确认」；unknown 沿用已确认状态）
 7.  突破策略盘中剔除用北京时间（当日 bar 的处理与北京时刻一致）
 8.  volume_percentile 向量化结果与 rolling.apply 参考实现逐点一致（含 NaN）
 9.  假突破过滤向量化结果与原三重循环参考实现逐点一致
 10. 突破评分重校准：浅幅度 L2 突破在新公式下可通过 B 级准入（旧纯乘法公式不能）
 11. 突破策略 RR 下限检查已删除（深幅度 L2/L1 不受摆设检查拦截）
 """
+import json
 import os
 import sys
 import tempfile
 from dataclasses import replace
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
 
@@ -176,16 +178,44 @@ check("周线: 开关关闭后不剔除", len(m._drop_incomplete_weekly_bar(_w_w
 # ===========================================================================
 with tempfile.TemporaryDirectory() as tmpdir:
     cfg_h = replace(cfg, CACHE_DIR=tmpdir, MARKET_REGIME_HYSTERESIS=True, MARKET_REGIME_CONFIRM_DAYS=2)
+    _state_path = os.path.join(tmpdir, "market_regime_state.json")
+
+    def _next_day() -> None:
+        """把滞回状态的 updated 回拨 1 天，模拟「隔日再运行一次」。
+
+        确认计数按自然日推进（防止一天内多次运行——如一个 workflow 顺序跑抄底 +
+        突破——把「连续 N 个交易日」悄悄缩短为「同日确认」），所以同进程内连续调用
+        不再等价于连续多日；必须显式改写 updated 才能真正模拟跨日。
+        """
+        with open(_state_path, encoding="utf-8") as fh:
+            st = json.load(fh)
+        st["updated"] = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+        with open(_state_path, "w", encoding="utf-8") as fh:
+            json.dump(st, fh, ensure_ascii=False)
+
     r1 = m._apply_regime_hysteresis({"regime": "bull", "description": "d1"}, cfg_h)
     check("滞回: 首次出现直接采用", r1["regime"] == "bull")
+
+    _next_day()
     r2 = m._apply_regime_hysteresis({"regime": "bear", "description": "d2"}, cfg_h)
     check("滞回: 切换首日维持原 regime", r2["regime"] == "bull" and r2.get("regime_raw") == "bear")
+
+    # 同一自然日内的重复运行不得推进确认计数（否则两套策略顺序跑一次即翻转）
+    r2b = m._apply_regime_hysteresis({"regime": "bear", "description": "d2-same-day"}, cfg_h)
+    check("滞回: 同日重复运行不推进计数", r2b["regime"] == "bull")
+
+    _next_day()
     r3 = m._apply_regime_hysteresis({"regime": "bear", "description": "d3"}, cfg_h)
-    check("滞回: 连续 2 日确认后翻转", r3["regime"] == "bear")
+    check("滞回: 连续 2 个交易日确认后翻转", r3["regime"] == "bear")
+
     r4 = m._apply_regime_hysteresis({"regime": "unknown", "description": "d4"}, cfg_h)
     check("滞回: unknown 沿用已确认状态", r4["regime"] == "bear")
+
+    _next_day()
     r5 = m._apply_regime_hysteresis({"regime": "neutral", "description": "d5"}, cfg_h)
     check("滞回: 新方向首日仍维持", r5["regime"] == "bear")
+
+    _next_day()
     r6 = m._apply_regime_hysteresis({"regime": "neutral", "description": "d6"}, cfg_h)
     check("滞回: 新方向连续确认后翻转", r6["regime"] == "neutral")
 

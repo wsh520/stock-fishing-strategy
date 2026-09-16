@@ -100,7 +100,9 @@ def run(argv: list[str] | None = None):
             if regime == "bear":
                 logger.info("市场环境为 bear，放量突破策略直接空仓（BEAR_MAX_PICKS_BREAKOUT=0），本次运行终止")
                 if not args.no_notify:
-                    notify_screening_result(None, market_env=market_env_desc)
+                    # 必须显式传 strategy：notify_screening_result 的默认值是 bottom_fishing，
+                    # 漏传会让熊市空仓通知套用抄底模板（标题/措辞串味）。该分支在 bear 时必然命中。
+                    notify_screening_result(None, market_env=market_env_desc, strategy="volume_breakout")
                 return
         except Exception:
             market_env_desc = "获取失败"
@@ -171,7 +173,9 @@ def run(argv: list[str] | None = None):
     except Exception as e:
         logger.exception("放量突破策略执行失败: %s", e)
         if not args.no_notify:
-            notify_screening_result(None, market_env=market_env_desc, error_msg=str(e))
+            # 同熊市分支：异常通知也要带 strategy，否则卡片标题回落为抄底口径
+            notify_screening_result(None, market_env=market_env_desc, error_msg=str(e),
+                                    strategy="volume_breakout")
         sys.exit(1)
 
 

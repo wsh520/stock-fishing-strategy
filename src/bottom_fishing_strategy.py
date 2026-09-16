@@ -1217,13 +1217,17 @@ def _apply_regime_hysteresis(result: dict, config: StrategyConfig) -> dict:
     - 无历史状态时直接采用当期 raw regime（启动期不加延迟）；
     - raw 与已确认状态不同 → 记为待确认，连续确认达天数才翻转；
     - raw=unknown（指数数据缺失）→ 沿用已确认状态，不污染计数；
-      无已确认状态时保持 unknown（由 _effective_regime 保守视同 bear）。
+      无已确认状态时保持 unknown（由 _effective_regime 保守视同 bear）；
+    - **每个自然日最多推进一次确认计数**：状态文件 updated 已是今天就只读取、
+      不再累加，确保「连续 N 个交易日」不因一天内多次运行（如一个 workflow 里
+      顺序跑抄底 + 突破两套策略）而退化为「同日确认」。
     """
     if not getattr(config, "MARKET_REGIME_HYSTERESIS", True):
         return result
     raw = str(result.get("regime", "unknown")).lower()
     path = _cache_path(config, "market_regime_state.json")
     state = _read_cache_json(path) or {}
+    today = datetime.now().strftime(_DATE_FMT)
     updated = state.get("updated")
     if updated:
         try:
@@ -1233,12 +1237,22 @@ def _apply_regime_hysteresis(result: dict, config: StrategyConfig) -> dict:
             state = {}
     confirmed = state.get("confirmed")
     pending, count = state.get("pending"), int(state.get("count", 0) or 0)
+    # 每自然日最多推进一次确认计数：同一交易日内重复运行（如一个 workflow 内顺序跑
+    # 抄底 + 突破两套策略，共用同一个 cache/ 目录）读到的是同一份收盘数据，raw 必然
+    # 完全相同；若允许重复计数，「连续 N 个交易日确认」会被悄悄缩短为「同日确认」，
+    # 恰好抵消滞回机制防抖动的目的。判定依据是状态文件自身的 updated 日期，
+    # 不依赖调用方传参，因此对「一天跑几次」完全鲁棒。
+    advanced_today = bool(updated) and str(updated) == today
 
     if raw == "unknown":
         eff = confirmed or "unknown"
     elif confirmed is None or raw == confirmed:
         confirmed, pending, count = raw, None, 0
         eff = raw
+    elif advanced_today:
+        # 今天已经推进过：沿用已确认状态，既不重复累加计数、也不改写候选，
+        # 使同日多次运行得到完全一致的 regime
+        eff = confirmed
     elif raw == pending:
         count += 1
         if count >= int(getattr(config, "MARKET_REGIME_CONFIRM_DAYS", 2)):
@@ -1250,7 +1264,7 @@ def _apply_regime_hysteresis(result: dict, config: StrategyConfig) -> dict:
 
     if raw != "unknown":
         _write_cache_json({"confirmed": confirmed, "pending": pending, "count": count,
-                           "updated": datetime.now().strftime(_DATE_FMT)}, path)
+                           "updated": today}, path)
     if eff != raw:
         result = dict(result)
         result["regime_raw"] = raw
