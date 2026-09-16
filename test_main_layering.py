@@ -132,7 +132,39 @@ def main() -> int:
     check("禁用路径: 财务缺失者进入待核验（不占正式名额）",
           any(r["code"] == "600001" for r in pending2))
 
-    total = 13
+    # ===== 场景 3：0 只通过时优雅返回 None（回归：2026-09-15 线上 KeyError: 'score'）=====
+    # fallback 默认关闭后，空 signals 曾直接进入 _rank_signals 排序导致 KeyError。
+    # 打桩 evaluate 全部否决（模拟昨晚 Baostock 熔断 + 严格筛选 0 通过的情形）。
+    m.evaluate = lambda *a, **k: (None, "FAIL_LIQUIDITY")
+
+    cfg3 = m.StrategyConfig()
+    cfg3.FETCH_DELAY = 0.0
+    cfg3.MAX_WORKERS = 1
+    cfg3.CACHE_DIR = _TMP_CACHE.name
+    cfg3.ENABLE_DAILY_FALLBACK = False  # 默认关闭：空信号必须直接返回 None，不得崩溃
+    pending3: list[dict] = []
+    df3 = None
+    _err3 = None
+    try:
+        df3 = m.main(config=cfg3, cache=m.CacheManager(), pending_out=pending3)
+    except Exception as e:  # noqa: BLE001 - 回归测试要捕获的正是“不该抛”的异常
+        _err3 = e
+    check("空信号: fallback 关闭时 main 返回 None 且不抛异常", _err3 is None and df3 is None)
+
+    cfg4 = m.StrategyConfig()
+    cfg4.FETCH_DELAY = 0.0
+    cfg4.MAX_WORKERS = 1
+    cfg4.CACHE_DIR = _TMP_CACHE.name
+    cfg4.ENABLE_DAILY_FALLBACK = True   # 开启：全部否决 → 无候选 → 同样优雅返回 None
+    df4 = None
+    _err4 = None
+    try:
+        df4 = m.main(config=cfg4, cache=m.CacheManager(), pending_out=pending3)
+    except Exception as e:  # noqa: BLE001
+        _err4 = e
+    check("空信号: fallback 开启但无候选时 main 返回 None 且不抛异常", _err4 is None and df4 is None)
+
+    total = 15
     print(f"\n{total - len(_FAILS)}/{total} 通过")
     return 0 if not _FAILS else 1
 

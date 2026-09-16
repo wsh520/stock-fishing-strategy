@@ -1909,39 +1909,43 @@ def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] 
                     fetch_stats["bs_ok"], fetch_stats["ak_ok"], fetch_stats["fail"])
         logger.info("=" * 50)
 
-        # 正式技术信号为空时，使用放宽技术确认的观察候选模式（默认关闭，ENABLE_DAILY_FALLBACK
-        # 开启时恢复）。核心行情安全条件仍由 evaluate() 保留；仅降低评分/确认门槛，明确标记 fallback。
-        if not signals and config.ENABLE_DAILY_FALLBACK:
-            relaxed = StrategyConfig(**{**asdict(config),
-                "MIN_PASS_GRADE": "C",
-                "REQUIRE_MACD_MOMENTUM": False,
-                "REQUIRE_KDJ_GOLDEN": False,
-                "POSITION_IN_RANGE_MAX": max(config.POSITION_IN_RANGE_MAX, 0.60),
-                "DAILY_RSI_ENTRY_MAX": max(config.DAILY_RSI_ENTRY_MAX, 65.0),
-            })
-            fallback_candidates: list[dict] = []
-            for stock in stock_list:
-                try:
-                    daily_df = get_daily_data(stock["code"], config, cache)
-                    if daily_df is None: continue
-                    sig, reason = evaluate(daily_df, stock["code"], stock["name"], relaxed,
-                                            market_env, get_fundamentals(stock["code"], cache, config),
-                                            latest_trade_date=latest_trade_date)
-                    if sig is not None:
-                        row = sig.to_dict()
-                        row["tier"] = "fallback"
-                        row["fallback_reason"] = "严格技术筛选无结果，使用放宽确认条件的最高分候选"
-                        fallback_candidates.append(row)
-                except Exception:
-                    continue
-            if fallback_candidates:
-                fallback_candidates.sort(key=lambda r: (-float(r.get("score", 0) or 0), str(r.get("code", ""))))
-                chosen = fallback_candidates[0]
-                logger.info("保底观察候选：%s(%s)，评分 %s，未计入正式推荐",
-                            chosen.get("name"), chosen.get("code"), chosen.get("score"))
-                if pending_out is not None:
-                    pending_out.extend(fallback_candidates[1:])
-                return pd.DataFrame([chosen])
+        # 正式技术信号为空：ENABLE_DAILY_FALLBACK 开启时进入放宽技术确认的观察候选模式
+        # （核心行情安全条件仍由 evaluate() 保留；仅降低评分/确认门槛，明确标记 fallback）；
+        # 未开启（默认）则直接结束——必须先 return，否则空 signals 进入 _rank_signals
+        # 会因缺少 score 列抛 KeyError（2026-09-15 线上事故：fallback 默认关闭后
+        # 0 只通过的运行在排序处崩溃）。
+        if not signals:
+            if config.ENABLE_DAILY_FALLBACK:
+                relaxed = StrategyConfig(**{**asdict(config),
+                    "MIN_PASS_GRADE": "C",
+                    "REQUIRE_MACD_MOMENTUM": False,
+                    "REQUIRE_KDJ_GOLDEN": False,
+                    "POSITION_IN_RANGE_MAX": max(config.POSITION_IN_RANGE_MAX, 0.60),
+                    "DAILY_RSI_ENTRY_MAX": max(config.DAILY_RSI_ENTRY_MAX, 65.0),
+                })
+                fallback_candidates: list[dict] = []
+                for stock in stock_list:
+                    try:
+                        daily_df = get_daily_data(stock["code"], config, cache)
+                        if daily_df is None: continue
+                        sig, reason = evaluate(daily_df, stock["code"], stock["name"], relaxed,
+                                                market_env, get_fundamentals(stock["code"], cache, config),
+                                                latest_trade_date=latest_trade_date)
+                        if sig is not None:
+                            row = sig.to_dict()
+                            row["tier"] = "fallback"
+                            row["fallback_reason"] = "严格技术筛选无结果，使用放宽确认条件的最高分候选"
+                            fallback_candidates.append(row)
+                    except Exception:
+                        continue
+                if fallback_candidates:
+                    fallback_candidates.sort(key=lambda r: (-float(r.get("score", 0) or 0), str(r.get("code", ""))))
+                    chosen = fallback_candidates[0]
+                    logger.info("保底观察候选：%s(%s)，评分 %s，未计入正式推荐",
+                                chosen.get("name"), chosen.get("code"), chosen.get("score"))
+                    if pending_out is not None:
+                        pending_out.extend(fallback_candidates[1:])
+                    return pd.DataFrame([chosen])
             logger.info("未发现符合条件的信号")
             return None
 
