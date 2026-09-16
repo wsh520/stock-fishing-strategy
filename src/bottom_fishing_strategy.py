@@ -94,7 +94,7 @@ bs_lock = threading.Lock()
 
 DISPLAY_COLS = [
     ("code", "代码"), ("name", "名称"), ("date", "日期"), ("close", "收盘"),
-    ("score", "评分"), ("grade", "等级"), ("tier", "层级"),
+    ("score", "评分"), ("grade", "等级"), ("tier", "层级"), ("rank_score", "排序分"),
     ("signals_hit", "入选依据"), ("fund_status", "财务核验"),
     ("weekly_status", "周线核验"), ("missing_tags", "缺项"), ("daily_score", "日线分"),
     ("rsi", "RSI"), ("rsi7", "RSI7"), ("rsi21", "RSI21"),
@@ -105,7 +105,9 @@ DISPLAY_COLS = [
 
 TITLE = "日线技术指标选股结果"
 PREFIX = "bf"
-SORT_BY = ["score"]
+# 主排序键为 rank_score（= daily_score + 连续质量分，见 _rank_quality_score）。
+# _rank_signals 在该列缺失时自动退回 score，兼容外部构造的 DataFrame（回测/单元测试）。
+SORT_BY = ["rank_score"]
 SORT_ASC = [False]
 
 # ===========================================================================
@@ -176,6 +178,14 @@ class StrategyConfig:
     # 数据时效：个股最新K线日期须与市场（沪深300）最新交易日一致，
     # 否则视为停牌/数据滞后，暂不推荐（宁可少荐，不让过期数据混入名单）
     REQUIRE_FRESH_DAILY: bool = True
+    # 停牌缺口检测：相邻 K 线的最大自然日间隔超过 MAX_BAR_GAP_DAYS 判定为期间曾停牌。
+    # 既有两道校验都抓不到「历史缺口」：MIN_DAYS 只数 bar 总数（停牌 40 天的复牌股
+    # 仍有约 60 根 bar，只是覆盖 160 个自然日），REQUIRE_FRESH_DAILY 只看末根日期。
+    # 这类股票的 ma20/rsi14/atr/60日高点/量比 全部跨缺口计算——「60日高点」实际是
+    # 5 个月前的高点，量比把停牌前的死量与复牌后的爆量混在同一窗口——取值无经济意义。
+    # 阈值 12 天可容纳春节（相邻交易日间隔约 11 天）与国庆（约 8 天）长假。
+    REQUIRE_NO_HALT_GAP: bool = True
+    MAX_BAR_GAP_DAYS: int = 12
 
     # 防追高否决：当日涨幅超过该值（%）判定为追高——涨停股买不进、大阳线次日易回调，直接否决
     MAX_ENTRY_PCT_CHG: float = 5.0
@@ -199,6 +209,21 @@ class StrategyConfig:
     MAX_RECENT_GAIN_PCT: float = 12.0
     # 最终推荐数量上限：评分降序截取前 N 只（目标每日推荐 3~5 只）
     MAX_PICKS: int = 5
+    # ===== 推荐数量按市场环境收缩 =====
+    # A 股个股收益方差中市场因子（beta）通常解释 60~75%，「何时交易」对胜率的影响
+    # 远大于「交易哪只」。原实现里 regime 的唯一作用是把准入分数线抬高
+    # BEAR_GRADE_BOOST 分，推荐数量在牛/中/熊一律为 MAX_PICKS——这与上方
+    # UNKNOWN_AS_BEAR 注释承诺的「推荐上限收缩」不符（该行为只在
+    # volume_breakout_strategy.main_breakout 里实现了）。此处补齐，口径与突破策略对齐。
+    # unknown 经 _effective_regime 折叠为 bear，自动适用熊市上限。
+    NEUTRAL_MAX_PICKS: int = 4
+    BEAR_MAX_PICKS: int = 2
+    # 市场级熔断：沪深300 近 MARKET_CRASH_LOOKBACK 个交易日累计跌幅低于该阈值（%）
+    # → 本次运行不推荐。急跌期间全市场同步满足 RSI 超卖 / MA5 拐头 / 创新低底背离，
+    # 抄底信号会批量触发，而 MA20_TREND_MIN_SLOPE 是个股级过滤，抓不到系统性风险。
+    # 这是组合层风控，也是本次改动中唯一新增的门槛（其余均为排序/数量层）。
+    MARKET_CRASH_HALT_PCT: float = -4.0
+    MARKET_CRASH_LOOKBACK: int = 5
     # 组合层：两套策略（抄底 + 放量突破）同一交易日合计推荐数上限，
     # 由后运行的策略在落库前去重并截取（见 run_breakout.py）
     DAILY_TOTAL_MAX_PICKS: int = 7
@@ -260,6 +285,30 @@ class StrategyConfig:
     # （已删除 DAILY_RSI_OVERBOUGHT_PENALTY：RSI14>60 已被 DAILY_RSI_ENTRY_MAX 否决，
     #   超买 -3 惩罚实际不可达，属死代码）
     # 底背离不参与评级升降（评级统一：等级=原始技术分定级），仅作形态标签与同分排序优先项
+
+    # ===== 排序质量分（仅决定 _rank_signals 的先后顺序，不参与任何门槛判定）=====
+    # 问题：daily_score 由 40/25/25/10 四个布尔分项求和，通过者只可能落在
+    # {60,65,68,75,83,90,93,100} 这几个离散值上——号称 0~100 的评分实际是 3-bit 变量。
+    # 且穷举可达组合可知 trend_turn 是事实上的必要条件（缺它时唯一通路是
+    # rsi_rebound+放量企稳满分+multi_resonance 精确凑到 60 分），评分几乎不提供区分度。
+    # 于是 _rank_signals 大量并列，实际决定 Top5 的是 rr_ratio——而
+    # rr_ratio = 0.10×entry / (2×ATR) = 0.05/ATR%，是「固定止盈除以 ATR 止损」的
+    # 代数残留，从未被设计为排序键；再并列就落到 code 字母序。
+    # 质量分把布尔闸门内的连续信息重新引入排序（这些列 compute_daily_signals 已全部算出，
+    # 零额外取数）。RANK_QUALITY_WEIGHT=0 可完全退回旧行为。
+    # 注意：权重 >3 时可能跨分数档重排（65 与 68 的档差仅 3 分），这是有意为之——
+    # 档位本身是布尔求和的产物，不代表质量序；需要严格「只在同档内细分」时设为 2.9。
+    RANK_QUALITY_WEIGHT: float = 10.0
+    RQ_W_LOW_VOL: float = 0.35        # ATR% 越低越好（低波异象 + 降低止损被扫概率）
+    RQ_W_DRAWDOWN: float = 0.35       # 回撤越深越好（均值回归的空间来自跌幅）
+    RQ_W_RANGE_POS: float = 0.30      # 20 日区间位置越低越好（闸门内细分）
+    # 动能维度默认权重 0：REQUIRE_MACD_MOMENTUM + MACD_MOMENTUM_DAYS=2 已是硬闸门，
+    # 通过者的 MACD 柱必然连续 2 日改善，该维度在整个候选集内几乎恒为满分
+    # （test_optimizations_p0 实测饱和在 W×1.0），不提供区分度——与上方已删除的
+    # DAILY_RSI_OVERBOUGHT_PENALTY 同属「被前置闸门架空的死权重」。
+    # 保留实现与参数，便于关闭 MACD 闸门做 A/B 时重新启用。
+    RQ_W_MOMENTUM: float = 0.0
+    RQ_DRAWDOWN_SATURATION: float = 0.45   # 回撤深度得分饱和点（与 MAX_DRAWDOWN_FROM_HIGH 解耦）
 
     GRADE_A: float = 80.0
     GRADE_B: float = 60.0
@@ -483,9 +532,30 @@ def _write_cache_json(obj: dict, path: str) -> None:
     except Exception:
         pass
 
+def _recompute_pct_chg(df: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
+    """统一 pct_chg 口径：一律由 qfq 收盘价自算，不信任数据源提供的涨跌幅字段。
+
+    三条取数路径的 pct_chg 口径原本互不一致：
+      - Baostock  pctChg        （随 adjustflag 变化的复权口径）
+      - AkShare 东财「涨跌幅」  （不复权原始口径：除权日把股息除权显示为暴跌）
+      - AkShare 新浪            （接口无该列，_fetch_daily_ak_sina 本就自算）
+    而 close 在双源都统一按 config.ADJUST="qfq" 取数，是唯一可横向比较的字段。
+
+    该字段直接驱动 MAX_ENTRY_PCT_CHG / MIN_BREAKOUT_PCT / MAX_BREAKOUT_PCT 三个硬否决，
+    口径漂移会让同一只股票「因本次由哪个数据源服务」而被不同判决——Baostock 熔断
+    切换 AkShare 时整个股票池的过滤行为随之漂移，且回测无法复现。
+    首行无前收置为 NaN（MIN_DAYS=60 保证评估用的是末行，不受影响）。
+    """
+    if df is None or df.empty or "close" not in df.columns:
+        return df
+    df = df.copy()
+    df["pct_chg"] = (df["close"] / df["close"].shift(1) - 1) * 100
+    return df
+
+
 def _normalize_bs_hist(df: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
     if df is None or df.empty: return None
-    # Baostock 列名映射
+    # Baostock 列名映射（pctChg 仅保留列名占位，取值随后由 _recompute_pct_chg 统一重算）
     rename_map = {"pctChg": "pct_chg", "turn": "turnover"}
     df = df.rename(columns=rename_map)
     if "date" not in df.columns or "close" not in df.columns: return None
@@ -493,7 +563,8 @@ def _normalize_bs_hist(df: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
     df = df.dropna(subset=["date", "close"])
-    return df.sort_values("date").reset_index(drop=True) if not df.empty else None
+    if df.empty: return None
+    return _recompute_pct_chg(df.sort_values("date").reset_index(drop=True))
 
 def _fetch_hist_bs(code: str, period: str, start: str, end: str, config: StrategyConfig, cache_name: Optional[str] = None) -> Optional[pd.DataFrame]:
     bs_code = _format_bs_code(code)
@@ -807,7 +878,8 @@ def _normalize_ak_hist(raw: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
     df = df.dropna(subset=["date", "close"])
-    return df.sort_values("date").reset_index(drop=True) if not df.empty else None
+    if df.empty: return None
+    return _recompute_pct_chg(df.sort_values("date").reset_index(drop=True))
 
 def _ak_sina_symbol(code: str) -> str:
     """转为新浪格式（如 sh600000 / sz000001）"""
@@ -985,32 +1057,36 @@ def _fetch_stock_pool_ak(config: Optional[StrategyConfig] = None) -> list[dict]:
 # ===========================================================================
 
 def _fetch_daily_dual(code: str, days: int, config: StrategyConfig) -> Optional[pd.DataFrame]:
+    df = None
     if _bs_available():
         df = _fetch_daily_bs(code, days=days, config=config)
         if df is not None:
             fetch_stats["bs_ok"] += 1
-            return df
-    df = _fetch_daily_ak(code, days=days, config=config)
-    if df is not None:
-        fetch_stats["ak_ok"] += 1
-    else:
-        fetch_stats["fail"] += 1
-    return df
+    if df is None:
+        df = _fetch_daily_ak(code, days=days, config=config)
+        if df is not None:
+            fetch_stats["ak_ok"] += 1
+        else:
+            fetch_stats["fail"] += 1
+    # 磁盘缓存命中路径（_read_cache_csv）不经过 _normalize_*，旧世代缓存里存的仍是
+    # 数据源原始 pct_chg。在出口统一重算，使口径与缓存写入时间无关。
+    return _recompute_pct_chg(df)
 
 def _fetch_weekly_dual(code: str, config: StrategyConfig) -> Optional[pd.DataFrame]:
     """周线双源拉取（仅决赛圈周线趋势确认使用）：Baostock 优先，失败降级 AkShare"""
+    df = None
     if _bs_available():
         df = _fetch_weekly_bs(code, weeks=config.WEEKLY_BARS, config=config)
-        if df is not None: return df
-    if not _AK_AVAILABLE: return None
-    symbol = _ak_symbol(code)
-    start = (datetime.now() - timedelta(weeks=config.WEEKLY_BARS)).strftime("%Y%m%d")
-    end = datetime.now().strftime("%Y%m%d")
-    raw = _fetch_with_retry(
-        lambda: ak.stock_zh_a_hist(symbol=symbol, period="weekly", start_date=start, end_date=end, adjust=config.ADJUST),
-        config.MAX_RETRY, f"ak_weekly({symbol})"
-    )
-    return _normalize_ak_hist(raw)
+    if df is None and _AK_AVAILABLE:
+        symbol = _ak_symbol(code)
+        start = (datetime.now() - timedelta(weeks=config.WEEKLY_BARS)).strftime("%Y%m%d")
+        end = datetime.now().strftime("%Y%m%d")
+        raw = _fetch_with_retry(
+            lambda: ak.stock_zh_a_hist(symbol=symbol, period="weekly", start_date=start, end_date=end, adjust=config.ADJUST),
+            config.MAX_RETRY, f"ak_weekly({symbol})"
+        )
+        df = _normalize_ak_hist(raw)
+    return _recompute_pct_chg(df)   # 同 _fetch_daily_dual：覆盖旧世代磁盘缓存
 
 def _fetch_index_daily_dual(symbol: str, config: StrategyConfig) -> Optional[pd.DataFrame]:
     if _bs_available():
@@ -1095,6 +1171,41 @@ def _effective_regime(regime: str, config: StrategyConfig) -> str:
     if value == "unknown" and getattr(config, "UNKNOWN_AS_BEAR", True):
         return "bear"
     return value if value in {"bull", "neutral", "bear"} else "neutral"
+
+
+def resolve_max_picks(regime: str, config: StrategyConfig) -> int:
+    """按市场环境解析本次运行的推荐数量上限（main / backtest 共用，避免口径漂移）。
+
+    牛 = MAX_PICKS，中性 = NEUTRAL_MAX_PICKS，熊（含 unknown 折叠）= BEAR_MAX_PICKS。
+    配置类未提供 NEUTRAL_/BEAR_ 字段时退回 MAX_PICKS（保持旧行为）。
+    注：放量突破策略走自己的 BEAR_MAX_PICKS_BREAKOUT 分支（熊市直接空仓 0 只），
+        不使用本函数。
+    """
+    eff = _effective_regime(regime, config)
+    if eff == "bull":
+        return int(config.MAX_PICKS)
+    if eff == "neutral":
+        return int(getattr(config, "NEUTRAL_MAX_PICKS", config.MAX_PICKS))
+    return int(getattr(config, "BEAR_MAX_PICKS", config.MAX_PICKS))
+
+
+def market_crash_halt(index_df: Optional[pd.DataFrame], config: StrategyConfig) -> Optional[float]:
+    """市场级熔断判定：返回触发熔断的累计跌幅（%），未触发或数据不足返回 None。
+
+    抄底信号在指数急跌期间会全市场批量触发（所有股票同时 RSI 超卖、同时创新低
+    产生底背离、同时 MA5 向下穿越后拐头），此时恰恰是接飞刀最危险的时候；
+    MA20_TREND_MIN_SLOPE 是个股级过滤，无法识别「全市场同步下跌」这种系统性事件。
+    数据不足时不触发（返回 None），避免指数缺数时把正常交易日误判为熔断。
+    """
+    n = int(getattr(config, "MARKET_CRASH_LOOKBACK", 5))
+    threshold = float(getattr(config, "MARKET_CRASH_HALT_PCT", -4.0))
+    if n <= 0 or index_df is None or index_df.empty or "close" not in index_df.columns:
+        return None
+    closes = pd.to_numeric(index_df["close"], errors="coerce").dropna().to_numpy(dtype=float)
+    if len(closes) <= n:
+        return None
+    ret = (closes[-1] / closes[-1 - n] - 1) * 100
+    return ret if ret < threshold else None
 
 
 def _apply_regime_hysteresis(result: dict, config: StrategyConfig) -> dict:
@@ -1446,6 +1557,10 @@ class Signal:
     weekly_status: str = "unverified" # 核验状态：周线 confirmed/unverified/disabled（决赛圈更新）
     missing_tags: str = ""            # 缺项标签（逗号分隔；可选指标缺失只标注不降级）
     tier: str = "pending"             # 推荐层级：formal=正式推荐 / pending=待核验候选
+    # 排序分 = score + 连续质量分（_rank_quality_score）。仅作 _rank_signals 主键与展示，
+    # 不参与准入判定，因此不改变「哪些股票通过」，只改变通过者之间的先后顺序。
+    # 默认 0.0 以保持 BreakoutSignal（放量突破策略自带独立 SORT_BY）构造接口兼容。
+    rank_score: float = 0.0
 
     def to_dict(self) -> dict: return asdict(self)
 
@@ -1457,15 +1572,88 @@ def _grade_from_score(score: float, config: StrategyConfig) -> str:
 
 _GRADE_ORDER = ("D", "C", "B", "A")
 
-def _rank_signals(df: pd.DataFrame) -> pd.DataFrame:
-    """确定性排序：评分降序 → 底背离优先 → 盈亏比降序 → 股票代码升序（末级键）。
+def _rank_quality_score(daily_out: pd.DataFrame, config: StrategyConfig) -> float:
+    """连续排序质量分（0 ~ RANK_QUALITY_WEIGHT）。
 
-    分数、背离、盈亏比完全相同时按代码排序，保证两次运行结果可复现，
+    只参与 _rank_signals 的先后顺序，不参与任何否决/准入判定——「哪些股票通过筛选」
+    与引入前完全一致，改变的只是通过者之间谁排在前面（原实现在大量同分时退化为
+    按 rr_ratio ≈ 0.05/ATR% 乃至 code 字母序选取 Top5）。
+
+    四个维度全部取自 compute_daily_signals 已经算出的列，零额外取数与计算成本：
+      1) 低波动  ：ATR% 在 [0, MAX_ATR_PCT] 内越低越好
+      2) 回撤深度：在闸门允许的 [MIN_DRAWDOWN_FROM_HIGH, RQ_DRAWDOWN_SATURATION] 内越深越好
+      3) 区间位置：现价在 20 日区间内越低越好（POSITION_IN_RANGE_MAX 是闸门，这里做闸门内细分）
+      4) 动能速率：MACD 柱近 3 日改善幅度（默认权重 0——REQUIRE_MACD_MOMENTUM 已是硬闸门，
+         通过者在该维度恒为满分，实测无区分度；关闭 MACD 闸门做 A/B 时可重新启用）
+    任何异常/缺失一律回退 0 或中性 0.5，绝不因质量分计算失败而影响主流程。
+    """
+    w = float(getattr(config, "RANK_QUALITY_WEIGHT", 0.0) or 0.0)
+    if w <= 0:
+        return 0.0
+    try:
+        d = daily_out.iloc[-1]
+        close = float(d["close"])
+        if not close > 0:
+            return 0.0
+
+        # 1) 低波动优先
+        atr_cap = float(config.MAX_ATR_PCT)
+        atr = d.get("atr")
+        atr_pct = float(atr) / close * 100 if atr is not None and not pd.isna(atr) else atr_cap
+        q_vol = 1.0 - min(max(atr_pct / atr_cap, 0.0), 1.0) if atr_cap > 0 else 0.0
+
+        # 2) 回撤深度优先（均值回归的空间来自跌幅）
+        hi = float(daily_out["high"].tail(config.DRAWDOWN_LOOKBACK).max())
+        dd = (hi - close) / hi if hi > 0 else 0.0
+        lo_dd = float(config.MIN_DRAWDOWN_FROM_HIGH)
+        sat_dd = float(getattr(config, "RQ_DRAWDOWN_SATURATION", 0.45))
+        q_dd = min(max((dd - lo_dd) / (sat_dd - lo_dd), 0.0), 1.0) if sat_dd > lo_dd else 0.0
+
+        # 3) 区间位置越低越好
+        win = daily_out.tail(config.RANGE_LOOKBACK)
+        wlo, whi = float(win["low"].min()), float(win["high"].max())
+        pos = (close - wlo) / (whi - wlo) if whi > wlo else 0.5
+        cap = float(config.POSITION_IN_RANGE_MAX)
+        q_pos = 1.0 - min(max(pos / cap, 0.0), 1.0) if cap > 0 else 0.0
+
+        # 4) MACD 柱改善速率：(h[-1]-h[-3]) / (|h[-3]|+|h[-1]|) ∈ [-1,1] → 映射到 [0,1]
+        #    无量纲，不受股价与柱值绝对量级影响；数据缺失给中性 0.5（不奖不罚）
+        #    权重为 0 时整段跳过（本函数在全市场逐股调用，属热点路径）
+        w_mom = float(getattr(config, "RQ_W_MOMENTUM", 0.0))
+        q_mom = 0.5
+        if w_mom > 0:
+            hist = daily_out["macd_histogram"].iloc[-3:].to_numpy(dtype=float)
+            if len(hist) == 3 and not np.isnan(hist).any():
+                scale = abs(float(hist[0])) + abs(float(hist[2])) + 1e-9
+                q_mom = min(max(((float(hist[2]) - float(hist[0])) / scale + 1.0) / 2.0, 0.0), 1.0)
+
+        q = (float(getattr(config, "RQ_W_LOW_VOL", 0.35)) * q_vol
+             + float(getattr(config, "RQ_W_DRAWDOWN", 0.35)) * q_dd
+             + float(getattr(config, "RQ_W_RANGE_POS", 0.30)) * q_pos
+             + w_mom * q_mom)
+        return round(w * q, 3)
+    except Exception:  # noqa: BLE001  质量分是排序增强项，任何失败都不得影响选股主流程
+        return 0.0
+
+
+def _rank_signals(df: pd.DataFrame) -> pd.DataFrame:
+    """确定性排序：排序分降序 → 底背离优先 → 盈亏比降序 → 股票代码升序（末级键）。
+
+    主键 rank_score = daily_score + 连续质量分（_rank_quality_score）。该列缺失时
+    （回测/单元测试手工构造的 DataFrame）自动退回 score，行为与引入前完全一致。
+    所有键都相同的情况下按代码排序，保证两次运行结果可复现，
     不受并发完成顺序（as_completed）影响。
     """
+    keys = SORT_BY + ["has_divergence", "rr_ratio", "code"]
+    ascending = SORT_ASC + [False, False, True]
+    pairs = [(k, a) for k, a in zip(keys, ascending) if k in df.columns]
+    if "rank_score" not in df.columns and "score" in df.columns:
+        pairs.insert(0, ("score", False))   # 向后兼容：无 rank_score 时以 score 为主键
+    if not pairs:
+        return df.reset_index(drop=True)
     return df.sort_values(
-        by=SORT_BY + ["has_divergence", "rr_ratio", "code"],
-        ascending=SORT_ASC + [False, False, True],
+        by=[k for k, _ in pairs],
+        ascending=[a for _, a in pairs],
         kind="mergesort",
     ).reset_index(drop=True)
 
@@ -1574,6 +1762,32 @@ def _weekly_fresh_enough(weekly_df: Optional[pd.DataFrame], latest_trade_date: s
     last = str(weekly_df.sort_values("date").iloc[-1]["date"])
     return last >= week_start
 
+def has_halt_gap(daily_out: Optional[pd.DataFrame], config: StrategyConfig) -> bool:
+    """K 线序列是否存在停牌缺口（相邻 bar 的最大自然日间隔 > MAX_BAR_GAP_DAYS）。
+
+    停牌 30~60 天的复牌股能同时骗过既有的两道校验：MIN_DAYS 只数 bar 总数
+    （60 根 bar 可能覆盖 160 个自然日），REQUIRE_FRESH_DAILY 只看末根日期是否等于
+    市场最新交易日。这类股票的 ma20/rsi14/kdj/atr/60日高点/量比 全部跨缺口计算：
+    「近60日最高价」实际是 5 个月前的高点，量比把停牌前的死量与复牌后的爆量
+    混进同一个 20 日窗口——所有下游闸门都在拿无经济意义的数字做判定。
+
+    阈值 12 天可容纳春节（相邻交易日间隔约 11 天）与国庆（约 8 天）长假，
+    超过即判定为停牌。数据缺失/无法解析时返回 False（放行不误杀，与既有约定一致）。
+    """
+    if daily_out is None or daily_out.empty or "date" not in daily_out.columns:
+        return False
+    if not getattr(config, "REQUIRE_NO_HALT_GAP", True):
+        return False
+    try:
+        gaps = pd.to_datetime(daily_out["date"], errors="coerce").diff().dt.days
+        max_gap = gaps.max()
+    except Exception:  # noqa: BLE001
+        return False
+    if pd.isna(max_gap):
+        return False
+    return float(max_gap) > float(getattr(config, "MAX_BAR_GAP_DAYS", 12))
+
+
 def evaluate(daily_df: Optional[pd.DataFrame], code: str = "", name: str = "", config: Optional[StrategyConfig] = None, market_env: Optional[dict] = None, fund_data: Optional[dict] = None, latest_trade_date: Optional[str] = None) -> tuple[Optional[Signal], str]:
     """评估单只股票。
 
@@ -1602,6 +1816,11 @@ def evaluate(daily_df: Optional[pd.DataFrame], code: str = "", name: str = "", c
     if config.REQUIRE_FRESH_DAILY and latest_trade_date is not None \
             and str(d_last["date"]) != str(latest_trade_date):
         return None, "FAIL_STALE"
+
+    # 停牌缺口：K 线跨停牌区间时全部滚动指标失真（详见 has_halt_gap）。
+    # 紧跟时效校验，使「数据不可信」的两个归因（FAIL_STALE / FAIL_HALT_GAP）在漏斗中同层。
+    if has_halt_gap(daily_out, config):
+        return None, "FAIL_HALT_GAP"
 
     # 核验状态维度一：财务核验（核心项=ROE+负债率；商誉/扣非为可选项，缺失只记标签）
     fund_status, fund_missing = _fund_verify_state(fund_data)
@@ -1703,6 +1922,8 @@ def evaluate(daily_df: Optional[pd.DataFrame], code: str = "", name: str = "", c
         signals_hit=",".join(hits), fund_status=fund_status,
         missing_tags=",".join(dict.fromkeys(t for t in missing_tags if t)),  # 去重保序
         tier="formal" if fund_status == "verified" else "pending",
+        # 排序分：技术分（决定准入，不变）+ 连续质量分（只决定同批通过者之间的先后）
+        rank_score=round(daily_score + _rank_quality_score(daily_out, config), 3),
     )
     return sig, "PASS"
 
@@ -1839,6 +2060,27 @@ def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] 
         if latest_trade_date is None:
             logger.warning("无法获取指数行情，本次运行跳过行情时效校验（停牌股可能混入待核验流程）")
 
+        # ===== 市场级熔断：指数急跌期间全市场抄底信号批量触发，直接不推荐 =====
+        halt_ret = market_crash_halt(index_df, config)
+        if halt_ret is not None:
+            logger.warning("市场级熔断：沪深300 近 %d 个交易日累计 %.2f%%（阈值 %.2f%%），"
+                           "本次运行不推荐（系统性下跌期间个股级过滤不足以防护）",
+                           config.MARKET_CRASH_LOOKBACK, halt_ret, config.MARKET_CRASH_HALT_PCT)
+            return None
+
+        # ===== 推荐数量上限按市场环境收缩（与 volume_breakout_strategy 口径对齐）=====
+        regime_raw = market_env.get("regime", "unknown")
+        regime_eff = _effective_regime(regime_raw, config)
+        max_picks = resolve_max_picks(regime_raw, config)
+        if regime_eff != regime_raw:
+            logger.warning("市场环境 unknown（指数数据缺失），按熊市保守处理：推荐上限收缩为 %d", max_picks)
+        logger.info("市场环境 %s：推荐数量上限 %d（牛 %d / 中性 %d / 熊 %d；熊市准入分数线 +%g）",
+                    regime_eff, max_picks, config.MAX_PICKS, config.NEUTRAL_MAX_PICKS,
+                    config.BEAR_MAX_PICKS, config.BEAR_GRADE_BOOST)
+        if max_picks <= 0:
+            logger.info("当前市场环境推荐上限为 0，跳过全市场筛选")
+            return None
+
         stock_list = get_stock_list(config, cache)
         if not stock_list:
             logger.warning("无法获取股票列表")
@@ -1847,7 +2089,8 @@ def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] 
 
         signals: list[dict] = []
         stats = {"total": len(stock_list), "error": 0, "fail_data": 0, "fail_liq": 0,
-                 "fail_stale": 0, "fail_fund": 0, "fail_tech": 0, "fail_volatile": 0, "pass": 0}
+                 "fail_stale": 0, "fail_halt": 0, "fail_fund": 0, "fail_tech": 0,
+                 "fail_volatile": 0, "pass": 0}
 
         def _screen_one(stock: dict) -> tuple[Optional[Signal], str]:
             code, name = stock["code"], stock["name"]
@@ -1874,6 +2117,7 @@ def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] 
             elif reason == "FAIL_DATA": stats["fail_data"] += 1
             elif reason == "FAIL_LIQUIDITY": stats["fail_liq"] += 1
             elif reason == "FAIL_STALE": stats["fail_stale"] += 1
+            elif reason == "FAIL_HALT_GAP": stats["fail_halt"] += 1
             elif reason == "FAIL_VOLATILE": stats["fail_volatile"] += 1
             # FAIL_CHASE（追高）/ FAIL_GAP（跳空）/ FAIL_RSI_HIGH（RSI过高）/ FAIL_CLIMAX_VOL（天量）/ FAIL_NOT_BOTTOM（非底部区域）
             # / FAIL_POSITION（区间位置偏高）/ FAIL_MACD_MOM（动能未改善）/ FAIL_KDJ（KDJ未金叉）均属技术面入场质量层
@@ -1883,7 +2127,7 @@ def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] 
             elif reason == "ERROR": stats["error"] += 1
 
         # 漏斗日志（按已处理数计，预算截断时不失真）
-        pass_data = processed - stats["fail_data"] - stats["fail_stale"] - stats["error"]
+        pass_data = processed - stats["fail_data"] - stats["fail_stale"] - stats["fail_halt"] - stats["error"]
         pass_liq = pass_data - stats["fail_liq"]
         pass_fund = pass_liq - stats["fail_fund"]
         pass_tech = pass_fund - stats["fail_tech"]
@@ -1898,6 +2142,8 @@ def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] 
         logger.info("2. 获取数据并达标: %d 只 (淘汰/缺失 %d 只)", pass_data, stats["fail_data"] + stats["error"])
         if stats["fail_stale"] > 0:
             logger.info("   其中行情时效不符（停牌/数据滞后）: %d 只，暂不推荐", stats["fail_stale"])
+        if stats["fail_halt"] > 0:
+            logger.info("   其中K线跨停牌缺口（滚动指标失真）: %d 只，暂不推荐", stats["fail_halt"])
         logger.info("3. 流动性达标: %d 只 (僵尸股淘汰 %d 只)", pass_liq, stats["fail_liq"])
         if pass_liq > 0: logger.info("4. 基本面防雷通过: %d 只 (淘汰 %d 只，通过率 %.1f%%)",
                                      pass_fund, stats["fail_fund"], pass_fund / pass_liq * 100)
@@ -1949,10 +2195,10 @@ def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] 
             logger.info("未发现符合条件的信号")
             return None
 
-        # 确定性排序：评分降序 → 底背离优先 → 盈亏比 → 股票代码（末级键，结果可复现）
+        # 确定性排序：排序分降序 → 底背离优先 → 盈亏比 → 股票代码（末级键，结果可复现）
         df = _rank_signals(pd.DataFrame(signals))
 
-        # 决赛圈：周线确认 + 财务字段补齐 + 行业分散，逐个按评分降序处理，取满 MAX_PICKS 即止。
+        # 决赛圈：周线确认 + 财务字段补齐 + 行业分散，逐个按排序分降序处理，取满 max_picks 即止。
         # 周线 MA 与周线 MACD 开关独立生效（任一启用即拉周线）；
         # 周线数据缺失/截止过旧 → 不足以确认 → 进入待核验候选，不占正式推荐名额
         weekly_enabled = config.REQUIRE_WEEKLY_TREND or config.REQUIRE_WEEKLY_MACD_STABLE
@@ -1963,7 +2209,7 @@ def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] 
             industry_used: dict[str, int] = {}
             weekly_checked = weekly_dropped = pending_weekly = industry_dropped = fund_late_dropped = pending_fund = 0
             for _, row in df.iterrows():
-                if len(confirmed) >= config.MAX_PICKS: break
+                if len(confirmed) >= max_picks: break
                 code = str(row["code"])
                 wk = _fetch_weekly_dual(code, config)
                 time.sleep(config.FETCH_DELAY)
@@ -2032,11 +2278,11 @@ def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] 
                 df = _dedup_by_industry(df, config, cache)
             if not df.empty:
                 df["weekly_status"] = "disabled"   # 周线确认未启用（两个开关均关闭）
-            # 推荐数量上限：评分降序截取前 MAX_PICKS 只（周线路径在循环内已取满即止）
-            if len(df) > config.MAX_PICKS:
-                logger.info("通过 %d 只，按评分截取前 %d 只（淘汰 %d 只低分信号）",
-                            len(df), config.MAX_PICKS, len(df) - config.MAX_PICKS)
-                df = df.head(config.MAX_PICKS).reset_index(drop=True)
+            # 推荐数量上限：按排序分降序截取前 max_picks 只（周线路径在循环内已取满即止）
+            if len(df) > max_picks:
+                logger.info("通过 %d 只，按排序分截取前 %d 只（淘汰 %d 只低分信号）",
+                            len(df), max_picks, len(df) - max_picks)
+                df = df.head(max_picks).reset_index(drop=True)
             # 周线未启用时：对最终名单做财务字段补齐与终审（四项防雷口径与决赛圈一致）
             if not df.empty:
                 keep_rows = []

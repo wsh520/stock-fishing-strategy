@@ -78,6 +78,8 @@ from src.bottom_fishing_strategy import (  # noqa: E402
     _weekly_fresh_enough,
     _fund_verify_state,
     evaluate,
+    resolve_max_picks,
+    market_crash_halt,
     bs_lock,
 )
 
@@ -85,14 +87,20 @@ logger = logging.getLogger("backtest")
 
 # evaluate() 否决原因 -> 中文标签（用于选股漏斗报告）
 _REASON_ZH = {
-    "PASS": "通过", "FAIL_DATA": "数据不足/流动性<3000万", "FAIL_STALE": "停牌或数据滞后",
+    "PASS": "通过", "FAIL_DATA": "数据不足/列缺失", "FAIL_STALE": "停牌或数据滞后",
+    "FAIL_HALT_GAP": "K线跨停牌缺口(指标失真)",
+    "FAIL_LIQUIDITY": "流动性不足(日均额<3000万)",
     "FAIL_FUND": "基本面防雷(ROE/负债率)", "FAIL_TECH": "技术评分未达门槛",
     "FAIL_CHASE": "当日追高(涨幅>5%)", "FAIL_GAP": "跳空高开(>2%)",
     "FAIL_RSI_HIGH": "RSI14过高(>60)", "FAIL_CLIMAX_VOL": "天量(量比>4)",
-    "FAIL_NOT_BOTTOM": "非底部(距60日高点回撤<15%)", "FAIL_DEEP_CRASH": "深度崩盘(回撤>70%)",
-    "FAIL_RECENT_RALLY": "近5日已反弹(>12%)", "FAIL_POSITION": "区间位置偏高(>35%)",
+    "FAIL_NOT_BOTTOM": "非底部(距60日高点回撤<10%)", "FAIL_DEEP_CRASH": "深度崩盘(回撤>70%)",
+    "FAIL_RECENT_RALLY": "近5日已反弹(>12%)", "FAIL_POSITION": "区间位置偏高(>50%)",
     "FAIL_MACD_MOM": "MACD柱未连续改善", "FAIL_KDJ": "KDJ未金叉/高位",
+    "FAIL_VOLATILE": "波动率超限(ATR>3.33%现价)",
     "FAIL_RR": "盈亏比不足(<1.5)", "ERROR": "异常",
+    # 非 evaluate() 归因，由 _screen_day 的组合层风控产生
+    "HALT_MARKET_CRASH": "市场级熔断(指数近5日跌幅超阈值)",
+    "HALT_MAX_PICKS_ZERO": "推荐上限为0(熊市不推荐)",
 }
 
 # ---------------------------------------------------------------------------
@@ -719,6 +727,20 @@ def _screen_day(bc: BacktestConfig, config: StrategyConfig, day: str,
     """对单个交易日 d 重放选股，返回 (formal_picks, pending_picks, 否决原因计数)。"""
     market_env = compute_market_environment(index_upto, config)
     regime = market_env.get("regime", "unknown")
+    reasons: Counter = Counter()
+
+    # 组合层风控（与实盘 main() 一致，否则回测会高估实盘表现）：
+    #   - 市场级熔断：指数近 MARKET_CRASH_LOOKBACK 日急跌 → 当日不选股
+    #   - 推荐上限按 regime 收缩：牛 MAX_PICKS / 中性 NEUTRAL_ / 熊 BEAR_（unknown 折叠为熊）
+    # 注：回测不套用 regime 滞回（_apply_regime_hysteresis 依赖磁盘状态，跨回测日会串味），
+    #     因此这里的 regime 是未滞回的原始值，与实盘可能存在 1~2 个交易日的切换延迟差异。
+    if market_crash_halt(index_upto, config) is not None:
+        reasons["HALT_MARKET_CRASH"] += 1
+        return [], [], reasons
+    max_picks = resolve_max_picks(regime, config)
+    if max_picks <= 0:
+        reasons["HALT_MAX_PICKS_ZERO"] += 1
+        return [], [], reasons
 
     # 1) 全池技术面筛选（fund_data=None：基本面延后到决赛圈终审，减少网络成本，最终集合等价）
     def _eval_one(sp: StockPanel):
@@ -734,7 +756,6 @@ def _screen_day(bc: BacktestConfig, config: StrategyConfig, day: str,
             return None, "ERROR"
 
     signals: list[dict] = []
-    reasons: Counter = Counter()
     pool_list = list(panels.values())
     with ThreadPoolExecutor(max_workers=bc.WORKERS) as ex:
         for sig, reason in ex.map(lambda sp: _eval_one(sp), pool_list):
@@ -747,14 +768,14 @@ def _screen_day(bc: BacktestConfig, config: StrategyConfig, day: str,
 
     df = _rank_signals(pd.DataFrame(signals))
 
-    # 2) 决赛圈：周线确认 + 行业分散 + 基本面终审，取满 MAX_PICKS（复刻 main() weekly 分支）
+    # 2) 决赛圈：周线确认 + 行业分散 + 基本面终审，取满 max_picks（复刻 main() weekly 分支）
     weekly_enabled = config.REQUIRE_WEEKLY_TREND or config.REQUIRE_WEEKLY_MACD_STABLE
     formal: list[dict] = []
     pending: list[dict] = []
     industry_used: dict[str, int] = {}
 
     for _, row in df.iterrows():
-        if len(formal) >= config.MAX_PICKS:
+        if len(formal) >= max_picks:
             break
         code = str(row["code"])
         sp = panels.get(code)
@@ -1212,7 +1233,12 @@ def _render_report(bc: BacktestConfig, stats: dict, picks_df: pd.DataFrame, trad
     L.append(f"- 卖出规则：**盘中触发 +{StrategyConfig().FIXED_TAKE_PROFIT_PCT:.0f}% 止盈 / -{StrategyConfig().FIXED_STOP_LOSS_PCT:.0f}% 止损**"
              f"（同根 K 线两者都触及按{'止损' if bc.STOP_FIRST_ON_BOTH else '止盈'}保守成交），否则持有到{'数据期末' if bc.MAX_HOLD_DAYS<=0 else str(bc.MAX_HOLD_DAYS)+'个交易日'}按收盘退出")
     L.append(f"- 股票池：沪深主板（60/00）非 ST，as-of {bc.BT_START}" + (f"，本次限制前 {bc.LIMIT} 只" if bc.LIMIT else ""))
-    L.append(f"- 每日推荐上限 MAX_PICKS={StrategyConfig().MAX_PICKS}，同行业最多 {StrategyConfig().MAX_PICKS_PER_INDUSTRY} 只")
+    _cfg0 = StrategyConfig()
+    L.append(f"- 每日推荐上限：牛 {_cfg0.MAX_PICKS} / 中性 {_cfg0.NEUTRAL_MAX_PICKS} / 熊（含 unknown）{_cfg0.BEAR_MAX_PICKS} 只"
+             f"，同行业最多 {_cfg0.MAX_PICKS_PER_INDUSTRY} 只")
+    L.append(f"- 市场级熔断：沪深300 近 {_cfg0.MARKET_CRASH_LOOKBACK} 个交易日累计跌幅 < {_cfg0.MARKET_CRASH_HALT_PCT:.1f}% 的交易日整日不选股")
+    L.append(f"- 停牌缺口过滤：相邻 K 线间隔 > {_cfg0.MAX_BAR_GAP_DAYS} 天判为曾停牌，否决（K线跨缺口时滚动指标失真）")
+    L.append(f"- 排序主键：rank_score = 技术分 + 连续质量分（权重 {_cfg0.RANK_QUALITY_WEIGHT:.0f}：低波/回撤深度/区间位置/动能速率）")
     L.append(f"- 基本面：仅对决赛圈候选按披露窗口回溯拉取（as-of）；商誉/扣非补齐={'开启' if bc.FILL_OPTIONAL_FUNDAMENTALS else '关闭（主源缺失即放行，终审略宽松）'}\n")
 
     L.append("## 二、总体收益\n")

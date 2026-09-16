@@ -103,8 +103,13 @@ def run(argv: list[str] | None = None):
                     (time.time() - t) / 60, n_picks, len(pending_rows))
         if output_df is not None and not output_df.empty:
             for _, r in output_df.iterrows():
-                logger.info("  推荐: %s(%s) 评分 %s %s级 收盘 %s | 入选 %s | 核验 财务=%s 周线=%s",
-                            r.get("name"), r.get("code"), r.get("score"), r.get("grade"), r.get("close"),
+                # 排序分 = 技术分 + 连续质量分，是决赛圈取 Top-N 的实际主键；
+                # 与技术分并列打印，便于在 CI 日志里核对「为什么是这几只入选」
+                _rs = r.get("rank_score")
+                logger.info("  推荐: %s(%s) 评分 %s（排序分 %s）%s级 收盘 %s | 入选 %s | 核验 财务=%s 周线=%s",
+                            r.get("name"), r.get("code"), r.get("score"),
+                            "-" if _rs is None or pd.isna(_rs) else f"{float(_rs):.1f}",
+                            r.get("grade"), r.get("close"),
                             r.get("signals_hit") or "-", r.get("fund_status") or "-", r.get("weekly_status") or "-")
 
         # Step 3: 推荐结果落库 MySQL（未配置环境变量时静默跳过，不影响主流程）

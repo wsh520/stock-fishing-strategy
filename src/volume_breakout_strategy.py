@@ -62,6 +62,7 @@ from src.bottom_fishing_strategy import (
     get_fundamentals,
     get_market_environment,
     get_stock_list,
+    has_halt_gap,
     run_concurrent_screen,
 )
 
@@ -567,6 +568,13 @@ def evaluate_breakout(
     if out is None or out.empty:
         return None, "FAIL_DATA"
 
+    # 层 2.5：停牌缺口（与抄底策略共用 has_halt_gap）。突破判定依赖 level_l1/l2（60/20 日
+    # 最高价）、platform_range（20 日振幅）与 daily_vol_ratio（20 日均量），K 线跨停牌区间时
+    # 这些窗口全部混入停牌前数据——「突破 60 日新高」可能是突破 5 个月前的复权高点，
+    # 量比也可能把复牌爆量与停牌前死量做比值，判定失去意义。
+    if has_halt_gap(out, config):
+        return None, "FAIL_HALT_GAP"
+
     d_last = out.iloc[-1]
     # 核心行情字段缺失时不应继续以默认值计算并放行。尤其是 amount、
     # pct_chg 缺失会绕过成交额/涨幅过滤，造成“无量突破”或无法复核的信号。
@@ -779,7 +787,8 @@ def main_breakout(
         signals: list[dict] = []
         total = len(stock_list)
         stats = {
-            "total": total, "error": 0, "fail_data": 0, "fail_liq": 0, "fail_fund": 0,
+            "total": total, "error": 0, "fail_data": 0, "fail_liq": 0, "fail_halt": 0,
+            "fail_fund": 0,
             "fail_breakout": 0, "fail_vol": 0, "fail_pattern": 0, "fail_trend": 0,
             "fail_fake": 0, "fail_chase": 0, "fail_rsi": 0, "fail_volatile": 0,
             "fail_tech": 0, "pass": 0,
@@ -811,6 +820,7 @@ def main_breakout(
             elif reason == "FAIL_FUND": stats["fail_fund"] += 1
             elif reason == "FAIL_DATA": stats["fail_data"] += 1
             elif reason == "FAIL_LIQUIDITY": stats["fail_liq"] += 1
+            elif reason == "FAIL_HALT_GAP": stats["fail_halt"] += 1
             elif reason == "FAIL_NO_BREAKOUT": stats["fail_breakout"] += 1
             elif reason in ("FAIL_VOL_INSUFFICIENT", "FAIL_CLIMAX_VOL", "FAIL_AMOUNT_INSUFFICIENT"): stats["fail_vol"] += 1
             elif reason in ("FAIL_NO_PLATFORM", "FAIL_PLATFORM_LOOSE"): stats["fail_pattern"] += 1
@@ -830,11 +840,12 @@ def main_breakout(
         if time_budget_hit:
             logger.warning("[WARN] 因达到时间预算，以下漏斗仅统计已完成的 %d/%d 只", processed, total)
         logger.info("1. 初始有效股票池: %d 只 (完成处理 %d 只)", stats["total"], processed)
-        logger.info("2. 数据 & 流动性达标: %d 只 (数据缺失 %d, 僵尸股 %d, 异常 %d)",
-                    processed - stats["fail_data"] - stats["fail_liq"] - stats["error"],
-                    stats["fail_data"], stats["fail_liq"], stats["error"])
+        _pass_data = processed - stats["fail_data"] - stats["fail_liq"] - stats["fail_halt"] - stats["error"]
+        logger.info("2. 数据 & 流动性达标: %d 只 (数据缺失 %d, 僵尸股 %d, 停牌缺口 %d, 异常 %d)",
+                    _pass_data,
+                    stats["fail_data"], stats["fail_liq"], stats["fail_halt"], stats["error"])
         logger.info("3. 基本面防雷通过: %d 只 (淘汰 %d)",
-                    processed - stats["fail_data"] - stats["fail_liq"] - stats["error"] - stats["fail_fund"],
+                    _pass_data - stats["fail_fund"],
                     stats["fail_fund"])
         logger.info("4. 突破 & 量能确认: %d 只 (未突破 %d, 量能不足/天量/额不足 %d)",
                     stats["pass"] + stats["fail_pattern"] + stats["fail_trend"] + stats["fail_fake"] +
