@@ -1559,6 +1559,121 @@ def describe_pending(row: dict) -> str:
     return "\n".join(parts)
 
 
+# ===========================================================================
+# 波动率风控否决（FAIL_VOLATILE）留档与展示
+# 这类标的已通过前置筛选层，唯一拦路条件是 ATR 占现价百分比超出风控上限——
+# 既不是数据缺失，也不是形态不合格。单独留档的意义：
+#   1) 让「今天为什么没有推荐」在日志里可逐只复核，而不是只看到一个计数；
+#   2) 作为「高风险观察池」推送飞书（ATR% 收敛后可能重新达标），并显式标注风险，
+#      避免被误读为推荐标的（不落库、不参与周度追踪与归因）。
+# ===========================================================================
+
+VOLATILE_LOG_LIMIT = 20   # 日志逐只打印上限，超出仅提示条数（飞书另设上限）
+
+
+def _num_or_none(v: Any) -> Optional[float]:
+    """转为 float，None/NaN/不可转换一律返回 None（展示层用 _fmt_cell 兜底）。"""
+    if v is None:
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return None if pd.isna(f) else f
+
+
+def _atr_risk_level(atr_pct: float, limit: float) -> str:
+    """按 ATR% 超出上限的倍数划风险档（纯展示标签，不参与任何筛选判定）。"""
+    lim = _num_or_none(limit)
+    val = _num_or_none(atr_pct)
+    if not lim or lim <= 0 or val is None:
+        return "未知"
+    ratio = val / lim
+    if ratio >= 2.0:
+        return "极高"
+    if ratio >= 1.5:
+        return "高"
+    if ratio >= 1.2:
+        return "偏高"
+    return "轻度超限"
+
+
+def _build_volatile_row(code: str, name: str, date: Any, close: float, atr: float,
+                        atr_pct: float, limit: float, score: float, grade: str,
+                        hits: str = "", rsi: Any = None, vol_ratio: Any = None,
+                        drawdown: Any = None) -> dict:
+    """构造一条「波动率风控否决」记录（日志与飞书共用同一结构，两策略共用）。"""
+    ratio = (float(atr_pct) / float(limit)) if limit and limit > 0 else 0.0
+    # compute_risk_reward 用 1.5×ATR 作止损距离：ATR% 越大，确认止损失败所需的
+    # 浮亏越深，日内噪声扫损概率越高——这是该档标的最实质的风险来源。
+    stop_dist = float(atr_pct) * 1.5
+    return {
+        "code": str(code), "name": str(name), "date": str(date),
+        "close": round(float(close), 2),
+        "score": round(float(score), 1), "grade": str(grade or "-"),
+        "atr": round(float(atr), 3),
+        "atr_pct": round(float(atr_pct), 2),
+        "atr_limit": round(float(limit), 2),
+        "atr_ratio": round(ratio, 2),
+        "risk_level": _atr_risk_level(atr_pct, limit),
+        "risk_note": (
+            f"ATR 已达现价 {float(atr_pct):.2f}%（上限 {float(limit):.2f}%，{ratio:.2f}×）："
+            f"按 1.5×ATR 设止损需先承受约 {stop_dist:.1f}% 的浮亏才确认失败，日内噪声即可能扫损；"
+            f"高 ATR 多源于近期暴涨暴跌，左侧介入风险显著放大"
+        ),
+        "rsi": _num_or_none(rsi),
+        "vol_ratio": _num_or_none(vol_ratio),
+        "drawdown_pct": None if _num_or_none(drawdown) is None else round(float(drawdown) * 100, 2),
+        "signals_hit": str(hits or ""),
+    }
+
+
+def sort_volatile(rows: list[dict]) -> list[dict]:
+    """波动率观察池排序：技术分降序（质量优先）→ ATR% 降序 → 代码。
+
+    仅决定展示顺序，不影响任何筛选结果（这些标的都已经是被否决的）。
+    """
+    return sorted(rows, key=lambda r: (-float(_num_or_none(r.get("score")) or 0.0),
+                                       -float(_num_or_none(r.get("atr_pct")) or 0.0),
+                                       str(r.get("code") or "")))
+
+
+def describe_volatile(row: dict) -> str:
+    """把一只「波动率风控否决」的个股格式化为飞书卡片文本（高风险观察池条目）。"""
+    lines = [
+        f"**{row.get('name', '')} {row.get('code', '')}**（高风险观察 · **{row.get('risk_level') or '-'}**）",
+        f"评分: {_fmt_cell(row.get('score'))} ({row.get('grade') or '-'}级)"
+        f" | 收盘: {_fmt_cell(row.get('close'))}"
+        f" | RSI14: {_fmt_cell(row.get('rsi'))}"
+        f" | 量比: {_fmt_cell(row.get('vol_ratio'))}",
+        f"波动率: ATR {_fmt_cell(row.get('atr_pct'))}%"
+        f"（上限 {_fmt_cell(row.get('atr_limit'))}%，{_fmt_cell(row.get('atr_ratio'))}×）"
+        f" | 距高点回撤: {_fmt_cell(row.get('drawdown_pct'))}%",
+    ]
+    if row.get("signals_hit"):
+        lines.append(f"已达标项: {row.get('signals_hit')}")
+    if row.get("risk_note"):
+        lines.append(f"⚠️ 风险: {row.get('risk_note')}")
+    return "\n".join(lines)
+
+
+def log_volatile_rejects(rows: list[dict], log: logging.Logger, top: int = VOLATILE_LOG_LIMIT) -> None:
+    """逐只打印波动率风控否决明细（按技术分降序）。两策略共用同一打印格式。"""
+    ordered = sort_volatile(rows)
+    log.info("-" * 60)
+    log.info("[VOLATILE] 波动率风控否决 %d 只（已过前置筛选层，仅 ATR 超限；不推荐，仅供观察）", len(ordered))
+    for r in ordered[:max(1, int(top))]:
+        log.info("  · %s(%s) 评分 %s %s级 收盘 %s | ATR %s%%（上限 %s%%，%s×，风险%s）"
+                 " | RSI %s 量比 %s | 已达标: %s",
+                 r.get("name"), r.get("code"), r.get("score"), r.get("grade"), r.get("close"),
+                 r.get("atr_pct"), r.get("atr_limit"), r.get("atr_ratio"), r.get("risk_level"),
+                 _fmt_cell(r.get("rsi")), _fmt_cell(r.get("vol_ratio")), r.get("signals_hit") or "-")
+    if len(ordered) > max(1, int(top)):
+        log.info("  ...其余 %d 只详见飞书卡片高风险观察池", len(ordered) - max(1, int(top)))
+    log.info("  说明：ATR%% 收敛至上限以内后，这些标的本可进入正式候选，可作高风险观察池跟踪")
+    log.info("-" * 60)
+
+
 @dataclass
 class Signal:
     code: str; name: str; date: str; close: float; score: float; grade: str
@@ -1802,11 +1917,28 @@ def has_halt_gap(daily_out: Optional[pd.DataFrame], config: StrategyConfig) -> b
     return float(max_gap) > float(getattr(config, "MAX_BAR_GAP_DAYS", 12))
 
 
-def evaluate(daily_df: Optional[pd.DataFrame], code: str = "", name: str = "", config: Optional[StrategyConfig] = None, market_env: Optional[dict] = None, fund_data: Optional[dict] = None, latest_trade_date: Optional[str] = None) -> tuple[Optional[Signal], str]:
+def _signal_hits(d_last) -> list[str]:
+    """实际触发的技术条件标签（入选依据）。
+
+    抽成函数供「正式推荐」与「波动率否决观察池」共用，避免两处措辞漂移。
+    """
+    hits: list[str] = []
+    if bool(d_last.get("trend_turn", False)): hits.append("趋势转折")
+    if bool(d_last.get("rsi_rebound", False)): hits.append("RSI超卖反弹")
+    vp_label = str(d_last.get("vol_price_label", "") or "")
+    if bool(d_last.get("vol_price_coord", False)): hits.append(vp_label or "放量上涨")
+    if bool(d_last.get("multi_resonance", False)): hits.append("多周期共振")
+    if bool(d_last.get("bottom_divergence", False)): hits.append("底背离")
+    return hits
+
+
+def evaluate(daily_df: Optional[pd.DataFrame], code: str = "", name: str = "", config: Optional[StrategyConfig] = None, market_env: Optional[dict] = None, fund_data: Optional[dict] = None, latest_trade_date: Optional[str] = None, volatile_out: Optional[list] = None) -> tuple[Optional[Signal], str]:
     """评估单只股票。
 
     latest_trade_date：市场（沪深300）最新交易日，用于行情时效校验——
     个股最新K线日期与之一致才评估（停牌/数据滞后 → 暂不推荐），None 时跳过校验。
+    volatile_out：可选 list，传入后被 FAIL_VOLATILE 否决的个股会以明细 dict 追加进去
+    （供日志逐只打印与飞书高风险观察池展示）；不影响返回值与准入判定。
     """
     if config is None: config = StrategyConfig()
     regime = (market_env or {}).get("regime", "unknown")
@@ -1911,18 +2043,24 @@ def evaluate(daily_df: Optional[pd.DataFrame], code: str = "", name: str = "", c
     if atr_val is None or last_close <= 0:
         return None, "FAIL_DATA"
     if (atr_val / last_close * 100) > config.MAX_ATR_PCT:
+        # 明细留档：此处是「技术面已达标、仅波动率超限」的最后一层否决，
+        # 也是实盘中最常见的「今天为什么没有推荐」的原因，逐只记录下来。
+        if volatile_out is not None:
+            # 并发筛选下由 worker 线程直接 append：CPython 的 list.append 是原子操作，
+            # 与 fetch_stats 的计数写入同一约定（单次运行量级 <100，无需加锁）。
+            volatile_out.append(_build_volatile_row(
+                code=code, name=name, date=d_last["date"], close=last_close,
+                atr=atr_val, atr_pct=atr_val / last_close * 100, limit=config.MAX_ATR_PCT,
+                score=daily_score, grade=grade, hits=",".join(_signal_hits(d_last)),
+                rsi=d_last.get("rsi14"), vol_ratio=d_last.get("daily_vol_ratio"),
+                drawdown=drawdown,
+            ))
         return None, "FAIL_VOLATILE"
 
     rr = compute_risk_reward(entry_price=last_close, config=config, atr=atr_val)
 
-    # 入选依据：实际触发的技术条件（量价按质量分档区分措辞）
-    hits: list[str] = []
-    if bool(d_last.get("trend_turn", False)): hits.append("趋势转折")
-    if bool(d_last.get("rsi_rebound", False)): hits.append("RSI超卖反弹")
-    vp_label = str(d_last.get("vol_price_label", "") or "")
-    if bool(d_last.get("vol_price_coord", False)): hits.append(vp_label or "放量上涨")
-    if bool(d_last.get("multi_resonance", False)): hits.append("多周期共振")
-    if has_div: hits.append("底背离")
+    # 入选依据：实际触发的技术条件（量价按质量分档区分措辞；与观察池共用同一实现）
+    hits: list[str] = _signal_hits(d_last)
 
     sig = Signal(
         code=code, name=name, date=pd.to_datetime(d_last["date"]).strftime("%Y-%m-%d"),
@@ -2039,11 +2177,13 @@ def run_concurrent_screen(
 
 
 def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] = None,
-         pending_out: Optional[list] = None) -> Optional[pd.DataFrame]:
+         pending_out: Optional[list] = None, volatile_out: Optional[list] = None) -> Optional[pd.DataFrame]:
     """执行选股主流程，返回正式推荐（formal）DataFrame。
 
     pending_out：可选 list，传出「待核验候选」（财务/周线数据缺失、不与正式推荐混排），
     由调用方决定是否展示——数据缺失不等于筛选通过，宁可少荐。
+    volatile_out：可选 list，传出「波动率风控否决」明细（技术面已达标、仅 ATR 超限），
+    仅用于日志与飞书高风险观察池，不落库、不参与追踪与归因。
     """
     if config is None: config = StrategyConfig()
     if cache is None: cache = CacheManager(expire_hours=config.CACHE_EXPIRE_HOURS)
@@ -2113,7 +2253,7 @@ def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] 
                 if daily_df is None: return None, "FAIL_DATA"
                 fund_data = get_fundamentals(code, cache, config)
                 return evaluate(daily_df, code, name, config, market_env, fund_data,
-                                latest_trade_date=latest_trade_date)
+                                latest_trade_date=latest_trade_date, volatile_out=volatile_out)
             except Exception as e:
                 logger.debug("%s(%s) 筛选异常: %s", name, code, e)
                 return None, "ERROR"
@@ -2165,9 +2305,34 @@ def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] 
                                       pass_tech, stats["fail_tech"], pass_tech / pass_fund * 100)
         if pass_tech > 0: logger.info("6. 波动率风控达标: %d 只 (淘汰 %d 只，通过率 %.1f%%)",
                                       pass_vol, stats["fail_volatile"], pass_vol / pass_tech * 100)
+        if stats["fail_volatile"] > 0:
+            logger.info("   其中 %d 只仅因波动率超限被否决（技术面已达准入线），明细见下方 [VOLATILE] 区块",
+                        stats["fail_volatile"])
         logger.info("日线取数来源: Baostock %d 只，AkShare 兜底 %d 只，双源均失败 %d 只",
                     fetch_stats["bs_ok"], fetch_stats["ak_ok"], fetch_stats["fail"])
         logger.info("=" * 50)
+
+        # 波动率风控否决明细：技术面已过准入分数线、仅 ATR 超限被拦的标的逐只留档。
+        # 这是实盘中最常见的「今天为什么没有推荐」的原因，只印计数无法复核，
+        # 故在此打印明细，并经 volatile_out 传给调用方推送飞书高风险观察池。
+        if volatile_out:
+            # 并发筛选的完成顺序不确定，先按「技术分降序 → ATR% 降序」就地定序：
+            # 使日志与飞书卡片的 Top-N 稳定可复现（同一份数据两次运行给出同样名单）。
+            volatile_out[:] = sort_volatile(volatile_out)
+            log_volatile_rejects(volatile_out, logger)
+        elif volatile_out is not None and not stats["fail_volatile"] and not stats["pass"]:
+            # 波动率层零淘汰 + 日线层无通过标的：拦截发生在上游层。直接点出主要拦截层，
+            # 避免「看了 [VOLATILE] 区块却什么都没有」的困惑（实测多数空仓日属此类）。
+            _upstream = {
+                "数据/时效/停牌缺口": stats["fail_data"] + stats["fail_stale"] + stats["fail_halt"] + stats["error"],
+                "流动性不足": stats["fail_liq"],
+                "基本面防雷": stats["fail_fund"],
+                "日线技术面(含评分未达准入门槛)": stats["fail_tech"],
+            }
+            _layer = max(_upstream, key=lambda k: _upstream[k])
+            if _upstream[_layer] > 0:
+                logger.info("[VOLATILE] 波动率层本轮未淘汰任何标的（拦截发生在上游）："
+                            "日线筛选无通过标的，主要拦截层为「%s」%d 只", _layer, _upstream[_layer])
 
         # 正式技术信号为空：ENABLE_DAILY_FALLBACK 开启时进入放宽技术确认的观察候选模式
         # （核心行情安全条件仍由 evaluate() 保留；仅降低评分/确认门槛，明确标记 fallback）；

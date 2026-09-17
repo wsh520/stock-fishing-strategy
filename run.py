@@ -94,13 +94,17 @@ def run(argv: list[str] | None = None):
 
         # Step 2: 运行选股策略（传入 config/cache 复用市场环境缓存）
         # pending_rows 收集「待核验候选」（财务/周线数据缺失），只用于通知展示，不落库、不参与追踪
+        # volatile_rows 收集「波动率风控否决」（技术面已达标、仅 ATR 超限），同样只用于
+        # 日志与飞书高风险观察池：这是「今天为什么没有推荐」最常见的原因，需要可逐只复核
         t = time.time()
         logger.info("Step 2/4 执行选股策略（明细见 strategy 日志）...")
         pending_rows: list[dict] = []
-        output_df = main(config=config, cache=cache, pending_out=pending_rows)
+        volatile_rows: list[dict] = []
+        output_df = main(config=config, cache=cache, pending_out=pending_rows,
+                         volatile_out=volatile_rows)
         n_picks = 0 if output_df is None else len(output_df)
-        logger.info("Step 2/4 完成 (%.1f 分钟)，正式推荐 %d 只，待核验候选 %d 只",
-                    (time.time() - t) / 60, n_picks, len(pending_rows))
+        logger.info("Step 2/4 完成 (%.1f 分钟)，正式推荐 %d 只，待核验候选 %d 只，波动率超限观察 %d 只",
+                    (time.time() - t) / 60, n_picks, len(pending_rows), len(volatile_rows))
         if output_df is not None and not output_df.empty:
             for _, r in output_df.iterrows():
                 # 排序分 = 技术分 + 连续质量分，是决赛圈取 Top-N 的实际主键；
@@ -126,8 +130,9 @@ def run(argv: list[str] | None = None):
         t = time.time()
         logger.info("Step 4/4 发送飞书通知...")
         pending_df = pd.DataFrame(pending_rows) if pending_rows else None
+        volatile_df = pd.DataFrame(volatile_rows) if volatile_rows else None
         notify_screening_result(output_df, market_env=market_env_desc, pending=pending_df,
-                                strategy="bottom_fishing")
+                                strategy="bottom_fishing", volatile=volatile_df)
         logger.info("Step 4/4 完成 (%.1f 秒)", time.time() - t)
 
         logger.info("任务全部完成，总耗时 %.1f 分钟", (time.time() - t_start) / 60)

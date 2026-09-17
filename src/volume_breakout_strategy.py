@@ -50,6 +50,7 @@ from src.bottom_fishing_strategy import (
     _AK_AVAILABLE,
     _beijing_now,
     _effective_regime,
+    _build_volatile_row,
     _fetch_weekly_dual,
     _fmt_cell,
     _GRADE_ORDER,
@@ -63,7 +64,9 @@ from src.bottom_fishing_strategy import (
     get_market_environment,
     get_stock_list,
     has_halt_gap,
+    log_volatile_rejects,
     run_concurrent_screen,
+    sort_volatile,
 )
 
 logger = logging.getLogger("strategy.breakout")
@@ -536,12 +539,17 @@ def evaluate_breakout(
     config: Optional[VolumeBreakoutConfig] = None,
     market_env: Optional[dict] = None,
     fund_data: Optional[dict] = None,
+    volatile_out: Optional[list] = None,
 ) -> tuple[Optional[BreakoutSignal], str]:
     """评估单只股票是否满足放量突破入场条件。
 
     返回 (signal, reason)：
     - reason == "PASS"：signal 为 BreakoutSignal 实例
     - reason 以 "FAIL_" 开头：signal 为 None，reason 为失败归因码
+
+    volatile_out：可选 list，FAIL_VOLATILE 的个股会以明细 dict 追加进去（供日志逐只
+    打印与飞书高风险观察池展示）。注意本策略的波动率检查位于评分定级之前，
+    因此其中的标的只保证「突破/量能/形态/趋势」各层已过，评分等级尚未校验。
     """
     if config is None:
         config = VolumeBreakoutConfig()
@@ -663,6 +671,21 @@ def evaluate_breakout(
     atr_val = d_last.get("atr")
     atr_val = float(atr_val) if atr_val is not None and not pd.isna(atr_val) else None
     if atr_val is not None and last_close > 0 and (atr_val / last_close * 100) > config.MAX_ATR_PCT_BREAKOUT:
+        if volatile_out is not None:
+            # 明细留档（并发 worker 线程直接 append，与抄底策略同一约定）。
+            # 注意本策略的波动率层位于评分定级（层 5）之前，故其评分/等级仅作参考。
+            _lvl_zh = {3: "L1·60日新高", 2: "L2·20日新高", 1: "L3·MA60"}.get(
+                breakout_level, f"L{breakout_level}")
+            _score = float(d_last.get("daily_score", 0))
+            volatile_out.append(_build_volatile_row(
+                code=code, name=name, date=d_last["date"], close=last_close,
+                atr=atr_val, atr_pct=atr_val / last_close * 100,
+                limit=config.MAX_ATR_PCT_BREAKOUT,
+                score=_score, grade=_grade_from_score(_score - grade_boost, config),
+                hits=(f"突破 {_lvl_zh} +{breakout_margin:.2f}%、放量 {float(vol_ratio):.2f}×、"
+                      f"K线形态与平台整理达标、MA20 上行"),
+                rsi=d_last.get("rsi14"), vol_ratio=vol_ratio,
+            ))
         return None, "FAIL_VOLATILE"
 
     # 层 5：综合评分与等级
@@ -732,9 +755,13 @@ def describe_breakout(row: dict) -> str:
 def main_breakout(
     config: Optional[VolumeBreakoutConfig] = None,
     cache: Optional[CacheManager] = None,
+    volatile_out: Optional[list] = None,
 ) -> Optional[pd.DataFrame]:
     """放量突破选股主流程。骨架与 bottom_fishing_strategy.main 对齐：
     初始化数据源 → 市场环境 → 股票池 → 并发筛选（漏斗日志） → 决赛圈周线确认 → 排序截取。
+
+    volatile_out：可选 list，传出「波动率风控否决」明细（突破/量能/形态/趋势各层已过、
+    仅 ATR 超限），仅用于日志与飞书高风险观察池，不落库、不参与追踪与归因。
     """
     if config is None:
         config = VolumeBreakoutConfig()
@@ -801,7 +828,8 @@ def main_breakout(
                 if daily_df is None:
                     return None, "FAIL_DATA"
                 fund_data = get_fundamentals(code, cache, config)
-                return evaluate_breakout(daily_df, code, name, config, market_env, fund_data)
+                return evaluate_breakout(daily_df, code, name, config, market_env, fund_data,
+                                         volatile_out=volatile_out)
             except Exception as e:
                 logger.debug("%s(%s) 筛选异常: %s", name, code, e)
                 return None, "ERROR"
@@ -863,6 +891,26 @@ def main_breakout(
         logger.info("日线取数来源: Baostock %d 只，AkShare 兜底 %d 只，双源均失败 %d 只",
                     fetch_stats["bs_ok"], fetch_stats["ak_ok"], fetch_stats["fail"])
         logger.info("=" * 50)
+
+        # 波动率风控否决明细：逐只留档便于复核「为什么今天没推荐」，
+        # 并经 volatile_out 传给调用方推送飞书高风险观察池（不落库、不参与追踪）。
+        if volatile_out:
+            # 就地定序（技术分降序 → ATR% 降序），保证日志与飞书卡片 Top-N 可复现
+            volatile_out[:] = sort_volatile(volatile_out)
+            log_volatile_rejects(volatile_out, logger)
+        elif volatile_out is not None and not stats["fail_volatile"] and not stats["pass"]:
+            # 波动率层零淘汰 + 无通过信号：拦截在上游层，直接点出主要拦截层
+            _upstream = {
+                "数据/流动性/停牌缺口": stats["fail_data"] + stats["fail_liq"] + stats["fail_halt"] + stats["error"],
+                "基本面防雷": stats["fail_fund"],
+                "突破形态/量能/趋势/RSI/评分": (stats["fail_breakout"] + stats["fail_vol"] + stats["fail_pattern"]
+                                              + stats["fail_trend"] + stats["fail_fake"] + stats["fail_chase"]
+                                              + stats["fail_rsi"] + stats["fail_tech"]),
+            }
+            _layer = max(_upstream, key=lambda k: _upstream[k])
+            if _upstream[_layer] > 0:
+                logger.info("[VOLATILE] 波动率层本轮未淘汰任何标的（拦截发生在上游）："
+                            "无通过信号，主要拦截层为「%s」%d 只", _layer, _upstream[_layer])
 
         if not signals:
             logger.info("未发现符合条件的放量突破信号")

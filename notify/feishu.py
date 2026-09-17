@@ -64,6 +64,57 @@ def _divider() -> dict:
 
 
 _STRATEGY_ZH = {"bottom_fishing": "抄底", "volume_breakout": "突破"}
+_VOLATILE_STRATEGY_LABEL = {"bottom_fishing": "抄底信号", "volume_breakout": "突破信号"}
+VOLATILE_CARD_TOP = 5   # 卡片内逐只展示上限（超出仅提示条数，避免卡片过长）
+
+
+def _volatile_elements(volatile: Optional[pd.DataFrame], strategy: str = "bottom_fishing",
+                       top: int = VOLATILE_CARD_TOP) -> list:
+    """构建「波动率风控否决」区块（高风险观察池）。
+
+    这些标的不是数据缺失、也不是形态不合格，而是**波动太大**：ATR 占现价百分比
+    超出风控上限，按 1.5×ATR 设止损需先承受较深浮亏才确认失败，日内噪声即可能扫损。
+    单独成区块并显式标注风险等级与风险提示——它们是「今天为什么没推荐」的直接答案，
+    也是可以持续观察（ATR% 收敛后可能重新达标）的对象，但绝不是买入建议。
+    """
+    if volatile is None or volatile.empty:
+        return []
+    try:
+        from bottom_fishing_strategy import describe_volatile, sort_volatile
+    except ImportError:
+        describe_volatile = sort_volatile = None
+
+    # 并发筛选的完成顺序不确定，这里按「技术分降序 → ATR% 降序」统一排序，
+    # 保证卡片里的 Top-N 与日志 [VOLATILE] 区块逐只对应、两次运行结果可复现。
+    rows = volatile.to_dict("records")
+    if sort_volatile:
+        rows = sort_volatile(rows)
+    total = len(rows)
+    top_n = max(1, int(top))
+
+    label = _VOLATILE_STRATEGY_LABEL.get(strategy, "信号")
+    elems = [
+        _divider(),
+        _md_element(
+            f"**⚠️ 波动率风控否决 {total} 只**"
+            f"（{label}已达标，仅因 ATR 超风控上限被拦下，未进入正式推荐）\n"
+            f"以下为**高风险观察池**，ATR% 收敛至上限以内后才可能重新达标；"
+            f"列出仅供观察与复核，**不构成买入建议**。"
+        ),
+    ]
+    for r in rows[:top_n]:
+        if describe_volatile:
+            elems.append(_md_element(describe_volatile(r)))
+        else:
+            elems.append(_md_element(
+                f"**{r.get('name', '')} {r.get('code', '')}**"
+                f" | 评分: {r.get('score', 0)} ({r.get('grade', '-')}级)"
+                f" | ATR: {r.get('atr_pct', '-')}% / 上限 {r.get('atr_limit', '-')}%"
+                f" | 风险: {r.get('risk_level', '-')}"
+            ))
+    if total > top_n:
+        elems.append(_md_element(f"*...共 {total} 只，仅展示前 {top_n} 只*"))
+    return elems
 
 
 def notify_screening_result(
@@ -72,6 +123,7 @@ def notify_screening_result(
     error_msg: Optional[str] = None,
     pending: Optional[pd.DataFrame] = None,
     strategy: str = "bottom_fishing",
+    volatile: Optional[pd.DataFrame] = None,
 ) -> None:
     """发送选股结果通知。
 
@@ -81,7 +133,9 @@ def notify_screening_result(
         notify_screening_result(None, market_env=market_env_desc, error_msg=str(e))
 
     分层展示：df 为正式推荐；pending 为待核验候选
-    （财务/周线数据缺失，未正式推荐，不与正式推荐混排）。
+    （财务/周线数据缺失，未正式推荐，不与正式推荐混排）；
+    volatile 为「波动率风控否决」的高风险观察池（技术面/形态已达标，仅 ATR 超限被拦），
+    单独成区块并显式标注风险等级与风险提示，避免被误读为推荐标的。
     strategy 决定卡片标题措辞与单票描述格式（抄底=低位企稳候选 / 突破=放量突破候选）。
     """
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -104,10 +158,11 @@ def notify_screening_result(
 
     # 尝试导入 describe 函数（按策略来源选择卡片格式）
     try:
-        from bottom_fishing_strategy import describe, describe_pending
+        from bottom_fishing_strategy import describe, describe_pending, describe_volatile
     except ImportError:
         describe = None
         describe_pending = None
+        describe_volatile = None
     try:
         from volume_breakout_strategy import describe_breakout
     except ImportError:
@@ -138,11 +193,18 @@ def notify_screening_result(
         no_signal_text = "今日无正式推荐（未发现数据完整且通过全部条件的标的），宁可少荐。"
         if pending is not None and not pending.empty:
             no_signal_text += f"\n另有待核验候选 {len(pending)} 只（数据待补全）。"
+        if volatile is not None and not volatile.empty:
+            no_signal_text += (f"\n本轮有 {len(volatile)} 只仅因**波动率超限**被拦下"
+                               f"（技术面已达标），详见下方高风险观察池。")
         card = {
-            "header": _build_header(f"{card_title} - 今日无信号", color="grey"),
+            "header": _build_header(
+                f"{card_title} - 今日无信号"
+                + (f"（波动率观察池 {len(volatile)} 只）" if volatile is not None and not volatile.empty else ""),
+                color="grey"),
             "elements": [
                 _md_element(f"**时间:** {now}\n**市场环境:** {market_env}\n\n{no_signal_text}"),
                 *_pending_elements(),
+                *_volatile_elements(volatile, strategy),
             ],
         }
         _send_feishu(card)
@@ -174,6 +236,7 @@ def notify_screening_result(
         elements.append(_md_element(f"*...共 {len(df)} 只，仅展示前10*"))
 
     elements.extend(_pending_elements())
+    elements.extend(_volatile_elements(volatile, strategy))
 
     card = {
         "header": _build_header(f"{card_title} - {len(df)}只信号", color="green"),

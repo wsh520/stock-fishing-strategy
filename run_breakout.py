@@ -25,6 +25,8 @@ import sys
 import time
 import traceback
 
+import pandas as pd
+
 # 将项目根目录加入 Python 路径（确保 src 包可导入）
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -110,11 +112,14 @@ def run(argv: list[str] | None = None):
         logger.info("Step 1/4 完成 (%.1f 秒): %s", time.time() - t, market_env_desc)
 
         # Step 2: 运行放量突破选股策略
+        # volatile_rows 收集「波动率风控否决」（突破/量能/形态/趋势各层已过、仅 ATR 超限），
+        # 只用于日志与飞书高风险观察池，不落库、不参与追踪与归因
         t = time.time()
         logger.info("Step 2/4 执行放量突破选股策略（明细见 strategy.breakout 日志）...")
-        output_df = main_breakout(config=config, cache=cache)
-        logger.info("Step 2/4 完成 (%.1f 分钟)，推荐 %d 只", (time.time() - t) / 60,
-                    0 if output_df is None else len(output_df))
+        volatile_rows: list[dict] = []
+        output_df = main_breakout(config=config, cache=cache, volatile_out=volatile_rows)
+        logger.info("Step 2/4 完成 (%.1f 分钟)，推荐 %d 只，波动率超限观察 %d 只", (time.time() - t) / 60,
+                    0 if output_df is None else len(output_df), len(volatile_rows))
 
         # 组合层：同一交易日已被其他策略推荐的个股不再重复推荐（同股去重），
         # 且两策略合计推荐数不超过 DAILY_TOTAL_MAX_PICKS（依赖运行顺序：后运行者去重）。
@@ -163,7 +168,9 @@ def run(argv: list[str] | None = None):
         if not args.no_notify:
             t = time.time()
             logger.info("Step 4/4 发送飞书通知...")
-            notify_screening_result(output_df, market_env=market_env_desc, strategy="volume_breakout")
+            volatile_df = pd.DataFrame(volatile_rows) if volatile_rows else None
+            notify_screening_result(output_df, market_env=market_env_desc,
+                                    strategy="volume_breakout", volatile=volatile_df)
             logger.info("Step 4/4 完成 (%.1f 秒)", time.time() - t)
         else:
             logger.info("Step 4/4 已跳过（--no-notify）")

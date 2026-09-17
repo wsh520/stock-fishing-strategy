@@ -17,6 +17,9 @@
 9.  假突破过滤向量化结果与原三重循环参考实现逐点一致
 10. 突破评分重校准：浅幅度 L2 突破在新公式下可通过 B 级准入（旧纯乘法公式不能）
 11. 突破策略 RR 下限检查已删除（深幅度 L2/L1 不受摆设检查拦截）
+12. 波动率风控否决明细采集（FAIL_VOLATILE → volatile_out）：技术分/等级/ATR%与上限/风险档
+    /风险提示/已达标项，日志逐只打印（`[VOLATILE]` 区块）与飞书高风险观察池共用同一结构；
+    不传 volatile_out 时行为与旧版完全一致（向后兼容）；两策略共用同一记录与渲染实现
 """
 import json
 import os
@@ -138,6 +141,92 @@ check(f"波动率: 高 ATR({_atr_pct:.2f}%) 否决 FAIL_VOLATILE",
 rr = m.compute_risk_reward(10.0, cfg, atr=0.2)
 check("RR: compute_risk_reward 不再返回 passes", "passes" not in rr)
 check("RR: 止损止盈仍计算", rr["stop_loss"] > 0 and rr["take_profit"] > 10.0 and rr["rr_ratio"] > 0)
+
+# ===========================================================================
+# 4b) 波动率风控否决明细采集（日志逐只打印 + 飞书高风险观察池）
+# ===========================================================================
+_vol_rows: list[dict] = []
+_, r_vol2 = m.evaluate(df_volatile, code="600000", name="波动测试", config=cfg,
+                       market_env=_NEUTRAL, fund_data=_FUND_OK, volatile_out=_vol_rows)
+check("观察池: 传入 volatile_out 后被否决标的被记录且归因不变",
+      r_vol2 == "FAIL_VOLATILE" and len(_vol_rows) == 1)
+if _vol_rows:
+    _vr = _vol_rows[0]
+    check("观察池: 记录含代码/名称/现价/ATR%/上限/倍数",
+          _vr["code"] == "600000" and _vr["name"] == "波动测试" and _vr["close"] > 0
+          and _vr["atr_pct"] > cfg.MAX_ATR_PCT and _vr["atr_limit"] == cfg.MAX_ATR_PCT
+          and abs(_vr["atr_ratio"] - _vr["atr_pct"] / cfg.MAX_ATR_PCT) < 0.02)
+    check("观察池: 风险等级与风险提示已生成",
+          _vr["risk_level"] in ("轻度超限", "偏高", "高", "极高")
+          and "ATR" in _vr["risk_note"] and "止损" in _vr["risk_note"])
+    check("观察池: 记录含评分/等级/RSI/量比等展示字段",
+          _vr["score"] > 0 and _vr["grade"] in ("A", "B", "C", "D")
+          and _vr["rsi"] is not None and _vr["vol_ratio"] is not None)
+
+# 未传 volatile_out 时不产生任何副作用（旧调用签名完全兼容）
+_, r_vol3 = m.evaluate(df_volatile, code="600000", name="测试", config=cfg,
+                       market_env=_NEUTRAL, fund_data=_FUND_OK)
+check("观察池: 不传 volatile_out 时行为与旧版一致", r_vol3 == "FAIL_VOLATILE")
+
+# 通过的标的不会被误记入观察池
+_pass_rows: list[dict] = []
+_, r_pass = m.evaluate(df_a, code="600000", name="测试", config=cfg,
+                       market_env=_NEUTRAL, fund_data=_FUND_OK, volatile_out=_pass_rows)
+check("观察池: 通过前置层的正常标的不会进入观察池", r_pass == "PASS" and not _pass_rows)
+
+# 风险分档阈值（3.33% 为抄底上限）
+check("风险档: 2.0× 及以上为极高", m._atr_risk_level(7.0, 3.33) == "极高")
+check("风险档: 1.5× 为高", m._atr_risk_level(5.0, 3.33) == "高")
+check("风险档: 1.2× 为偏高", m._atr_risk_level(4.0, 3.33) == "偏高")
+check("风险档: 略超上限为轻度超限", m._atr_risk_level(3.4, 3.33) == "轻度超限")
+
+# 展示排序：技术分降序 → ATR% 降序（只影响展示顺序，这些标的都已被否决）
+_ordered = m.sort_volatile([
+    {"code": "600003", "score": 70.0, "atr_pct": 5.0},
+    {"code": "600001", "score": 82.0, "atr_pct": 4.0},
+    {"code": "600002", "score": 82.0, "atr_pct": 6.0},
+])
+check("观察池排序: 技术分降序、同分按 ATR% 降序",
+      [r["code"] for r in _ordered] == ["600002", "600001", "600003"])
+
+# 日志输出：逐只打印（用内存 handler 捕获，避免污染测试输出）
+import io
+import logging as _logging
+
+_buf = io.StringIO()
+_h = _logging.StreamHandler(_buf)
+_logger = _logging.getLogger("test.volatile")
+_logger.addHandler(_h)
+_logger.setLevel(_logging.INFO)
+m.log_volatile_rejects(_vol_rows * 3, _logger, top=2)
+_log_text = _buf.getvalue()
+check("日志: 打印 [VOLATILE] 区块并逐只输出明细",
+      "[VOLATILE] 波动率风控否决 3 只" in _log_text and _log_text.count("  · ") == 2)
+check("日志: 超出上限时提示剩余条数", "其余 1 只" in _log_text)
+
+# 飞书区块：由 notify.feishu 渲染「高风险观察池」，必须显式标注风险且不落库
+try:
+    from notify.feishu import _volatile_elements
+
+    _vdf = pd.DataFrame(_vol_rows)
+    _elems = _volatile_elements(_vdf, strategy="bottom_fishing")
+    _blob = json.dumps(_elems, ensure_ascii=False)
+    check("飞书: 生成波动率观察池区块并声明不构成买入建议",
+          any("波动率风控否决 1 只" in str(e.get("content", "")) for e in _elems)
+          and "不构成买入建议" in _blob)
+    check("飞书: 区块内含风险等级与风险提示",
+          "高风险观察" in _blob and "风险:" in _blob and "ATR" in _blob)
+    check("飞书: 无数据时不产生空区块", _volatile_elements(None) == [] and _volatile_elements(pd.DataFrame()) == [])
+
+    # 并发完成顺序不确定，渲染时必须统一排序，使卡片 Top-N 与日志 [VOLATILE] 区块一致
+    _low = dict(_vol_rows[0]); _low.update({"code": "600009", "name": "低分股", "score": 30.0})
+    _high = dict(_vol_rows[0]); _high.update({"code": "600010", "name": "高分股", "score": 95.0})
+    _elems_sorted = _volatile_elements(pd.DataFrame([_low, _high]), strategy="bottom_fishing")
+    _first_stock = str(_elems_sorted[2].get("content", ""))
+    check("飞书: 卡片顺序按技术分降序（与日志一致）",
+          "高分股" in _first_stock and "低分股" not in _first_stock)
+except ImportError as _e:  # requests 等依赖缺失的环境：跳过并明确提示
+    print(f"[SKIP] 飞书区块渲染测试（依赖缺失: {_e}）")
 
 # ===========================================================================
 # 5) 周线未收盘 bar 剔除
@@ -355,6 +444,28 @@ _old_score = vcfg.W_BREAKOUT * 0.75 * _mf
 _new_score = vcfg.W_BREAKOUT * (0.55 * 0.75 + 0.45 * _mf)
 check("校准: 浅幅度 L2 旧公式突破分 <8（被压制）", _old_score < 8.0)
 check("校准: 浅幅度 L2 新公式突破分 >15（可达成 B 级）", _new_score > 15.0)
+
+# ===========================================================================
+# 11) 突破策略同样采集「波动率风控否决」明细（共用同一记录结构）
+# ===========================================================================
+# 突破策略的波动率层位于评分定级之前，故收紧 ATR 上限来触发该分支
+_vol_bo: list[dict] = []
+_vcfg_tight = replace(vcfg, MAX_ATR_PCT_BREAKOUT=0.5)
+_sig_bo, r_bo = vb.evaluate_breakout(make_l2_breakout_df(10.25), code="600000", name="测试",
+                                     config=_vcfg_tight, market_env=_NEUTRAL, fund_data=_FUND_OK,
+                                     volatile_out=_vol_bo)
+check("突破观察池: 波动率否决被记录且归因不变",
+      r_bo == "FAIL_VOLATILE" and _sig_bo is None and len(_vol_bo) == 1)
+check("突破观察池: 记录含上限/倍数/风险等级",
+      bool(_vol_bo) and _vol_bo[0]["atr_limit"] == 0.5 and _vol_bo[0]["atr_ratio"] > 1.0
+      and _vol_bo[0]["risk_level"] in ("轻度超限", "偏高", "高", "极高"))
+check("突破观察池: 记录标注已通过的突破/量能条件",
+      bool(_vol_bo) and "突破 L2" in _vol_bo[0]["signals_hit"] and "放量" in _vol_bo[0]["signals_hit"])
+
+# 未传 volatile_out 时突破策略行为不变
+_sig_bo2, r_bo2 = vb.evaluate_breakout(make_l2_breakout_df(10.25), code="600000", name="测试",
+                                       config=_vcfg_tight, market_env=_NEUTRAL, fund_data=_FUND_OK)
+check("突破观察池: 不传 volatile_out 时行为与旧版一致", r_bo2 == "FAIL_VOLATILE")
 
 # ===========================================================================
 # 汇总
