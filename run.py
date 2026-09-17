@@ -44,6 +44,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     --no-cache：跳过磁盘缓存读写（cache/ 目录），强制从 Baostock/AkShare 拉最新数据。
     同一天多次执行、或怀疑缓存被污染时使用。内存 TTL 缓存仍生效（同一次进程内复用）。
+
+    --no-save / --no-notify：测试专用，跳过 MySQL 落库 / 飞书通知。
+    实盘推荐表 stock_recommendation 以 (rec_date, code, strategy) 为唯一键且用
+    INSERT IGNORE 写入——**不会清掉当天旧行**，因此白天测试写进去的推荐会与晚间
+    正式结果并存在同一天，污染周度追踪与归因，还会干扰晚间突破策略的同股去重。
+    纯测试请用这两个开关。
     """
     parser = argparse.ArgumentParser(
         prog="run.py",
@@ -54,6 +60,16 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="禁用 cache/ 磁盘缓存读写，强制从数据源拉最新数据",
     )
+    parser.add_argument(
+        "--no-save",
+        action="store_true",
+        help="跳过 MySQL 落库（测试用，避免污染实盘推荐/追踪数据）",
+    )
+    parser.add_argument(
+        "--no-notify",
+        action="store_true",
+        help="跳过飞书通知（测试用）",
+    )
     return parser.parse_args(argv)
 
 
@@ -61,6 +77,8 @@ def run(argv: list[str] | None = None):
     """主执行流程"""
     _setup_logging()
     args = _parse_args(argv)
+    save_enabled = not args.no_save
+    notify_enabled = not args.no_notify
     # 延迟导入策略模块（确保路径已设置）
     from src.bottom_fishing_strategy import (
         StrategyConfig,
@@ -72,6 +90,10 @@ def run(argv: list[str] | None = None):
     t_start = time.time()
     logger.info("=" * 60)
     logger.info("每日选股任务启动")
+    if not save_enabled:
+        logger.info("已启用 --no-save：本次不写 MySQL（纯测试运行，不污染实盘推荐与追踪数据）")
+    if not notify_enabled:
+        logger.info("已启用 --no-notify：本次不推送飞书通知")
 
     config = StrategyConfig()
     if args.no_cache:
@@ -118,29 +140,36 @@ def run(argv: list[str] | None = None):
 
         # Step 3: 推荐结果落库 MySQL（未配置环境变量时静默跳过，不影响主流程）
         t = time.time()
-        logger.info("Step 3/4 推荐结果落库 MySQL...")
-        # 保底观察候选只用于通知/回测观察，不落库、不进入正式追踪归因
-        formal_output_df = output_df
-        if output_df is not None and not output_df.empty and "tier" in output_df.columns:
-            formal_output_df = output_df[output_df["tier"].fillna("formal") == "formal"].copy()
-        save_recommendations(formal_output_df, strategy="bottom_fishing")
-        logger.info("Step 3/4 完成 (%.1f 秒)", time.time() - t)
+        if save_enabled:
+            logger.info("Step 3/4 推荐结果落库 MySQL...")
+            # 保底观察候选只用于通知/回测观察，不落库、不进入正式追踪归因
+            formal_output_df = output_df
+            if output_df is not None and not output_df.empty and "tier" in output_df.columns:
+                formal_output_df = output_df[output_df["tier"].fillna("formal") == "formal"].copy()
+            save_recommendations(formal_output_df, strategy="bottom_fishing")
+            logger.info("Step 3/4 完成 (%.1f 秒)", time.time() - t)
+        else:
+            logger.info("Step 3/4 已跳过（--no-save）：测试结果不落库")
 
         # Step 4: 发送选股结果通知
         t = time.time()
-        logger.info("Step 4/4 发送飞书通知...")
-        pending_df = pd.DataFrame(pending_rows) if pending_rows else None
-        volatile_df = pd.DataFrame(volatile_rows) if volatile_rows else None
-        notify_screening_result(output_df, market_env=market_env_desc, pending=pending_df,
-                                strategy="bottom_fishing", volatile=volatile_df)
-        logger.info("Step 4/4 完成 (%.1f 秒)", time.time() - t)
+        if notify_enabled:
+            logger.info("Step 4/4 发送飞书通知...")
+            pending_df = pd.DataFrame(pending_rows) if pending_rows else None
+            volatile_df = pd.DataFrame(volatile_rows) if volatile_rows else None
+            notify_screening_result(output_df, market_env=market_env_desc, pending=pending_df,
+                                    strategy="bottom_fishing", volatile=volatile_df)
+            logger.info("Step 4/4 完成 (%.1f 秒)", time.time() - t)
+        else:
+            logger.info("Step 4/4 已跳过（--no-notify）：不推送飞书")
 
         logger.info("任务全部完成，总耗时 %.1f 分钟", (time.time() - t_start) / 60)
 
     except Exception as e:
         logger.exception("策略执行失败: %s", e)
-        # 发送错误通知
-        notify_screening_result(None, market_env=market_env_desc, error_msg=str(e))
+        # 发送错误通知（--no-notify 时同样跳过，避免测试运行刷屏；失败详情见上方 traceback）
+        if notify_enabled:
+            notify_screening_result(None, market_env=market_env_desc, error_msg=str(e))
         sys.exit(1)
 
 

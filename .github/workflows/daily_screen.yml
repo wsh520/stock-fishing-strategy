@@ -7,6 +7,22 @@ on:
     - cron: "0 13 * * 1-5"
   workflow_dispatch:
     inputs:
+      purge_cache:
+        description: "手动运行时也清除恢复回来的行情缓存，强制重新拉取（模拟定时运行的取数行为）"
+        type: boolean
+        default: false
+      reuse_cache:
+        description: "手动运行时复用「最近一次收盘快照」，完全不拉行情（默认开启；要拉最新数据请关掉它并勾选 purge_cache）"
+        type: boolean
+        default: true
+      no_save:
+        description: "两套策略都跳过 MySQL 落库（纯测试运行，避免测试推荐与晚间正式结果混在同一天）"
+        type: boolean
+        default: false
+      no_notify:
+        description: "两套策略都跳过飞书通知"
+        type: boolean
+        default: false
       no_cache:
         description: "跳过 cache/ 磁盘缓存读写（两套策略都强制全量拉取，且不再跨策略共享）"
         type: boolean
@@ -45,9 +61,12 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      # 缓存 baostock 磁盘缓存目录。数据层按文件 mtime 判新鲜度，而 actions/cache
-      # 基于 tar 会保留 mtime，因此恢复的「昨日行情」会被正确判定为过期并重新拉取，
-      # 仍在 TTL 内的股票列表（6天）与基本面（7天）则直接复用，省下大量请求。
+      # 缓存 baostock 磁盘缓存目录。
+      # key 里带 github.run_id：actions/cache 的 key 不可变（同 key 二次保存会被跳过），
+      # 若全用「当天日期」做 key，则当天第一次运行写下的缓存会锁死当天，之后每次运行
+      # （哪怕是 21:00 定时任务重新拉取的最新行情）都存不进去，后续手动运行又会命中
+      # 那份「收盘前」的旧快照 —— 带 run_id 后每次运行各自入库，restore-keys 取当天最新。
+      # 恢复优先级：当天最近一次运行的缓存 → 全局最近一次缓存。
       - name: Resolve cache date
         id: cachedate
         run: echo "ymd=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
@@ -56,11 +75,19 @@ jobs:
         uses: actions/cache@v4
         with:
           path: cache
-          key: baostock-cache-${{ steps.cachedate.outputs.ymd }}
+          key: baostock-cache-${{ steps.cachedate.outputs.ymd }}-${{ github.run_id }}
           restore-keys: |
+            baostock-cache-${{ steps.cachedate.outputs.ymd }}-
             baostock-cache-
 
+      # 清理「恢复回来的」行情缓存：只在【定时执行】时做 —— 定时任务代表实盘推荐，
+      # 必须基于当日收盘后的最新行情，不能赌「行情缓存恰好是今天的」。
+      # 手动触发（白天测试）默认【不清理】，直接复用同一天里已经拉好的行情：数据层按
+      # 文件 mtime 判定「是否当天」（_cache_fresh_today），同一天内反复运行几乎零请求，
+      # 几分钟就能跑完一轮；需要复现定时任务的取数行为时，勾选 purge_cache 即可。
+      # no_cache=true 时本就完全不读写 cache/，此步骤无意义但无害。
       - name: Purge restored quote cache
+        if: github.event_name == 'schedule' || inputs.purge_cache == true
         run: |
           # 删除「恢复回来的」行情类缓存（daily_/weekly_/index_daily_）：
           # 这三类的新鲜度由文件 mtime 判定（_cache_fresh_today），复用与否取决于
@@ -79,6 +106,27 @@ jobs:
             echo "cache/ 目录不存在：首次运行或缓存已过期淘汰"
           fi
 
+      # 手动运行默认「复用最近一次收盘快照」：把恢复回来的行情缓存 touch 成今天，让
+      # _cache_fresh_today 判定为有效 —— 白天测试一个行情请求都不发，几分钟跑完一轮。
+      # 这是等价而非「拿旧数据凑数」：Baostock 当日数据 17:30 后才陆续入库，17:00 前全量
+      # 拉取拿回的本来也就是「昨收为止」的同一批 K 线，与缓存内容完全一致。
+      # 定时运行（实盘）走上面的清理分支，永远重新拉取当日最新行情，不受本步骤影响。
+      - name: Reuse last close snapshot (manual runs)
+        if: github.event_name != 'schedule' && inputs.reuse_cache == true && inputs.purge_cache != true && inputs.no_cache != true
+        run: |
+          if [ -d cache ]; then
+            before=$(find cache -maxdepth 1 -type f \( -name 'daily_*' -o -name 'weekly_*' -o -name 'index_daily_*' \) | wc -l)
+            # 打印这份快照的写入时间，让「复用的是哪一次收盘」在日志里可直接核对
+            newest=$(find cache -maxdepth 1 -type f -name 'daily_*' -printf '%T@\n' 2>/dev/null | sort -n | tail -1)
+            if [ -n "$newest" ]; then
+              echo "::notice::行情缓存最近写入时间：$(date -d "@${newest%.*}" '+%Y-%m-%d %H:%M')（本次复用这份快照）"
+            fi
+            find cache -maxdepth 1 -type f \( -name 'daily_*' -o -name 'weekly_*' -o -name 'index_daily_*' \) -exec touch {} +
+            echo "::notice::复用最近一次收盘快照：$before 个行情缓存已标记为今日有效，本次不拉取行情"
+          else
+            echo "::notice::cache/ 不存在（首次运行或缓存已被淘汰），本次仍会全量拉取行情"
+          fi
+
       - name: Run bottom-fishing strategy
         env:
           FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
@@ -92,20 +140,31 @@ jobs:
           TZ: Asia/Shanghai
           # 关闭 stdout 缓冲：否则 Python 输出按块缓冲，任务超时/取消后缓冲的日志全部丢失
           PYTHONUNBUFFERED: "1"
-          # 定时任务现在【使用】磁盘缓存（不再强制 --no-cache）：
-          # 这是共享当日行情的前提——抄底必须把当天日线/基本面写入 cache/，
-          # 同一 runner 上的突破步骤才能零重拉复用。过期风险由上面的
-          # Purge restored quote cache 步骤承担（行情类缓存一律不作为复用来源）。
-          # 只有手动触发勾选 no_cache 时才强制全量拉取。
+          # 定时任务【使用】磁盘缓存（不再强制 --no-cache）：这是共享当日行情的前提 ——
+          # 抄底必须把当天日线/基本面写进 cache/，同一 runner 上的突破步骤才能零重拉复用。
+          # 定时运行「必须基于当日最新行情」这一正确性要求，由上面的 Purge restored quote
+          # cache 步骤承担（仅在 schedule 或勾选 purge_cache 时执行）；手动运行则由
+          # Reuse last close snapshot 步骤复用最近一次收盘快照，白天的反复测试因此从
+          # 几十分钟降到几分钟。勾选 no_cache 时两套策略都强制全量拉取（既不读也不写缓存）。
           NO_CACHE: ${{ inputs.no_cache }}
+          NO_SAVE: ${{ inputs.no_save }}
+          NO_NOTIFY: ${{ inputs.no_notify }}
         run: |
+          ARGS=""
           if [ "$NO_CACHE" = "true" ]; then
-            echo "::notice::手动触发已勾选 no_cache：抄底与突破均跳过 cache/，全部从数据源拉取（本次不共享）"
-            python -u run.py --no-cache
-          else
-            echo "::notice::抄底策略开始（写入当天行情缓存，供随后的突破策略复用）"
-            python -u run.py
+            ARGS="$ARGS --no-cache"
+            echo "::notice::已勾选 no_cache：抄底与突破均跳过 cache/，全部从数据源拉取（本次不共享）"
           fi
+          if [ "$NO_SAVE" = "true" ]; then
+            ARGS="$ARGS --no-save"
+            echo "::notice::已勾选 no_save：抄底本次跳过 MySQL 落库（测试推荐不会与晚间正式结果混在同一天）"
+          fi
+          if [ "$NO_NOTIFY" = "true" ]; then
+            ARGS="$ARGS --no-notify"
+            echo "::notice::已勾选 no_notify：抄底本次跳过飞书通知"
+          fi
+          echo "::notice::抄底策略开始：run.py $ARGS"
+          python -u run.py $ARGS
 
       # if: always() —— 抄底失败/异常时突破仍要执行：两套策略是独立信号源，
       # 不应互相阻塞。抄底未写出的缓存由突破自行补拉（慢但结果正确）。
@@ -121,21 +180,27 @@ jobs:
           TZ: Asia/Shanghai
           PYTHONUNBUFFERED: "1"
           NO_CACHE: ${{ inputs.no_cache }}
+          NO_SAVE: ${{ inputs.no_save }}
+          NO_NOTIFY: ${{ inputs.no_notify }}
           BREAKOUT_NO_SAVE: ${{ inputs.breakout_no_save }}
           BREAKOUT_NO_NOTIFY: ${{ inputs.breakout_no_notify }}
         run: |
           ARGS=""
           if [ "$NO_CACHE" = "true" ]; then ARGS="$ARGS --no-cache"; fi
-          if [ "$BREAKOUT_NO_SAVE" = "true" ]; then
+          # no_save / no_notify 是「整套策略一起跳过」的总开关（测试模式），
+          # breakout_* 是只针对突破策略的细粒度开关（历史保留），两者取或
+          if [ "$NO_SAVE" = "true" ] || [ "$BREAKOUT_NO_SAVE" = "true" ]; then
             ARGS="$ARGS --no-save"
-            echo "::notice::已勾选 breakout_no_save：本次跳过 MySQL 落库"
+            echo "::notice::已勾选 no_save / breakout_no_save：突破本次跳过 MySQL 落库"
           fi
-          if [ "$BREAKOUT_NO_NOTIFY" = "true" ]; then
+          if [ "$NO_NOTIFY" = "true" ] || [ "$BREAKOUT_NO_NOTIFY" = "true" ]; then
             ARGS="$ARGS --no-notify"
-            echo "::notice::已勾选 breakout_no_notify：本次跳过飞书通知"
+            echo "::notice::已勾选 no_notify / breakout_no_notify：突破本次跳过飞书通知"
           fi
           # 组合层去重（fetch_rec_codes_for_date 剔除当日已被抄底推荐的个股）
-          # 依赖运行顺序，本步骤排在抄底之后即为顺序保证
+          # 依赖运行顺序，本步骤排在抄底之后即为顺序保证。
+          # 注意：抄底若带 --no-save，当天 MySQL 里没有抄底记录，本步骤的去重自然不生效
+          # （测试运行期望的行为——没有落库就没有可去重的样本）。
           echo "::notice::突破策略开始（复用抄底写下的当天行情缓存）：run_breakout.py $ARGS"
           python -u run_breakout.py $ARGS
 
