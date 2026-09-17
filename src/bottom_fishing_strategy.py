@@ -1904,13 +1904,13 @@ def evaluate(daily_df: Optional[pd.DataFrame], code: str = "", name: str = "", c
     if daily_score < required_score:
         return None, "FAIL_TECH"
 
+    # 波动率风控：ATR 缺失时无法计算真实风险，不能以默认值静默放行。
+    # ATR 超限仍归因 FAIL_VOLATILE；缺失归因 FAIL_DATA，避免把不可复核信号当作正式信号。
     atr_val = d_last.get("atr")
     atr_val = float(atr_val) if atr_val is not None and not pd.isna(atr_val) else None
-
-    # 波动率风控：ATR 占现价百分比超上限直接否决。
-    # 替代旧「RR≥1.5 否决」：2×ATR止损+10%止盈下 RR≥1.5 与 ATR≤3.33% 数学等价，
-    # 但旧实现在 ATR 缺失时 RR 恒 2.0 永不否决（静默放行），现已修复该漏洞。
-    if atr_val is not None and last_close > 0 and (atr_val / last_close * 100) > config.MAX_ATR_PCT:
+    if atr_val is None or last_close <= 0:
+        return None, "FAIL_DATA"
+    if (atr_val / last_close * 100) > config.MAX_ATR_PCT:
         return None, "FAIL_VOLATILE"
 
     rr = compute_risk_reward(entry_price=last_close, config=config, atr=atr_val)
