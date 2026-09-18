@@ -96,6 +96,8 @@ DISPLAY_COLS = [
     ("code", "代码"), ("name", "名称"), ("date", "日期"), ("close", "收盘"),
     ("score", "评分"), ("grade", "等级"), ("tier", "层级"), ("rank_score", "排序分"),
     ("signals_hit", "入选依据"), ("fund_status", "财务核验"),
+    ("quality_score", "质量分"), ("valuation_score", "估值分"),
+    ("pe_ttm", "PE"), ("pb_mrq", "PB"), ("position_250", "250日位置"),
     ("weekly_status", "周线核验"), ("missing_tags", "缺项"), ("daily_score", "日线分"),
     ("rsi", "RSI"), ("rsi7", "RSI7"), ("rsi21", "RSI21"),
     ("vol_ratio", "量比"), ("turnover_ratio", "换手比"), ("stop_loss", "止损"),
@@ -116,6 +118,17 @@ SORT_ASC = [False]
 
 @dataclass
 class StrategyConfig:
+    # quality_value：质量/估值/中长期低位必选，技术仅排序；technical 保留旧策略作对照。
+    RECOMMENDATION_MODE: str = "quality_value"
+    QUALITY_YEARS: int = 3
+    QUALITY_MEDIAN_ROE_MIN: float = 10.0
+    QUALITY_MIN_ROE: float = 5.0
+    QUALITY_CASH_CONVERSION_MIN: float = 0.8
+    LOW_POSITION_LOOKBACK: int = 250
+    LOW_POSITION_MAX: float = 0.40
+    QUALITY_SCORE_WEIGHT: float = 0.50
+    VALUATION_SCORE_WEIGHT: float = 0.35
+    TECHNICAL_SCORE_WEIGHT: float = 0.15
     CSI300_AK_SYMBOL: str = "sh000300"  # Baostock 格式为 sh.000300
     MARKET_MA_PERIOD: int = 20
     MARKET_SLOPE_LOOKBACK: int = 4
@@ -336,7 +349,7 @@ class StrategyConfig:
 
     CACHE_EXPIRE_HOURS: float = 4.0
     MAX_WORKERS: int = 4
-    DAILY_BARS: int = 120
+    DAILY_BARS: int = 600  # 自然日取数窗口，覆盖250根有效日线及指标预热
     WEEKLY_BARS: int = 60
     FETCH_DELAY: float = 0.05
     # 并发筛选时间预算（分钟）：超时取消未完成任务，按已完成结果出报告
@@ -1515,10 +1528,13 @@ def _fmt_cell(v: Any, default: str = "-") -> Any:
 
 
 _FUND_STATUS_ZH = {"verified": "财务已核验", "partial": "财务部分核验", "missing": "财务未核验"}
-_WEEKLY_STATUS_ZH = {"confirmed": "周线已确认", "unverified": "周线待核验", "disabled": "周线未启用"}
+_WEEKLY_STATUS_ZH = {"confirmed": "周线已确认", "unverified": "周线待核验", "disabled": "周线未启用", "not_required": "技术仅供排序"}
 _MISSING_TAG_ZH = {
     "fund": "财务数据缺失", "fund_roe": "ROE缺失", "fund_debt": "负债率缺失",
     "fund_goodwill": "商誉缺失", "fund_deducted": "扣非缺失",
+    "valuation_pe": "PE未核验", "valuation_pb": "PB未核验",
+    "fund_annual": "多年财务未核验", "market_date": "行情基准日期缺失",
+    "financial_review": "金融企业待专项核验",
     "valuation": "估值缺失", "pct_chg": "涨幅数据缺失", "gap": "开盘价缺失",
     "macd_mom": "MACD柱数据缺失", "kdj": "KDJ数据缺失",
 }
@@ -1535,6 +1551,17 @@ def describe(row: dict) -> str:
     2. 入选依据：实际触发的技术条件（放量企稳/放量上涨/放量冲高回落措辞区分）；
     3. 核验状态：财务/周线是否已核验、缺项明细（可选指标缺失只标注不降级）。
     """
+    if row.get("weekly_status") == "not_required":
+        return "\n".join([
+            f"**{row.get('name', '')} {row.get('code', '')}**（优质低估低位候选）",
+            f"综合分: {_fmt_cell(row.get('score'))} | 质量分: {_fmt_cell(row.get('quality_score'))}"
+            f" | 估值分: {_fmt_cell(row.get('valuation_score'))} | 技术分: {_fmt_cell(row.get('daily_score'))}",
+            f"收盘: {_fmt_cell(row.get('close'))} | PE: {_fmt_cell(row.get('pe_ttm'))}"
+            f" | PB: {_fmt_cell(row.get('pb_mrq'))} | 250日区间位置: {float(row.get('position_250', 0)):.1%}",
+            f"入选依据: {row.get('signals_hit', '')}",
+            f"核验: {_FUND_STATUS_ZH.get(str(row.get('fund_status')), '待核验')}"
+            + (f" | 缺项: {_missing_tags_zh(str(row.get('missing_tags')))}" if row.get('missing_tags') else ""),
+        ])
     verify_bits = [
         _FUND_STATUS_ZH.get(str(row.get("fund_status", "")), "财务未核验"),
         _WEEKLY_STATUS_ZH.get(str(row.get("weekly_status", "")), "周线待核验"),
@@ -1708,6 +1735,12 @@ class Signal:
     # 不参与准入判定，因此不改变「哪些股票通过」，只改变通过者之间的先后顺序。
     # 默认 0.0 以保持 BreakoutSignal（放量突破策略自带独立 SORT_BY）构造接口兼容。
     rank_score: float = 0.0
+    quality_score: float = 0.0
+    valuation_score: float = 0.0
+    position_250: float = 0.0
+    pe_ttm: Optional[float] = None
+    pb_mrq: Optional[float] = None
+    quality_status: str = "missing"
 
     def to_dict(self) -> dict: return asdict(self)
 
@@ -1791,6 +1824,10 @@ def _rank_signals(df: pd.DataFrame) -> pd.DataFrame:
     所有键都相同的情况下按代码排序，保证两次运行结果可复现，
     不受并发完成顺序（as_completed）影响。
     """
+    if "weekly_status" in df.columns and df["weekly_status"].eq("not_required").all():
+        keys = [k for k in ("rank_score", "quality_score", "valuation_score", "code") if k in df.columns]
+        return df.sort_values(keys, ascending=[k == "code" for k in keys],
+                              kind="mergesort").reset_index(drop=True)
     keys = SORT_BY + ["has_divergence", "rr_ratio", "code"]
     ascending = SORT_ASC + [False, False, True]
     pairs = [(k, a) for k, a in zip(keys, ascending) if k in df.columns]
@@ -1959,6 +1996,9 @@ def evaluate(daily_df: Optional[pd.DataFrame], code: str = "", name: str = "", c
     （供日志逐只打印与飞书高风险观察池展示）；不影响返回值与准入判定。
     """
     if config is None: config = StrategyConfig()
+    if config.RECOMMENDATION_MODE == "quality_value":
+        return evaluate_quality_value(daily_df, code, name, config, market_env,
+                                      fund_data, latest_trade_date)
     regime = (market_env or {}).get("regime", "unknown")
 
     if not check_fundamentals(fund_data, config, code=code, name=name): return None, "FAIL_FUND"
@@ -2113,6 +2153,187 @@ def evaluate(daily_df: Optional[pd.DataFrame], code: str = "", name: str = "", c
     )
     return sig, "PASS"
 
+def enrich_annual_fundamentals(code: str, fund_data: Optional[dict], config: StrategyConfig,
+                               as_of: Optional[str] = None) -> dict:
+    """年度数据独立缓存，决策日期隔离；缺失不伪造、不用季度年化替代。"""
+    from src.fundamental_quality import fetch_annual_quality
+    result = dict(fund_data or {})
+    day = str(as_of or _beijing_now().date())[:10]
+    if "annual_rows" in result:
+        return result
+    path = _cache_path(config, f"annual_quality_v1_{code}_{day}_{config.QUALITY_YEARS}.json") if config.USE_CACHE else ""
+    cached = _read_cache_json(path) if path and _cache_fresh(path, config.FUND_CACHE_TTL_DAYS) else None
+    if cached is not None:
+        result["annual_rows"] = cached.get("annual_rows", [])
+        return result
+    fetched = fetch_annual_quality(code, day, years=config.QUALITY_YEARS,
+                                   ak_client=ak if _AK_AVAILABLE else None)
+    rows = fetched.get("annual_rows", [])
+    result["annual_rows"] = rows
+    if path and rows:
+        _write_cache_json({"annual_rows": rows}, path)
+    return result
+
+
+def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: str,
+                           config: StrategyConfig, market_env: Optional[dict] = None,
+                           fund_data: Optional[dict] = None,
+                           latest_trade_date: Optional[str] = None) -> tuple[Optional[Signal], str]:
+    """统一荐股资格：多年质量 + 低估值 + 250日低位；技术面不作否决。"""
+    from src.fundamental_quality import evaluate_annual_quality
+    if daily_df is None or daily_df.empty:
+        return None, "FAIL_DATA"
+    df = daily_df.copy()
+    required = {"date", "open", "high", "low", "close", "volume", "amount"}
+    if not required.issubset(df.columns):
+        return None, "FAIL_DATA"
+    df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.strftime(_DATE_FMT)
+    if df["date"].isna().any() or df["date"].duplicated().any():
+        return None, "FAIL_DATA"
+    df = df.sort_values("date").reset_index(drop=True)
+    now = _beijing_now()
+    if now.hour < 15 and df.iloc[-1]["date"] == str(now.date()):
+        df = df.iloc[:-1].reset_index(drop=True)
+    if df.empty:
+        return None, "FAIL_DATA"
+    day = str(df.iloc[-1]["date"])
+    if latest_trade_date is not None and day != str(latest_trade_date)[:10]:
+        return None, "FAIL_STALE"
+    # 零量停牌占位不计为有效交易日；末日无成交不推荐。
+    for col in required - {"date"}:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    if not np.isfinite(df.iloc[-1][["open", "high", "low", "close", "volume", "amount"]].to_numpy(dtype=float)).all():
+        return None, "FAIL_DATA"
+    if df.iloc[-1]["volume"] <= 0 or df.iloc[-1]["amount"] <= 0:
+        return None, "FAIL_STALE"
+    df = df[(df["volume"] > 0) & (df["amount"] > 0)].reset_index(drop=True)
+    n = config.LOW_POSITION_LOOKBACK
+    if len(df) < max(n, config.MIN_DAYS):
+        return None, "FAIL_DATA"
+    window = df.tail(n)
+    if not np.isfinite(window[["open", "high", "low", "close", "volume", "amount"]].to_numpy(dtype=float)).all():
+        return None, "FAIL_DATA"
+    if (window[["open", "high", "low", "close"]] <= 0).any().any():
+        return None, "FAIL_DATA"
+    if ((window["high"] < window[["open", "close", "low"]].max(axis=1)) |
+            (window["low"] > window[["open", "close", "high"]].min(axis=1))).any():
+        return None, "FAIL_DATA"
+    last = df.iloc[-1]
+    close = float(last["close"])
+    lo, hi = float(window["low"].min()), float(window["high"].max())
+    if hi <= lo:
+        return None, "FAIL_DATA"
+    position = (close - lo) / (hi - lo)
+    if position > config.LOW_POSITION_MAX:
+        return None, "FAIL_POSITION"
+    missing = [] if latest_trade_date is not None else ["market_date"]
+    def finite(value):
+        try:
+            v = float(value)
+            return v if np.isfinite(v) else None
+        except (ValueError, TypeError):
+            return None
+    pe, pb = finite(last.get("peTTM")), finite(last.get("pbMRQ"))
+    for value, cap, tag in ((pe, config.MAX_PE_TTM, "valuation_pe"),
+                             (pb, config.MAX_PB_MRQ, "valuation_pb")):
+        if value is None:
+            missing.append(tag)
+        elif value <= 0 or value > cap:
+            return None, "FAIL_VALUATION"
+    fund = fund_data or {}
+    debt = finite(fund.get("debt_ratio"))
+    financial = _is_financial_stock(code, name, config)
+    debt_limit = config.FINANCE_MAX_DEBT_RATIO if financial else config.MAX_DEBT_RATIO
+    if debt is None:
+        missing.append("fund_debt")
+    elif debt < 0 or debt > debt_limit:
+        return None, "FAIL_FUND"
+    goodwill = finite(fund.get("goodwill_ratio"))
+    if goodwill is not None and goodwill > config.MAX_GOODWILL_RATIO:
+        return None, "FAIL_FUND"
+    quality = evaluate_annual_quality(
+        fund.get("annual_rows", []), day, years=config.QUALITY_YEARS,
+        median_roe_min=config.QUALITY_MEDIAN_ROE_MIN, min_roe=config.QUALITY_MIN_ROE,
+        cash_conversion_min=config.QUALITY_CASH_CONVERSION_MIN, financial=financial)
+    if quality["status"] == "failed":
+        return None, "FAIL_FUND"
+    missing.extend(quality.get("missing_tags", []))
+    if quality["status"] != "verified" and not quality.get("missing_tags"):
+        missing.append("fund_annual")
+    # 技术缺项只影响标签/分数，绝不覆盖财务和估值的待核验状态。
+    df = _recompute_pct_chg(df)
+    technical = compute_daily_signals(df, config)
+    if technical is None:
+        return None, "FAIL_DATA"
+    d = technical.iloc[-1]
+    tech_score = float(d["daily_score"])
+    quality_score = float(quality.get("quality_score", 0))
+    valuation_score = (50 * (1 - pe / config.MAX_PE_TTM) +
+                       50 * (1 - pb / config.MAX_PB_MRQ)) if pe is not None and pb is not None else 0.0
+    score = round(config.QUALITY_SCORE_WEIGHT * quality_score +
+                  config.VALUATION_SCORE_WEIGHT * valuation_score +
+                  config.TECHNICAL_SCORE_WEIGHT * tech_score, 2)
+    tags = ["优质低估低位" if not missing else "低位候选待核验"]
+    hits = _signal_hits(d)
+    tags.append("动能改善" if hits else "趋势待确认")
+    tags.extend(hits)
+    # 两个入口共享同一标签；避免第二入口去重后丢失突破提示。
+    from src.volume_breakout_strategy import VolumeBreakoutConfig, evaluate_breakout
+    breakout_config = VolumeBreakoutConfig(**{**asdict(config), "RECOMMENDATION_MODE": "technical"})
+    breakout, _ = evaluate_breakout(df, code, name, breakout_config, market_env, None)
+    if breakout is not None:
+        tags.append("放量突破")
+    atr = finite(d.get("atr"))
+    rr = compute_risk_reward(close, config, atr)
+    return Signal(
+        code=code, name=name, date=day, close=round(close, 2), score=score,
+        grade=_grade_from_score(score, config), daily_score=tech_score,
+        rsi=finite(d.get("rsi14")), rsi7=finite(d.get("rsi7")), rsi21=finite(d.get("rsi21")),
+        vol_ratio=finite(d.get("daily_vol_ratio")), turnover_ratio=finite(d.get("daily_turnover_ratio")),
+        stop_loss=rr["stop_loss"], take_profit=rr["take_profit"], rr_ratio=rr["rr_ratio"],
+        market_env=(market_env or {}).get("regime", "unknown"),
+        has_divergence=bool(d.get("bottom_divergence", False)), signals_hit=",".join(tags),
+        fund_status="verified" if quality["status"] == "verified" and debt is not None else "partial",
+        weekly_status="not_required", missing_tags=",".join(dict.fromkeys(missing)),
+        tier="pending" if missing else "formal", rank_score=score,
+        quality_score=quality_score, valuation_score=round(valuation_score, 2),
+        position_250=round(position, 4), pe_ttm=pe, pb_mrq=pb,
+        quality_status=quality["status"]), "PASS"
+
+
+def _screen_quality_pool(config: StrategyConfig, cache: CacheManager, market_env: dict,
+                         latest_trade_date: Optional[str], pending_out: Optional[list] = None,
+                         evaluator=None) -> Optional[pd.DataFrame]:
+    """先廉价行情筛选、后年度财务核验；核验完所有候选才排序和行业限额。"""
+    evaluator = evaluator or evaluate
+    stocks = get_stock_list(config, cache)
+    def screen(stock):
+        code, name = stock["code"], stock["name"]
+        daily = get_daily_data(code, config, cache)
+        pre, reason = evaluator(daily, code, name, config, market_env, None,
+                                latest_trade_date=latest_trade_date)
+        if pre is None:
+            return None, reason
+        fund = get_fundamentals(code, cache, config)
+        if not _is_financial_stock(code, name, config):
+            fund = enrich_annual_fundamentals(code, fund, config, as_of=pre.date)
+        return evaluator(daily, code, name, config, market_env, fund,
+                         latest_trade_date=latest_trade_date)
+    results, processed, timed_out = run_concurrent_screen(stocks, screen, config, logger)
+    rows = [sig.to_dict() for sig, reason in results if sig is not None and reason == "PASS"]
+    logger.info("优质低估低位筛选：已处理 %d/%d，候选 %d，时间预算耗尽=%s", processed, len(stocks), len(rows), timed_out)
+    if not rows:
+        return None
+    frame = _rank_signals(pd.DataFrame(rows))
+    pending = frame[frame["tier"] != "formal"]
+    if pending_out is not None:
+        pending_out.extend(pending.to_dict("records"))
+    formal = frame[frame["tier"] == "formal"]
+    if config.USE_INDUSTRY_DEDUP and not formal.empty:
+        formal = _dedup_by_industry(formal, config, cache)
+    return formal.head(config.MAX_PICKS).reset_index(drop=True)
+
+
 def get_market_environment(config: StrategyConfig, cache: CacheManager) -> dict:
     if (cached := cache.get("market_env")) is not None: return cached
     df_index = get_index_daily(config, cache)
@@ -2247,6 +2468,9 @@ def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] 
             if index_df is not None and not index_df.empty and "date" in index_df.columns else None
         if latest_trade_date is None:
             logger.warning("无法获取指数行情，本次运行跳过行情时效校验（停牌股可能混入待核验流程）")
+
+        if config.RECOMMENDATION_MODE == "quality_value":
+            return _screen_quality_pool(config, cache, market_env, latest_trade_date, pending_out)
 
         # ===== 市场级熔断：指数急跌期间全市场抄底信号批量触发，直接不推荐 =====
         halt_ret = market_crash_halt(index_df, config)

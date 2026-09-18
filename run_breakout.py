@@ -99,7 +99,7 @@ def run(argv: list[str] | None = None):
             market_env_desc = env_result.get("description", "unknown")
             regime = env_result.get("regime", "unknown")
             # 熊市直接跳过（main_breakout 内部也会跳过，此处提前记录）
-            if regime == "bear":
+            if regime == "bear" and config.RECOMMENDATION_MODE == "technical":
                 logger.info("市场环境为 bear，放量突破策略直接空仓（BEAR_MAX_PICKS_BREAKOUT=0），本次运行终止")
                 if not args.no_notify:
                     # 必须显式传 strategy：notify_screening_result 的默认值是 bottom_fishing，
@@ -117,7 +117,9 @@ def run(argv: list[str] | None = None):
         t = time.time()
         logger.info("Step 2/4 执行放量突破选股策略（明细见 strategy.breakout 日志）...")
         volatile_rows: list[dict] = []
-        output_df = main_breakout(config=config, cache=cache, volatile_out=volatile_rows)
+        pending_rows: list[dict] = []
+        output_df = main_breakout(config=config, cache=cache, volatile_out=volatile_rows,
+                                  pending_out=pending_rows)
         logger.info("Step 2/4 完成 (%.1f 分钟)，推荐 %d 只，波动率超限观察 %d 只", (time.time() - t) / 60,
                     0 if output_df is None else len(output_df), len(volatile_rows))
 
@@ -170,7 +172,8 @@ def run(argv: list[str] | None = None):
             logger.info("Step 4/4 发送飞书通知...")
             volatile_df = pd.DataFrame(volatile_rows) if volatile_rows else None
             notify_screening_result(output_df, market_env=market_env_desc,
-                                    strategy="volume_breakout", volatile=volatile_df)
+                                    strategy="volume_breakout", volatile=volatile_df,
+                                    pending=pd.DataFrame(pending_rows) if pending_rows else None)
             logger.info("Step 4/4 完成 (%.1f 秒)", time.time() - t)
         else:
             logger.info("Step 4/4 已跳过（--no-notify）")

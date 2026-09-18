@@ -50,6 +50,9 @@ from src.bottom_fishing_strategy import (
     _AK_AVAILABLE,
     _beijing_now,
     _effective_regime,
+    evaluate_quality_value,
+    _screen_quality_pool,
+    get_index_daily,
     _build_volatile_row,
     _fetch_weekly_dual,
     _fmt_cell,
@@ -540,6 +543,7 @@ def evaluate_breakout(
     market_env: Optional[dict] = None,
     fund_data: Optional[dict] = None,
     volatile_out: Optional[list] = None,
+    latest_trade_date: Optional[str] = None,
 ) -> tuple[Optional[BreakoutSignal], str]:
     """评估单只股票是否满足放量突破入场条件。
 
@@ -553,6 +557,21 @@ def evaluate_breakout(
     """
     if config is None:
         config = VolumeBreakoutConfig()
+    if config.RECOMMENDATION_MODE == "quality_value":
+        base, reason = evaluate_quality_value(daily_df, code, name, config, market_env,
+                                              fund_data, latest_trade_date)
+        if base is None:
+            return None, reason
+        # 突破仅作为统一候选池内的标签，不另设荐股资格或排序权重。
+        technical_config = VolumeBreakoutConfig(**{**asdict(config), "RECOMMENDATION_MODE": "technical"})
+        breakout, _ = evaluate_breakout(daily_df, code, name, technical_config, market_env,
+                                        None, latest_trade_date=latest_trade_date)
+        extra = {}
+        if breakout is not None:
+            if "放量突破" not in base.signals_hit.split(","):
+                base.signals_hit += ",放量突破"
+            extra = {k: getattr(breakout, k) for k in ("breakout_level", "breakout_margin", "platform_range", "avg_amount")}
+        return BreakoutSignal(**base.to_dict(), **extra), "PASS"
     regime = (market_env or {}).get("regime", "unknown")
     eff_regime = _effective_regime(regime, config)
     grade_boost = config.BEAR_GRADE_BOOST_BREAKOUT if eff_regime == "bear" else 0.0
@@ -733,6 +752,9 @@ def evaluate_breakout(
 
 def describe_breakout(row: dict) -> str:
     """把一条放量突破推荐格式化为飞书卡片文本（notify/feishu.py 按 strategy 选择调用）。"""
+    if row.get("weekly_status") == "not_required":
+        from src.bottom_fishing_strategy import describe
+        return describe(row)
     lvl = {3: "L1·60日新高", 2: "L2·20日新高", 1: "L3·MA60"}.get(
         int(row.get("breakout_level") or 0), "-")
     lines = [
@@ -756,6 +778,7 @@ def main_breakout(
     config: Optional[VolumeBreakoutConfig] = None,
     cache: Optional[CacheManager] = None,
     volatile_out: Optional[list] = None,
+    pending_out: Optional[list] = None,
 ) -> Optional[pd.DataFrame]:
     """放量突破选股主流程。骨架与 bottom_fishing_strategy.main 对齐：
     初始化数据源 → 市场环境 → 股票池 → 并发筛选（漏斗日志） → 决赛圈周线确认 → 排序截取。
@@ -784,6 +807,12 @@ def main_breakout(
     try:
         market_env = get_market_environment(config, cache)
         logger.info("市场环境: %s", market_env.get("description", "unknown"))
+
+        if config.RECOMMENDATION_MODE == "quality_value":
+            index = get_index_daily(config, cache)
+            latest = str(index.iloc[-1]["date"]) if index is not None and not index.empty else None
+            return _screen_quality_pool(config, cache, market_env, latest,
+                                         pending_out, evaluator=evaluate_breakout)
 
         regime_raw = market_env.get("regime", "unknown")
         regime_eff = _effective_regime(regime_raw, config)

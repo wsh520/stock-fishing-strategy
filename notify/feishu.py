@@ -142,6 +142,12 @@ def notify_screening_result(
     is_breakout = strategy == "volume_breakout"
     candidate_label = "放量突破候选" if is_breakout else "低位企稳候选"
     card_title = "放量突破选股结果" if is_breakout else "选股结果"
+    quality_mode = any(frame is not None and not frame.empty and "weekly_status" in frame
+                       and frame["weekly_status"].eq("not_required").any()
+                       for frame in (df, pending))
+    if quality_mode:
+        candidate_label = "优质低估低位候选"
+        card_title = "优质低估低位荐股"
 
     # 异常通知
     if error_msg:
@@ -158,13 +164,13 @@ def notify_screening_result(
 
     # 尝试导入 describe 函数（按策略来源选择卡片格式）
     try:
-        from bottom_fishing_strategy import describe, describe_pending, describe_volatile
+        from src.bottom_fishing_strategy import describe, describe_pending, describe_volatile
     except ImportError:
         describe = None
         describe_pending = None
         describe_volatile = None
     try:
-        from volume_breakout_strategy import describe_breakout
+        from src.volume_breakout_strategy import describe_breakout
     except ImportError:
         describe_breakout = None
     describe_fn = (describe_breakout or describe) if is_breakout else describe
@@ -175,7 +181,7 @@ def notify_screening_result(
             return []
         elems = [
             _divider(),
-            _md_element(f"**待核验候选 {len(pending)} 只**（财务/周线数据待补全，未正式推荐，不参与追踪）"),
+            _md_element(f"**待核验候选 {len(pending)} 只**（必要数据待核验，未正式推荐，不参与追踪）"),
         ]
         for _, row in pending.head(5).iterrows():
             r = row.to_dict()

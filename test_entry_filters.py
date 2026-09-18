@@ -137,9 +137,9 @@ def kdj_weak_closes():
 
 
 def run_case(label, df, expect):
-    sig, reason = m.evaluate(df, code="600000", name="测试", config=m.StrategyConfig(),
+    sig, reason = m.evaluate(df, code="600000", name="测试", config=m.StrategyConfig(RECOMMENDATION_MODE="technical"),
                              market_env={"regime": "neutral"}, fund_data=None)
-    out = m.compute_daily_signals(df, m.StrategyConfig())
+    out = m.compute_daily_signals(df, m.StrategyConfig(RECOMMENDATION_MODE="technical"))
     if out is None or out.empty:
         diag = "compute_daily_signals=None（数据不足/流动性未达下限）"
     else:
@@ -181,7 +181,7 @@ results.append(run_case("L MACD柱当日转弱", make_df(macd_weak_closes(), las
 results.append(run_case("M KDJ动能掉头", make_df(kdj_weak_closes(), last_vol_mult=2.0), "FAIL_KDJ"))
 
 # ===== 判定函数隔离单测 =====
-cfg = m.StrategyConfig()
+cfg = m.StrategyConfig(RECOMMENDATION_MODE="technical")
 out_a = m.compute_daily_signals(df_a, cfg)
 checks = []
 checks.append(("_range_position_ok 基准放行", m._range_position_ok(out_a, cfg) is True))
@@ -332,7 +332,7 @@ checks.append(("评级: 熊市等级与展示分数同源",
                _r_bear == "PASS" and _sig_bear.grade == m._grade_from_score(_sig_bear.score, cfg)))
 
 # 恰好 60 分：中性达 B 级门槛放行、熊市门槛 +10=70 被否决（体现"门槛上浮"替代"扣分定级"）
-_cfg60 = replace(m.StrategyConfig(), W_DAILY_TREND_TURN=60.0, W_DAILY_RSI_REBOUND=0.0,
+_cfg60 = replace(m.StrategyConfig(RECOMMENDATION_MODE="technical"), W_DAILY_TREND_TURN=60.0, W_DAILY_RSI_REBOUND=0.0,
                  DAILY_MULTI_RESONANCE_BONUS=0.0, DAILY_VOL_EXPAND=999.0)
 _sig60, _r60n = m.evaluate(df_a, code="600000", name="测试", config=_cfg60,
                            market_env=_NEUTRAL, fund_data=_FUND_OK)

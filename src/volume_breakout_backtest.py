@@ -4,6 +4,9 @@ Input files are daily OHLCV CSVs.  A signal is evaluated on the close of day t
 and can only be entered at the next available day's open, which avoids
 look-ahead.  The module is intentionally independent of the network/data
 fetching pipeline and can therefore be run on exported historical data.
+Only explicitly formal signals become events. OHLCV-only CSVs lack multi-year
+financial evidence, so the default quality mode produces zero trades; financial
+history is never fabricated or substituted with today's data.
 """
 from __future__ import annotations
 
@@ -85,8 +88,9 @@ def _candidate_events(data: Dict[str, pd.DataFrame], cfg: VolumeBreakoutConfig, 
         for i in range(cfg.MIN_DAYS - 1, len(df) - 1):
             hist = df.iloc[: i + 1]
             sig, reason = evaluate_breakout(hist, code=code, name=name,
-                                             config=cfg, market_env={"regime": regime})
-            if sig is not None:
+                                             config=cfg, market_env={"regime": regime},
+                                             latest_trade_date=pd.Timestamp(df.iloc[i]["date"]).strftime("%Y-%m-%d"))
+            if reason == "PASS" and sig is not None and getattr(sig, "tier", None) == "formal":
                 events.append({"code": code, "name": name, "signal_date": df.iloc[i]["date"],
                                "entry_date": df.iloc[i + 1]["date"], "entry_index": i + 1,
                                "signal": sig, "df": df})
@@ -97,7 +101,9 @@ def run_backtest(data: Dict[str, pd.DataFrame], cfg: Optional[BacktestConfig] = 
                  strategy_cfg: Optional[VolumeBreakoutConfig] = None):
     cfg = cfg or BacktestConfig()
     strategy_cfg = strategy_cfg or VolumeBreakoutConfig()
-    events = sorted(_candidate_events(data, strategy_cfg, cfg.regime), key=lambda x: x["entry_date"])
+    events = sorted(_candidate_events(data, strategy_cfg, cfg.regime),
+                    key=lambda x: (x["entry_date"], -float(getattr(x["signal"], "rank_score", 0.0)),
+                                   str(x["code"])))
     by_date: Dict[pd.Timestamp, list] = {}
     for e in events:
         by_date.setdefault(pd.Timestamp(e["entry_date"]), []).append(e)
@@ -203,7 +209,9 @@ def main(argv: Optional[Iterable[str]] = None):
     summary, trades = run_backtest(data, BacktestConfig(args.initial_capital, args.position_size,
         args.max_positions, args.fee_rate, args.stamp_duty, args.slippage_bps,
         args.max_holding_days, args.regime))
-    result = {"summary": summary, "trades": trades}
+    result = {"summary": summary, "trades": trades,
+              "data_note": "Only formal signals are traded. OHLCV CSVs have no multi-year financial "
+                           "evidence; incomplete default quality-mode data produces zero trades."}
     text = json.dumps(result, ensure_ascii=False, indent=2)
     if args.output:
         Path(args.output).write_text(text, encoding="utf-8")

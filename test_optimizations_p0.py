@@ -149,7 +149,7 @@ try:
     m._bs_state["circuit_open"] = True          # 强制走 AkShare 分支
     m._AK_AVAILABLE = True
     m._fetch_daily_ak = lambda code, days=120, config=None: _stale.copy()
-    _dual = m._fetch_daily_dual("600000", 120, m.StrategyConfig())
+    _dual = m._fetch_daily_dual("600000", 120, m.StrategyConfig(RECOMMENDATION_MODE="technical"))
 finally:
     m._fetch_daily_ak = _saved["ak"]
     m._bs_state["circuit_open"] = _saved["circuit"]
@@ -166,7 +166,7 @@ check("A1: dual 重算值等于收盘价自算值",
 # ===========================================================================
 print("\n--- A2: 停牌缺口过滤 FAIL_HALT_GAP ---")
 
-cfg = m.StrategyConfig()
+cfg = m.StrategyConfig(RECOMMENDATION_MODE="technical")
 
 
 def _dates_with_gap(n=80, gap_at=40, gap_days=40, end="2025-06-30"):
@@ -226,7 +226,7 @@ _sig_off, _r_off = m.evaluate(_gap_same, code="600000", name="测试",
 check("A2: 开关关闭后同一缺口序列恢复 PASS", _r_off == "PASS")
 
 # 突破策略共用同一守卫
-_vbcfg = vb.VolumeBreakoutConfig()
+_vbcfg = vb.VolumeBreakoutConfig(RECOMMENDATION_MODE="technical")
 check("A2: 突破策略已接线 has_halt_gap", hasattr(vb, "has_halt_gap"))
 check("A2: 突破策略继承 REQUIRE_NO_HALT_GAP 默认开启", getattr(_vbcfg, "REQUIRE_NO_HALT_GAP", False) is True)
 
@@ -391,7 +391,7 @@ check("B2: 含 NaN 的指数序列不崩",
       m.market_crash_halt(_index(np.concatenate([np.full(25, np.nan), np.full(5, 4000.0)])), cfg) is None)
 
 # 突破策略口径未被父类新字段污染
-_vb = vb.VolumeBreakoutConfig()
+_vb = vb.VolumeBreakoutConfig(RECOMMENDATION_MODE="technical")
 check("B2: 突破策略 NEUTRAL_MAX_PICKS 仍为 3（子类覆盖生效）", _vb.NEUTRAL_MAX_PICKS == 3)
 check("B2: 突破策略 BEAR_MAX_PICKS_BREAKOUT 仍为 0（熊市空仓）", _vb.BEAR_MAX_PICKS_BREAKOUT == 0)
 check("B2: 突破策略 MAX_PICKS 仍为 5", _vb.MAX_PICKS == 5)

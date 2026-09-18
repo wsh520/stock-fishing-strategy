@@ -47,8 +47,8 @@ def check(label: str, ok: bool) -> None:
 # ===========================================================================
 # 1) 配置层
 # ===========================================================================
-cfg = m.StrategyConfig()
-vcfg = vb.VolumeBreakoutConfig()
+cfg = m.StrategyConfig(RECOMMENDATION_MODE="technical")
+vcfg = vb.VolumeBreakoutConfig(RECOMMENDATION_MODE="technical")
 
 check("配置: SCREEN_TIME_BUDGET_MIN 存在", getattr(cfg, "SCREEN_TIME_BUDGET_MIN", None) == 240.0)
 check("配置: PROGRESS_LOG_EVERY 存在", getattr(cfg, "PROGRESS_LOG_EVERY", None) == 500)

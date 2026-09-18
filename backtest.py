@@ -5,7 +5,7 @@ compute_daily_signals / 周线确认 / 风控 / 排序 / 行业分散），保�
 
 核心设计——避免未来函数（point-in-time）：
   1. 预取每只股票 [DATA_START, DATA_END] 的日线面板并落盘缓存（一次性网络成本）；
-  2. 对区间内每个交易日 d：把个股日线**截断到 d**、且只取最近 DAILY_BARS(=120) 根
+  2. 对区间内每个交易日 d：把个股日线**截断到 d**、且只取最近 DAILY_EVAL_BARS(至少350) 根
      （与实盘 _window_dates 的取数窗口一致），交给策略 evaluate() 打分/否决；
      周线由「截至 d 的日线」重采样得到（对应实盘单独拉取的 60 周窗口）；
      市场环境用「截至 d 的沪深300」计算；latest_trade_date=d 触发停牌/滞后剔除；
@@ -16,9 +16,8 @@ compute_daily_signals / 周线确认 / 风控 / 排序 / 行业分散），保�
   5. 月度统计：每笔等权平均收益 + 每日等权组合的逐日盯市净值曲线，两套口径对比，
      并按 等级 / 市场环境 / 底背离 / 退出原因 归因。
 
-基本面为控制网络成本，只对「决赛圈候选」按 d 所属披露窗口回溯拉取（as-of 时点），
-商誉/扣非主源缺失时默认不用 AkShare 补齐（--fill-fund 可开启），因此个别标的的
-fund 终审可能比实盘略宽松，已在报告中注明。
+基本面仅对价格预筛候选按 as-of 拉取并以公告日期过滤，质量模式补充多年年报后完整重评。
+历史回测禁用当前财务补齐（--fill-fund 仅保留参数兼容）；数据不完整仅待核验，可能零交易。
 
 用法：
     python backtest.py prefetch [--workers 6] [--limit N]      # 预取行情面板到磁盘缓存（可断点续跑）
@@ -77,6 +76,8 @@ from src.bottom_fishing_strategy import (  # noqa: E402
     _weekly_macd_data_ok,
     _weekly_fresh_enough,
     _fund_verify_state,
+    _annualize_roe,
+    enrich_annual_fundamentals,
     evaluate,
     resolve_max_picks,
     market_crash_halt,
@@ -113,11 +114,11 @@ class BacktestConfig:
     BT_START: str = "2026-08-01"
     BT_END: str = "2026-09-01"
     # 行情面板取数区间：DATA_START 需早于 BT_START 足够多，以覆盖
-    #   日线 120 根窗口 + 周线 60 周（约需 8~9 个月历史）；DATA_END 决定持有退出的「期末」
-    DATA_START: str = "2025-11-01"
+    #   日线至少 350 根（约 600 自然日）；DATA_END 决定持有退出的「期末」
+    DATA_START: str = "2024-11-01"
     DATA_END: str = ""            # 空 = 自动取今天（baostock 返回到最近可用交易日）
     # 每日 evaluate 传入的日线根数上限，与实盘 StrategyConfig.DAILY_BARS 对齐（避免未来函数 + 控制算力）
-    DAILY_EVAL_BARS: int = 120
+    DAILY_EVAL_BARS: int = 350
     # 收益模拟
     ENTRY_MODE: str = "next_open"      # next_open=次日开盘买入 / rec_close=信号日收盘买入
     USE_STOP_TP: bool = True           # 是否用盘中高低价模拟止损/止盈
@@ -129,7 +130,7 @@ class BacktestConfig:
     OUT_DIR: str = os.path.join(_PROJECT_ROOT, "backtest_output")
     # 运行控制
     WORKERS: int = 6                   # prefetch 进程数 / replay 线程数
-    FILL_OPTIONAL_FUNDAMENTALS: bool = False   # 决赛圈是否用 AkShare 补齐商誉/扣非（慢，默认关）
+    FILL_OPTIONAL_FUNDAMENTALS: bool = False   # 兼容旧配置；历史回测始终禁用当前补齐
     LIMIT: int = 0                     # >0 时只取股票池前 N 只（冒烟测试用）
     # 行情数据源：baostock（默认）/ akshare（东财+新浪，独立通道，baostock 被限流时用）
     DATA_SOURCE: str = "baostock"
@@ -147,8 +148,21 @@ def _daily_cache_path(bc: BacktestConfig, code: str) -> str:
     return os.path.join(bc.CACHE_DIR, "daily", f"{code}.csv")
 
 
-def _fund_cache_path(bc: BacktestConfig, code: str) -> str:
-    return os.path.join(bc.CACHE_DIR, "fund", f"{code}.json")
+def _fund_cache_path(bc: BacktestConfig, code: str, as_of: str) -> str:
+    # 新命名空间不读取旧的按代码缓存（其中可能包含未来已披露数据）。
+    return os.path.join(bc.CACHE_DIR, "fund", f"pit_v2_{code}_{as_of}.json")
+
+
+def _published_asof(df: pd.DataFrame, as_of: str) -> pd.DataFrame:
+    """仅接受可核实公告日期的财报，报告期不能替代公告日期。"""
+    col = next((c for c in ("pubDate", "公告日期", "公告日", "披露日期", "NOTICE_DATE")
+                if c in df.columns), None)
+    if col is None:
+        return df.iloc[:0]
+    published = pd.to_datetime(df[col], errors="coerce")
+    cutoff = pd.Timestamp(as_of)
+    return df.loc[published.notna() & (published <= cutoff)].assign(
+        _published=published).sort_values("_published", ascending=False)
 
 
 def _meta_path(bc: BacktestConfig, name: str) -> str:
@@ -478,7 +492,7 @@ def _fetch_fund_ak_asof(code: str, as_of: str) -> Optional[dict]:
         return None
     if df is None or df.empty or "日期" not in df.columns:
         return None
-    df = df.copy()
+    df = _published_asof(df.copy(), as_of)
     df["日期"] = pd.to_datetime(df["日期"], errors="coerce").dt.strftime("%Y-%m-%d")
     df = df[df["日期"].notna() & (df["日期"] <= as_of)].sort_values("日期", ascending=False)
     if df.empty:
@@ -489,7 +503,8 @@ def _fetch_fund_ak_asof(code: str, as_of: str) -> Optional[dict]:
         if result["roe"] is None and ("净资产收益率" in cs or "roe" in cl):
             v = pd.to_numeric(row[col], errors="coerce")
             if not pd.isna(v):
-                result["roe"] = float(v)
+                quarter = pd.Timestamp(row["日期"]).quarter
+                result["roe"] = _annualize_roe(float(v), quarter)
         if result["debt_ratio"] is None and ("资产负债率" in cs or "debt" in cl):
             v = pd.to_numeric(row[col], errors="coerce")
             if not pd.isna(v):
@@ -501,7 +516,8 @@ def _fetch_fund_ak_asof(code: str, as_of: str) -> Optional[dict]:
 
 def fetch_fundamentals_asof(bc: BacktestConfig, code: str, as_of: str) -> Optional[dict]:
     """按 as_of 时点拉取 ROE / 资产负债率：baostock（按披露窗口回溯）优先，缺失则 AkShare 兜底。带磁盘缓存。"""
-    path = _fund_cache_path(bc, code)
+    as_of = pd.Timestamp(as_of).strftime("%Y-%m-%d")
+    path = _fund_cache_path(bc, code, as_of)
     if os.path.exists(path):
         try:
             with open(path, "r", encoding="utf-8") as f:
@@ -524,15 +540,15 @@ def fetch_fundamentals_asof(bc: BacktestConfig, code: str, as_of: str) -> Option
             except Exception:  # noqa: BLE001
                 continue
             if getattr(p_rs, "error_code", None) == "0" and len(p_rs.data) > 0 and result["roe"] is None:
-                dfp = p_rs.get_data()
-                if "roeAvg" in dfp.columns:
+                dfp = _published_asof(p_rs.get_data(), as_of)
+                if not dfp.empty and "roeAvg" in dfp.columns:
                     v = pd.to_numeric(dfp["roeAvg"].iloc[0], errors="coerce")
                     if not pd.isna(v):
-                        result["roe"] = float(v) * 100
+                        result["roe"] = _annualize_roe(float(v) * 100, quarter)
             if getattr(b_rs, "error_code", None) == "0" and len(b_rs.data) > 0 and result["debt_ratio"] is None:
-                dfb = b_rs.get_data()
+                dfb = _published_asof(b_rs.get_data(), as_of)
                 col = next((c for c in ("liabilityToAsset", "liabToAsset", "liabRate") if c in dfb.columns), None)
-                if col:
+                if col and not dfb.empty:
                     v = pd.to_numeric(dfb[col].iloc[0], errors="coerce")
                     if not pd.isna(v):
                         result["debt_ratio"] = float(v) * 100
@@ -722,9 +738,59 @@ def _resample_weekly(daily_upto: pd.DataFrame) -> Optional[pd.DataFrame]:
 # 逐日重放（复刻 main() 的选股 + 决赛圈）
 # ---------------------------------------------------------------------------
 
+def _screen_quality_day(bc: BacktestConfig, config: StrategyConfig, day: str,
+                        panels: dict, index_upto: pd.DataFrame, industry_map: dict):
+    """历史质量荐股：价格预筛后补当时已披露财务，完整重评再排序分层。"""
+    market_env = compute_market_environment(index_upto, config)
+    reasons = Counter()
+    signals = []
+    bars = max(350, bc.DAILY_EVAL_BARS, getattr(config, "LOW_POSITION_LOOKBACK", 250))
+    for sp in panels.values():
+        i = sp.idx_of_date.get(day)
+        if i is None:
+            reasons["FAIL_STALE"] += 1
+            continue
+        daily = sp.df.iloc[max(0, i + 1 - bars):i + 1]
+        try:
+            sig, reason = evaluate(daily, sp.code, sp.name, config, market_env, None,
+                                   latest_trade_date=day)
+            if reason == "PASS" and sig is not None:
+                fund = fetch_fundamentals_asof(bc, sp.code, day)
+                fund = enrich_annual_fundamentals(sp.code, fund, config, as_of=day)
+                sig, reason = evaluate(daily, sp.code, sp.name, config, market_env, fund,
+                                       latest_trade_date=day)
+            reasons[reason] += 1
+            if reason == "PASS" and sig is not None:
+                signals.append(sig.to_dict())
+        except Exception:
+            logger.debug("历史质量重评失败 %s %s", sp.code, day, exc_info=True)
+            reasons["ERROR"] += 1
+    if not signals:
+        return [], [], reasons
+    ranked = _rank_signals(pd.DataFrame(signals))
+    formal, pending = [], []
+    counts = {"formal": Counter(), "pending": Counter()}
+    for row in ranked.to_dict("records"):
+        tier = row.get("tier")
+        if tier not in counts:
+            continue
+        target = formal if tier == "formal" else pending
+        if len(target) >= config.MAX_PICKS:
+            continue
+        industry = industry_map.get(str(row["code"]), "") or ""
+        if industry and counts[tier][industry] >= config.MAX_PICKS_PER_INDUSTRY:
+            continue
+        if industry:
+            counts[tier][industry] += 1
+        target.append(row)
+    return formal, pending, reasons
+
+
 def _screen_day(bc: BacktestConfig, config: StrategyConfig, day: str,
                 panels: dict, index_upto: pd.DataFrame, industry_map: dict) -> tuple[list, list, Counter]:
     """对单个交易日 d 重放选股，返回 (formal_picks, pending_picks, 否决原因计数)。"""
+    if getattr(config, "RECOMMENDATION_MODE", "quality_value") == "quality_value":
+        return _screen_quality_day(bc, config, day, panels, index_upto, industry_map)
     market_env = compute_market_environment(index_upto, config)
     regime = market_env.get("regime", "unknown")
     reasons: Counter = Counter()
@@ -814,12 +880,7 @@ def _screen_day(bc: BacktestConfig, config: StrategyConfig, day: str,
 
         # 基本面终审（as-of d 的披露窗口）
         fund = fetch_fundamentals_asof(bc, code, day)
-        if bc.FILL_OPTIONAL_FUNDAMENTALS and fund is not None:
-            try:
-                from src.bottom_fishing_strategy import _fill_optional_fundamentals
-                fund = _fill_optional_fundamentals(code, dict(fund), config)
-            except Exception:  # noqa: BLE001
-                pass
+        # 当前补齐接口无 as-of 保证，历史回放禁止调用（即使传入 --fill-fund）。
         if fund is None:
             row["tier"] = "pending"
             pending.append(row)
@@ -1234,12 +1295,13 @@ def _render_report(bc: BacktestConfig, stats: dict, picks_df: pd.DataFrame, trad
              f"（同根 K 线两者都触及按{'止损' if bc.STOP_FIRST_ON_BOTH else '止盈'}保守成交），否则持有到{'数据期末' if bc.MAX_HOLD_DAYS<=0 else str(bc.MAX_HOLD_DAYS)+'个交易日'}按收盘退出")
     L.append(f"- 股票池：沪深主板（60/00）非 ST，as-of {bc.BT_START}" + (f"，本次限制前 {bc.LIMIT} 只" if bc.LIMIT else ""))
     _cfg0 = StrategyConfig()
-    L.append(f"- 每日推荐上限：牛 {_cfg0.MAX_PICKS} / 中性 {_cfg0.NEUTRAL_MAX_PICKS} / 熊（含 unknown）{_cfg0.BEAR_MAX_PICKS} 只"
-             f"，同行业最多 {_cfg0.MAX_PICKS_PER_INDUSTRY} 只")
-    L.append(f"- 市场级熔断：沪深300 近 {_cfg0.MARKET_CRASH_LOOKBACK} 个交易日累计跌幅 < {_cfg0.MARKET_CRASH_HALT_PCT:.1f}% 的交易日整日不选股")
+    if getattr(_cfg0, "RECOMMENDATION_MODE", "quality_value") == "quality_value":
+        L.append(f"- 质量低估低位模式：每日最多 {_cfg0.MAX_PICKS} 只，同行业最多 {_cfg0.MAX_PICKS_PER_INDUSTRY} 只；大盘仅作标签，周线不作硬闸门")
+    else:
+        L.append(f"- 技术模式每日上限：牛 {_cfg0.MAX_PICKS} / 中性 {_cfg0.NEUTRAL_MAX_PICKS} / 熊 {_cfg0.BEAR_MAX_PICKS} 只；保留市场熔断")
     L.append(f"- 停牌缺口过滤：相邻 K 线间隔 > {_cfg0.MAX_BAR_GAP_DAYS} 天判为曾停牌，否决（K线跨缺口时滚动指标失真）")
-    L.append(f"- 排序主键：rank_score = 技术分 + 连续质量分（权重 {_cfg0.RANK_QUALITY_WEIGHT:.0f}：低波/回撤深度/区间位置/动能速率）")
-    L.append(f"- 基本面：仅对决赛圈候选按披露窗口回溯拉取（as-of）；商誉/扣非补齐={'开启' if bc.FILL_OPTIONAL_FUNDAMENTALS else '关闭（主源缺失即放行，终审略宽松）'}\n")
+    L.append("- 排序主键：完整财务重评后的 rank_score，与对应策略模式一致")
+    L.append("- 基本面：按 as-of 隔离缓存并过滤公告日；禁用当前财务补齐。质量模式多年财务或估值不全仅待核验，不参与交易；数据不全可产生零交易。\n")
 
     L.append("## 二、总体收益\n")
     L.append("| 口径 | 数值 |")
@@ -1356,7 +1418,7 @@ def _add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--workers", type=int, default=0, help="并发数（prefetch 进程 / replay 线程）")
     p.add_argument("--max-hold-days", dest="max_hold_days", type=int, help="最多持有 N 个交易日（默认 0=持有到数据期末）")
     p.add_argument("--entry", choices=["next_open", "rec_close"], help="买入价口径")
-    p.add_argument("--fill-fund", action="store_true", help="决赛圈用 AkShare 补齐商誉/扣非（慢）")
+    p.add_argument("--fill-fund", action="store_true", help="兼容旧参数；历史回测禁用当前财务补齐以避免前视")
     p.add_argument("--source", choices=["baostock", "akshare"], help="行情数据源（baostock 被限流时用 akshare 直连）")
     p.add_argument("--refresh", action="store_true", help="忽略已有缓存，全部重新从接口拉取")
 

@@ -89,7 +89,7 @@ def main() -> int:
     _stub_sources()
 
     # ===== 场景 1：周线路径（默认配置） =====
-    cfg = m.StrategyConfig()
+    cfg = m.StrategyConfig(RECOMMENDATION_MODE="technical")
     cfg.FETCH_DELAY = 0.0
     cfg.MAX_WORKERS = 1
     cfg.CACHE_DIR = _TMP_CACHE.name
@@ -116,7 +116,7 @@ def main() -> int:
           and pend.get("600002", {}).get("weekly_status") == "unverified")
 
     # ===== 场景 2：周线开关全关（disabled 路径 + 无周线时仍做财务终审） =====
-    cfg2 = m.StrategyConfig()
+    cfg2 = m.StrategyConfig(RECOMMENDATION_MODE="technical")
     cfg2.FETCH_DELAY = 0.0
     cfg2.MAX_WORKERS = 1
     cfg2.CACHE_DIR = _TMP_CACHE.name
@@ -137,7 +137,7 @@ def main() -> int:
     # 打桩 evaluate 全部否决（模拟昨晚 Baostock 熔断 + 严格筛选 0 通过的情形）。
     m.evaluate = lambda *a, **k: (None, "FAIL_LIQUIDITY")
 
-    cfg3 = m.StrategyConfig()
+    cfg3 = m.StrategyConfig(RECOMMENDATION_MODE="technical")
     cfg3.FETCH_DELAY = 0.0
     cfg3.MAX_WORKERS = 1
     cfg3.CACHE_DIR = _TMP_CACHE.name
@@ -151,7 +151,7 @@ def main() -> int:
         _err3 = e
     check("空信号: fallback 关闭时 main 返回 None 且不抛异常", _err3 is None and df3 is None)
 
-    cfg4 = m.StrategyConfig()
+    cfg4 = m.StrategyConfig(RECOMMENDATION_MODE="technical")
     cfg4.FETCH_DELAY = 0.0
     cfg4.MAX_WORKERS = 1
     cfg4.CACHE_DIR = _TMP_CACHE.name

@@ -206,6 +206,12 @@ def save_recommendations(df: Optional[pd.DataFrame], strategy: str = STRATEGY_BO
     """
     if df is None or df.empty:
         return 0
+    # 未明确核验为 formal 的记录不得进入正式推荐追踪。
+    if "tier" not in df.columns:
+        return 0
+    df = df.loc[df["tier"].eq("formal")].copy()
+    if df.empty:
+        return 0
     if not is_configured():
         logger.info("MySQL 未配置（MYSQL_HOST/USER/PASSWORD/DATABASE），跳过推荐结果落库")
         return 0
@@ -226,7 +232,7 @@ def save_recommendations(df: Optional[pd.DataFrame], strategy: str = STRATEGY_BO
             str(r.get("signals_hit", "") or "") or None,
             str(r.get("fund_status", "") or "") or None,
             str(r.get("weekly_status", "") or "") or None,
-            str(r.get("tier", "formal") or "formal") or None,
+            "formal",
             strategy,
             str(r.get("missing_tags", "") or "") or None,
         ))
