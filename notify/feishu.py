@@ -64,8 +64,14 @@ def _divider() -> dict:
 
 
 _STRATEGY_ZH = {"bottom_fishing": "抄底", "volume_breakout": "突破"}
+# 卡片标题按策略加统一前缀，避免不同策略通知看起来像同一条消息。
+# 例：【抄底策略】优质低估低位荐股 / 【突破策略】放量突破选股结果
+_STRATEGY_TITLE_PREFIX = {"bottom_fishing": "【抄底策略】", "volume_breakout": "【突破策略】"}
 _VOLATILE_STRATEGY_LABEL = {"bottom_fishing": "抄底信号", "volume_breakout": "突破信号"}
 VOLATILE_CARD_TOP = 5   # 卡片内逐只展示上限（超出仅提示条数，避免卡片过长）
+# 飞书通知每策略最多展示的股票数。策略层已按 MAX_PICKS/NEUTRAL_MAX_PICKS/BEAR_MAX_PICKS
+# 截取正式推荐，这里再做一次通知口径的收敛：宁缺毋滥，用户只看 Top-3。
+NOTIFY_TOP_PER_STRATEGY = 3
 
 
 def _volatile_elements(volatile: Optional[pd.DataFrame], strategy: str = "bottom_fishing",
@@ -128,15 +134,18 @@ def notify_screening_result(
     """发送选股结果通知。
 
     参数匹配 run.py / run_breakout.py 中的调用:
-        notify_screening_result(output_df, market_env=market_env_desc, pending=pending_df, strategy="bottom_fishing")
+        notify_screening_result(output_df, market_env=market_env_desc, strategy="bottom_fishing")
         notify_screening_result(output_df, market_env=market_env_desc, strategy="volume_breakout")
         notify_screening_result(None, market_env=market_env_desc, error_msg=str(e))
 
-    分层展示：df 为正式推荐；pending 为待核验候选
-    （财务/周线数据缺失，未正式推荐，不与正式推荐混排）；
+    展示口径：df 为正式推荐，每策略最多 NOTIFY_TOP_PER_STRATEGY=3 只（宁缺毋滥）；
     volatile 为「波动率风控否决」的高风险观察池（技术面/形态已达标，仅 ATR 超限被拦），
     单独成区块并显式标注风险等级与风险提示，避免被误读为推荐标的。
-    strategy 决定卡片标题措辞与单票描述格式（抄底=低位企稳候选 / 突破=放量突破候选）。
+    strategy 决定卡片标题前缀与单票描述格式（抄底=低位企稳候选 / 突破=放量突破候选），
+    两策略通知的卡片标题以【抄底策略】/【突破策略】前缀区分，避免混淆。
+
+    注：pending（待核验候选）参数保留以兼容旧调用签名，但**不再在飞书卡片中渲染**——
+    待核验意味着数据不全、既不构成推荐也不该被误读为备选，仅在 CI 日志中打印计数即可。
     """
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     is_breakout = strategy == "volume_breakout"
@@ -148,6 +157,8 @@ def notify_screening_result(
     if quality_mode:
         candidate_label = "优质低估低位候选"
         card_title = "优质低估低位荐股"
+    # 统一按策略加前缀，两个策略的卡片标题一眼可辨。
+    card_title = _STRATEGY_TITLE_PREFIX.get(strategy, "") + card_title
 
     # 异常通知
     if error_msg:
@@ -164,10 +175,9 @@ def notify_screening_result(
 
     # 尝试导入 describe 函数（按策略来源选择卡片格式）
     try:
-        from src.bottom_fishing_strategy import describe, describe_pending, describe_volatile
+        from src.bottom_fishing_strategy import describe, describe_volatile
     except ImportError:
         describe = None
-        describe_pending = None
         describe_volatile = None
     try:
         from src.volume_breakout_strategy import describe_breakout
@@ -175,30 +185,9 @@ def notify_screening_result(
         describe_breakout = None
     describe_fn = (describe_breakout or describe) if is_breakout else describe
 
-    def _pending_elements() -> list:
-        """待核验候选区块：与正式推荐分开，说明缺什么、为什么没进正式推荐"""
-        if pending is None or pending.empty:
-            return []
-        elems = [
-            _divider(),
-            _md_element(f"**待核验候选 {len(pending)} 只**（必要数据待核验，未正式推荐，不参与追踪）"),
-        ]
-        for _, row in pending.head(5).iterrows():
-            r = row.to_dict()
-            if describe_pending:
-                text = describe_pending(r)
-            else:
-                text = f"**{r.get('name', '')} {r.get('code', '')}** | 缺项: {r.get('missing_tags', '-')}"
-            elems.append(_md_element(text))
-        if len(pending) > 5:
-            elems.append(_md_element(f"*...共 {len(pending)} 只，仅展示前5*"))
-        return elems
-
     # 无信号
     if df is None or df.empty:
         no_signal_text = "今日无正式推荐（未发现数据完整且通过全部条件的标的），宁可少荐。"
-        if pending is not None and not pending.empty:
-            no_signal_text += f"\n另有待核验候选 {len(pending)} 只（数据待补全）。"
         if volatile is not None and not volatile.empty:
             no_signal_text += (f"\n本轮有 {len(volatile)} 只仅因**波动率超限**被拦下"
                                f"（技术面已达标），详见下方高风险观察池。")
@@ -209,20 +198,28 @@ def notify_screening_result(
                 color="grey"),
             "elements": [
                 _md_element(f"**时间:** {now}\n**市场环境:** {market_env}\n\n{no_signal_text}"),
-                *_pending_elements(),
                 *_volatile_elements(volatile, strategy),
             ],
         }
         _send_feishu(card)
         return
 
-    # 有信号
+    # 有信号：每策略最多展示 NOTIFY_TOP_PER_STRATEGY 只
+    top_n = max(1, int(NOTIFY_TOP_PER_STRATEGY))
+    shown_df = df.head(top_n)
+    shown_n = len(shown_df)
     elements = [
-        _md_element(f"**时间:** {now}\n**市场环境:** {market_env}\n**推荐数量:** {len(df)} 只（{candidate_label}）"),
+        _md_element(
+            f"**时间:** {now}\n"
+            f"**市场环境:** {market_env}\n"
+            f"**推荐数量:** {shown_n} 只（{candidate_label}"
+            + (f"，策略命中 {len(df)} 只，展示 Top-{top_n}" if len(df) > shown_n else "")
+            + "）"
+        ),
         _divider(),
     ]
 
-    for _, row in df.head(10).iterrows():
+    for _, row in shown_df.iterrows():
         r = row.to_dict()
         if describe_fn:
             text = describe_fn(r)
@@ -238,14 +235,10 @@ def notify_screening_result(
         elements.append(_md_element(text))
         elements.append(_divider())
 
-    if len(df) > 10:
-        elements.append(_md_element(f"*...共 {len(df)} 只，仅展示前10*"))
-
-    elements.extend(_pending_elements())
     elements.extend(_volatile_elements(volatile, strategy))
 
     card = {
-        "header": _build_header(f"{card_title} - {len(df)}只信号", color="green"),
+        "header": _build_header(f"{card_title} - {shown_n}只信号", color="green"),
         "elements": elements,
     }
     _send_feishu(card)

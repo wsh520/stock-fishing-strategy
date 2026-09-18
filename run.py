@@ -155,9 +155,10 @@ def run(argv: list[str] | None = None):
         t = time.time()
         if notify_enabled:
             logger.info("Step 4/4 发送飞书通知...")
-            pending_df = pd.DataFrame(pending_rows) if pending_rows else None
+            # 待核验候选（pending）仅在上方 CI 日志中打印计数，不再进入飞书卡片：
+            # 数据不全的标的既不构成推荐也不该被误读为备选，飞书只展示正式推荐 Top-3。
             volatile_df = pd.DataFrame(volatile_rows) if volatile_rows else None
-            notify_screening_result(output_df, market_env=market_env_desc, pending=pending_df,
+            notify_screening_result(output_df, market_env=market_env_desc,
                                     strategy="bottom_fishing", volatile=volatile_df)
             logger.info("Step 4/4 完成 (%.1f 秒)", time.time() - t)
         else:
