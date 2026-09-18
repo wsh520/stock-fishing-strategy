@@ -138,6 +138,20 @@ class StrategyConfig:
     FINANCE_EXEMPT_CODES: tuple = ("601318", "601336", "601601", "601628", "601319", "300059")  # 平安/新华/太保/人寿/人保/东方财富
     FINANCE_MAX_DEBT_RATIO: float = 97.0
 
+    # ===== 估值过滤（A：低估值）=====
+    # 与「低位」（C：MIN_DRAWDOWN_FROM_HIGH / POSITION_IN_RANGE_MAX）共同定义「优质低价」：
+    # C 保证价格处于回撤低位，A 保证估值本身便宜——两者缺一，「低位」可能只是「贵票回调」。
+    # 数据源：Baostock 日线逐 bar 自带 peTTM/pbMRQ（同一请求返回，点位正确、无前视）；
+    # AkShare 东财/新浪逐 bar 不提供估值 → 该两列缺失时本层放行并记 missing_tag「valuation」
+    # （估值降级为「待核验」，不硬否决，与既有「数据缺失不误杀」约定一致）。
+    USE_VALUATION_FILTER: bool = True
+    # 市盈率（TTM）上限：> 上限判为偏贵，否决。
+    MAX_PE_TTM: float = 25.0
+    # 要求 peTTM > 0：亏损股（peTTM ≤ 0）不属于「优质」，直接否决（可关以放行周期股底部）
+    REQUIRE_POSITIVE_PE: bool = True
+    # 市净率（MRQ）上限：> 上限判为偏贵，否决；≤ 0（净资产为负/异常）一并否决
+    MAX_PB_MRQ: float = 3.0
+
     DAILY_MA5: int = 5
     DAILY_MA10: int = 10
     DAILY_EMA5: int = 5
@@ -257,7 +271,7 @@ class StrategyConfig:
     WEEKLY_MA_PERIOD: int = 10
     WEEKLY_SLOPE_LOOKBACK: int = 3
     WEEKLY_TOLERANCE: float = 0.02
-    WEEKLY_MA_BOTH_REQUIRED: bool = True
+    WEEKLY_MA_BOTH_REQUIRED: bool = False  # A+C 定位下松开：真·低位买点常出现在周线 MA10 尚未上行时，双条件会把目标 setup 全滤掉；设 True 恢复「站上且上行」严格口径
     # 周线 MACD 企稳确认：周线 MACD 柱翻红（含金叉后）或绿柱连续 2 周收窄，
     # 确认周线级别动能拐头，避免周线仍在加速下跌时抄底；设为 False 关闭
     REQUIRE_WEEKLY_MACD_STABLE: bool = True
@@ -463,7 +477,7 @@ def _bs_adjust_flag(adjust: str) -> str:
     return "3"
 
 _DATE_FMT = "%Y-%m-%d"
-_NUMERIC_COLS = ("open", "close", "high", "low", "volume", "amount", "pct_chg", "turnover")
+_NUMERIC_COLS = ("open", "close", "high", "low", "volume", "amount", "pct_chg", "turnover", "peTTM", "pbMRQ")
 
 def _fetch_with_retry(fetcher: Callable[[], Any], max_retry: int, label: str, retry_on_empty: bool = False) -> Any:
     last_err = None
@@ -578,7 +592,11 @@ def _fetch_hist_bs(code: str, period: str, start: str, end: str, config: Strateg
 
     freq = "d" if period == "daily" else "w"
     adj = _bs_adjust_flag(config.ADJUST)
+    # 估值字段（peTTM/pbMRQ）仅日线需要，与行情同一次请求返回，零额外成本；
+    # AkShare 逐 bar 不提供估值，走兜底源时该两列缺失 → 估值闸门自动放行并记缺项。
     fields = "date,open,high,low,close,volume,amount,pctChg,turn"
+    if period == "daily":
+        fields += ",peTTM,pbMRQ"
 
     def fetch_data():
         _bs_guard(f"bs_hist({bs_code},{period})")
@@ -1501,7 +1519,7 @@ _WEEKLY_STATUS_ZH = {"confirmed": "周线已确认", "unverified": "周线待核
 _MISSING_TAG_ZH = {
     "fund": "财务数据缺失", "fund_roe": "ROE缺失", "fund_debt": "负债率缺失",
     "fund_goodwill": "商誉缺失", "fund_deducted": "扣非缺失",
-    "pct_chg": "涨幅数据缺失", "gap": "开盘价缺失",
+    "valuation": "估值缺失", "pct_chg": "涨幅数据缺失", "gap": "开盘价缺失",
     "macd_mom": "MACD柱数据缺失", "kdj": "KDJ数据缺失",
 }
 
@@ -1971,6 +1989,22 @@ def evaluate(daily_df: Optional[pd.DataFrame], code: str = "", name: str = "", c
     # 核验状态维度一：财务核验（核心项=ROE+负债率；商誉/扣非为可选项，缺失只记标签）
     fund_status, fund_missing = _fund_verify_state(fund_data)
     missing_tags: list[str] = list(fund_missing)
+
+    # 估值闸门（A：低估值）：peTTM/pbMRQ 取自 Baostock 日线逐 bar（点位正确、无前视）。
+    # 双列均缺失（AkShare 兜底 / 旧缓存无该字段）→ 记缺项放行，不硬否决；
+    # 有值时：亏损（peTTM≤0，可选）、PE 偏高、PB 异常或偏高 → FAIL_VALUATION。
+    if config.USE_VALUATION_FILTER:
+        pe_raw, pb_raw = d_last.get("peTTM"), d_last.get("pbMRQ")
+        pe = float(pe_raw) if pe_raw is not None and not pd.isna(pe_raw) else None
+        pb = float(pb_raw) if pb_raw is not None and not pd.isna(pb_raw) else None
+        if pe is None and pb is None:
+            missing_tags.append("valuation")
+        else:
+            if pe is not None:
+                if (config.REQUIRE_POSITIVE_PE and pe <= 0) or pe > config.MAX_PE_TTM:
+                    return None, "FAIL_VALUATION"
+            if pb is not None and (pb <= 0 or pb > config.MAX_PB_MRQ):
+                return None, "FAIL_VALUATION"
 
     # 防追高否决：当日涨幅过大（涨停买不进、大阳线次日易回调），数据缺失时放行不误杀（记缺项）
     pct_chg_today = d_last.get("pct_chg")

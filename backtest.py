@@ -165,7 +165,7 @@ def _ensure_dirs(bc: BacktestConfig) -> None:
 # 数据抓取（baostock，显式日期区间；与实盘不同：不使用 now() 窗口）
 # ---------------------------------------------------------------------------
 
-_HIST_FIELDS = "date,open,high,low,close,volume,amount,pctChg,turn"
+_HIST_FIELDS = "date,open,high,low,close,volume,amount,pctChg,turn,peTTM,pbMRQ"
 
 
 def _bs_login_safe(max_retry: int = 5) -> bool:
