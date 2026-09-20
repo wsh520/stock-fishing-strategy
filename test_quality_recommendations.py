@@ -26,7 +26,7 @@ def prices(end=DAY):
 def fundamentals():
     # 年度 ROE 18/20/22：质量分稳过下限；季度 roe=2 仍保留，用于验证「最新季度低 ROE
     # 不再否决连续盈利的年度质量」（见 test_low_long_term_but_high_short_term_is_eligible）。
-    return {"debt_ratio": 40., "roe": 2., "annual_rows": [
+    return {"debt_ratio": 40., "roe": 2., "forward_ni_yoy": 12., "forward_stat_date": "2025Q1", "annual_rows": [
         {"year": year, "report_date": f"{year}-12-31", "available_date": f"{year+1}-04-20",
          "roe": roe, "deducted_profit": 90., "net_profit": 100., "operating_cashflow": 110.}
         for year, roe in [(2022, 18), (2023, 20), (2024, 22)]]}

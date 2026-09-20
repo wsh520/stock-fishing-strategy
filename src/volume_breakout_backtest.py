@@ -123,9 +123,12 @@ def run_backtest(data: Dict[str, pd.DataFrame], cfg: Optional[BacktestConfig] = 
     trades: List[dict] = []
     slip = cfg.slippage_bps / 10000.0
 
-    for date in all_dates:
-        # Exit positions before processing today's new entries.
+    def process_exits(date):
+        nonlocal cash
         for pos in list(active):
+            # New positions cannot be sold on their entry day (A-share T+1).
+            if pd.Timestamp(date) <= pos["entry_date"]:
+                continue
             bar = bars[pos["code"]].loc[date] if date in bars[pos["code"]].index else None
             if bar is None:
                 continue
@@ -157,6 +160,9 @@ def run_backtest(data: Dict[str, pd.DataFrame], cfg: Optional[BacktestConfig] = 
                            "reason": reason, "score": pos["score"]})
             active.remove(pos)
 
+    for date in all_dates:
+        # Open entries use only cash and slots carried from yesterday. Daily bars
+        # cannot establish same-open sell/buy ordering, so exits settle afterwards.
         for e in by_date.get(pd.Timestamp(date), []):
             if any(p["code"] == e["code"] for p in active) or len(active) >= cfg.max_positions:
                 continue
@@ -185,6 +191,8 @@ def run_backtest(data: Dict[str, pd.DataFrame], cfg: Optional[BacktestConfig] = 
                           "entry_date": pd.Timestamp(date), "entry": entry, "shares": shares,
                           "cost": buy_value + buy_fee, "stop": stop, "target": target,
                           "days": 0, "score": float(sig.score)})
+
+        process_exits(date)
 
     # Mark still-open positions at the last available close; they are not counted as closed wins.
     for pos in active:

@@ -57,8 +57,13 @@ CREATE TABLE IF NOT EXISTS stock_recommendation (
   COLLATE = utf8mb4_unicode_ci COMMENT ='每日选股推荐记录';
 
 -- ----------------------------------------------------------------------------
--- 周度追踪表：每周对仍在追踪期内（推荐日起一个月内、最多4次）的推荐记录
--- 记录一次最新收盘价，收益值 = close_price - rec_close，收益率 = 收益值/推荐价
+-- 周度追踪表：推荐后第5/10/15/20个市场交易日，允许60日内补跑。
+-- 目标日停牌/缺价不填充。holding_trade_days=NULL 的历史行不混入固定期限归因。
+-- 存量迁移由 _ensure_tracking_schema 自动执行：保留所有历史行及周号、日期、价格，
+-- 同 rec_id+close_date 仅最早一行 legacy_duplicate=0，其他行标记为1。
+-- 生成列将历史重复行映射NULL，既保留历史又约束所有正常新行同日唯一。
+-- 原 uk_rec_week 改为普通索引，避免历史错误周号占满额度；新期限由 uk_rec_horizon 保证唯一。
+-- 不要对存在历史重复的旧表直接增加 (rec_id, close_date) UNIQUE。
 -- ----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS stock_tracking (
     id            BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '主键',
@@ -68,12 +73,17 @@ CREATE TABLE IF NOT EXISTS stock_tracking (
     week_no       TINYINT         NOT NULL COMMENT '第几次追踪（1起，最多4）',
     track_date    DATE            NOT NULL COMMENT '本次追踪执行日期',
     close_date    DATE            NOT NULL COMMENT '收盘价对应的实际交易日',
-    close_price   DECIMAL(10, 3)  NOT NULL COMMENT '最新收盘价（元）',
+    holding_trade_days TINYINT UNSIGNED NULL COMMENT '推荐后市场交易日数；旧记录未知为NULL',
+    legacy_duplicate TINYINT NOT NULL DEFAULT 0 COMMENT '保留的历史同日重复记录',
+    unique_close_date DATE GENERATED ALWAYS AS (CASE WHEN legacy_duplicate = 0 THEN close_date ELSE NULL END) STORED,
+    close_price   DECIMAL(10, 3)  NOT NULL COMMENT '目标交易日收盘价（元）',
     return_value  DECIMAL(10, 3)  NOT NULL COMMENT '收益值 = close_price - 推荐时收盘价（元）',
     return_pct    DECIMAL(8, 3)   NOT NULL COMMENT '收益率 = return_value / 推荐时收盘价 × 100（%）',
     created_at    DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '写入时间',
     PRIMARY KEY (id),
-    UNIQUE KEY uk_rec_week (rec_id, week_no),
+    KEY idx_rec_week (rec_id, week_no),
+    UNIQUE KEY uk_rec_close_date (rec_id, unique_close_date),
+    UNIQUE KEY uk_rec_horizon (rec_id, holding_trade_days),
     KEY idx_code_track (code, track_date),
     KEY idx_track_date (track_date),
     CONSTRAINT fk_tracking_rec FOREIGN KEY (rec_id) REFERENCES stock_recommendation (id)

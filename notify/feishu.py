@@ -147,6 +147,13 @@ def notify_screening_result(
     注：pending（待核验候选）参数保留以兼容旧调用签名，但**不再在飞书卡片中渲染**——
     待核验意味着数据不全、既不构成推荐也不该被误读为备选，仅在 CI 日志中打印计数即可。
     """
+    # 通知边界再次核验资格，兼容调用方误传候选或缺少 tier 的旧数据。
+    if df is not None and not df.empty:
+        formal = df["tier"].eq("formal") if "tier" in df.columns else pd.Series(False, index=df.index)
+        omitted = len(df) - int(formal.sum())
+        if omitted:
+            logger.warning("通知过滤 %d 只非 formal 标的（含核验状态缺失）", omitted)
+        df = df.loc[formal].copy()
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     is_breakout = strategy == "volume_breakout"
     candidate_label = "放量突破候选" if is_breakout else "低位企稳候选"

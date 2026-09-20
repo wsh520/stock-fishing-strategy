@@ -136,6 +136,11 @@ class BacktestConfig:
     DATA_SOURCE: str = "baostock"
     REFRESH: bool = False              # True 时预取忽略已有缓存，全部重新从接口拉取
 
+    # 单边佣金、卖出印花税与单边滑点；新增字段置于末尾，保留旧配置/位置参数。
+    FEE_RATE: float = 0.0003
+    STAMP_DUTY: float = 0.0005
+    SLIPPAGE_BPS: float = 10.0
+
     def data_end(self) -> str:
         return self.DATA_END or datetime.now().strftime("%Y-%m-%d")
 
@@ -978,6 +983,28 @@ def replay(bc: BacktestConfig, config: StrategyConfig) -> tuple[list, list, pd.D
 # 收益模拟
 # ---------------------------------------------------------------------------
 
+def _bar_can_trade(bar: pd.Series, previous_close: float, side: str) -> bool:
+    """日线保守成交约束：停牌/无效行情不成交，一字上行不买、下行不卖。
+
+    缺少交易所涨跌停价时，将同方向一字线均视为可能封板；不猜测排队成交。
+    老缓存缺少 volume 时仍兼容，存在该列则必须为正。
+    """
+    prices = pd.to_numeric(bar.reindex(["open", "high", "low", "close"]), errors="coerce")
+    if not np.isfinite(prices).all() or (prices <= 0).any():
+        return False
+    if prices["low"] > min(prices["open"], prices["close"]) or prices["high"] < max(prices["open"], prices["close"]):
+        return False
+    if "volume" in bar and not (pd.notna(bar["volume"]) and float(bar["volume"]) > 0):
+        return False
+    if str(bar.get("tradestatus", bar.get("tradeStatus", "1"))) in ("0", "0.0"):
+        return False
+    if prices["high"] == prices["low"]:
+        if not np.isfinite(previous_close) or previous_close <= 0:
+            return False
+        return prices["close"] < previous_close if side == "buy" else prices["close"] > previous_close
+    return True
+
+
 def simulate_trade(bc: BacktestConfig, pick: dict, panels: dict, trading_days: list) -> dict:
     """对一条推荐做收益模拟：次日开盘买入 → 盘中止损/止盈 → 否则持有到期末按收盘退出。
 
@@ -1019,11 +1046,28 @@ def simulate_trade(bc: BacktestConfig, pick: dict, panels: dict, trading_days: l
             return out
         entry_price = float(df.iloc[ei]["open"])
         entry_date = dates[ei]
-        start_i = ei            # 从入场当日开始监控止损止盈
+        start_i = ei            # 入场当天盯市，但 T+1 才允许卖出
+        # 次一市场交易日缺失视为停牌，不能把信号顺延到复牌日。
+        next_days = [day for day in trading_days if day > d]
+        if next_days and entry_date != next_days[0]:
+            out.update(entry_date=None, entry_price=None, exit_date=None, exit_price=None,
+                       exit_reason="ENTRY_BLOCKED", return_pct=np.nan, peak_pct=np.nan, hold_days=0, mtm=[])
+            return out
     else:  # rec_close
         entry_price = float(df.iloc[i]["close"])
         entry_date = d
-        start_i = i + 1
+        ei = i
+        start_i = i
+
+    previous_close = float(df.iloc[ei - 1]["close"]) if ei > 0 else np.nan
+    if not _bar_can_trade(df.iloc[ei], previous_close, "buy"):
+        out.update(entry_date=None, entry_price=None, exit_date=None, exit_price=None,
+                   exit_reason="ENTRY_BLOCKED", return_pct=np.nan, peak_pct=np.nan, hold_days=0, mtm=[])
+        return out
+    fee, duty, slip = bc.FEE_RATE, bc.STAMP_DUTY, bc.SLIPPAGE_BPS / 10000
+    if not all(np.isfinite(v) and 0 <= v < 1 for v in (fee, duty, slip)) or fee + duty >= 1:
+        raise ValueError("交易成本必须为非负有限值，费率及滑点须小于 100%")
+    entry_price *= 1 + slip
 
     if entry_price <= 0:
         out.update(entry_date=entry_date, entry_price=entry_price, exit_date=None, exit_price=None,
@@ -1041,44 +1085,53 @@ def simulate_trade(bc: BacktestConfig, pick: dict, panels: dict, trading_days: l
     peak_close = entry_price
     mtm = []  # 逐日盯市：(date, close)
 
-    for k in range(start_i, max_i + 1):
+    for k in range(start_i, len(df)):
         bar = df.iloc[k]
-        low = float(bar["low"]) if not pd.isna(bar["low"]) else float(bar["close"])
-        high = float(bar["high"]) if not pd.isna(bar["high"]) else float(bar["close"])
         close = float(bar["close"])
-        mtm.append((dates[k], close))
-        if not pd.isna(close):
+        if np.isfinite(close) and close > 0:
+            mtm.append((dates[k], close))
             peak_close = max(peak_close, close)
-        if bc.USE_STOP_TP and stop is not None and tp is not None:
-            hit_stop = low <= stop
-            hit_tp = high >= tp
-            if hit_stop and hit_tp:
-                if bc.STOP_FIRST_ON_BOTH:
-                    exit_i, exit_price, exit_reason = k, stop, "STOP_LOSS"
-                else:
-                    exit_i, exit_price, exit_reason = k, tp, "TAKE_PROFIT"
-                break
-            if hit_stop:
-                exit_i, exit_price, exit_reason = k, stop, "STOP_LOSS"
-                break
-            if hit_tp:
-                exit_i, exit_price, exit_reason = k, tp, "TAKE_PROFIT"
-                break
+        if dates[k] <= entry_date or not _bar_can_trade(bar, float(df.iloc[k - 1]["close"]), "sell"):
+            continue
+        low, high, opening = float(bar["low"]), float(bar["high"]), float(bar["open"])
+        if bc.USE_STOP_TP:
+            # 开盘是已知的首个成交时点，优先于当天后续高低点。
+            if stop is not None and opening <= stop:
+                exit_price, exit_reason = opening, "STOP_LOSS"
+            elif tp is not None and opening >= tp:
+                exit_price, exit_reason = opening, "TAKE_PROFIT"
+            else:
+                hit_stop = stop is not None and low <= stop
+                hit_tp = tp is not None and high >= tp
+                if hit_stop and (not hit_tp or bc.STOP_FIRST_ON_BOTH):
+                    exit_price, exit_reason = stop, "STOP_LOSS"
+                elif hit_tp:
+                    exit_price, exit_reason = tp, "TAKE_PROFIT"
+        if exit_price is None and k >= max_i:
+            exit_price = close
+            exit_reason = "PERIOD_END" if bc.MAX_HOLD_DAYS <= 0 else "TIMEOUT"
+        if exit_price is not None:
+            exit_i = k
+            break
     if exit_i is None:
-        # 未触发止损止盈：持有到期末（数据末根或 max_hold 上限）按收盘退出
-        exit_i = max_i
-        exit_price = float(df.iloc[exit_i]["close"])
-        exit_reason = "PERIOD_END" if bc.MAX_HOLD_DAYS <= 0 else "TIMEOUT"
-        if not mtm:
-            mtm.append((dates[exit_i], exit_price))
+        # T+1/停牌/封跌停使期末不能卖出，保留持仓而非虚构平仓收益。
+        out.update(entry_date=entry_date, entry_price=round(entry_price, 3),
+                   exit_date=None, exit_price=None, exit_reason="OPEN", return_pct=np.nan,
+                   peak_pct=round((peak_close / entry_price - 1) * 100, 3),
+                   hold_days=len(df) - ei, mtm=mtm, entry_unit_cost=entry_price * (1 + fee))
+        return out
 
-    ret = (exit_price - entry_price) / entry_price * 100
+    exit_price *= 1 - slip
+    entry_unit_cost = entry_price * (1 + fee)
+    exit_unit_proceeds = exit_price * (1 - fee - duty)
+    ret = (exit_unit_proceeds / entry_unit_cost - 1) * 100
     peak_ret = (peak_close - entry_price) / entry_price * 100
     out.update(
         entry_date=entry_date, entry_price=round(entry_price, 3),
         exit_date=dates[exit_i], exit_price=round(exit_price, 3),
         exit_reason=exit_reason, return_pct=round(ret, 3), peak_pct=round(peak_ret, 3),
         hold_days=int(exit_i - start_i + 1), mtm=mtm,
+        entry_unit_cost=entry_unit_cost, exit_unit_proceeds=exit_unit_proceeds,
     )
     return out
 
@@ -1140,7 +1193,9 @@ def build_monthly_stats(bc: BacktestConfig, trades: list, index: pd.DataFrame,
     }
 
     # 组合口径：每日投入等额资金 DAILY_BUDGET，等权分给当日推荐；逐日盯市所有未平仓+已平仓头寸
-    portfolio = _build_portfolio_curve(bc, valid)
+    portfolio = _build_portfolio_curve(bc, [t for t in trades if t.get("entry_price")
+                                           and (t.get("exit_price") is not None or t.get("exit_reason") == "OPEN")])
+    per_trade["n_open"] = sum(t.get("exit_reason") == "OPEN" for t in trades)
 
     # 基准：沪深300 在回测区间的买入持有收益
     idx = index[(index["date"] >= bc.BT_START) & (index["date"] <= bc.BT_END)]
@@ -1173,7 +1228,7 @@ def _build_portfolio_curve(bc: BacktestConfig, valid: list) -> dict:
                 "max_drawdown_pct": 0.0, "n_screen_days": 0, "curve": []}
 
     # 收集所有相关交易日（覆盖到最后一笔退出日）
-    all_days = sorted({t["entry_date"] for t in valid} | {t["exit_date"] for t in valid}
+    all_days = sorted({t["entry_date"] for t in valid} | {t["exit_date"] for t in valid if t.get("exit_date")}
                       | {d for t in valid for d, _ in t.get("mtm", [])})
     # 每笔交易的逐日价值序列（现金/持仓）
     # 持仓期：shares * close；退出后：exit 现金。入场前：0（尚未投入）。
@@ -1182,17 +1237,19 @@ def _build_portfolio_curve(bc: BacktestConfig, valid: list) -> dict:
     for t in valid:
         budget = bc.DAILY_BUDGET / max(1, _cohort_size(valid, t["rec_date"]))
         total_invested += budget
-        shares = budget / t["entry_price"]
-        exit_val = shares * t["exit_price"]
+        shares = budget / t.get("entry_unit_cost", t["entry_price"])
+        exit_val = shares * t.get("exit_unit_proceeds", t["exit_price"]) if t.get("exit_date") else None
         mtm_map = dict(t.get("mtm", []))
         series = {}
+        last_mark = t["entry_price"]
         for day in all_days:
             if day < t["entry_date"]:
                 continue               # 尚未入场，组合层按已划拨现金计
-            if day >= t["exit_date"]:
+            if t.get("exit_date") and day >= t["exit_date"]:
                 series[day] = exit_val  # 已退出，按退出现金计
-            elif day in mtm_map:
-                series[day] = shares * mtm_map[day]   # 持仓中，按当日收盘盯市
+            else:
+                last_mark = mtm_map.get(day, last_mark)
+                series[day] = shares * last_mark  # 停牌延用最近价格；OPEN 不虚构卖出费用
         per_trade_series.append((t, budget, series, exit_val))
 
     # 组合逐日净值：把每笔在 day 的价值（持仓盯市 / 退出后现金）相加；未入场的资金视为已投入现金
@@ -1206,7 +1263,7 @@ def _build_portfolio_curve(bc: BacktestConfig, valid: list) -> dict:
                 val += budget          # 已划拨但尚未入场，按现金计
             elif day in series and series[day] is not None:
                 val += series[day]
-            elif day >= t["exit_date"]:
+            elif t.get("exit_date") and day >= t["exit_date"]:
                 val += exit_val
             else:
                 val += budget
@@ -1598,6 +1655,10 @@ def _apply_args(bc: BacktestConfig, args: argparse.Namespace) -> BacktestConfig:
         bc.MAX_HOLD_DAYS = args.max_hold_days
     if getattr(args, "entry", None):
         bc.ENTRY_MODE = args.entry
+    for arg, field_name in (("fee_rate", "FEE_RATE"), ("stamp_duty", "STAMP_DUTY"),
+                            ("slippage_bps", "SLIPPAGE_BPS")):
+        if getattr(args, arg, None) is not None:
+            setattr(bc, field_name, getattr(args, arg))
     if getattr(args, "fill_fund", False):
         bc.FILL_OPTIONAL_FUNDAMENTALS = True
     if getattr(args, "source", None):
@@ -1618,6 +1679,9 @@ def _add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--workers", type=int, default=0, help="并发数（prefetch 进程 / replay 线程）")
     p.add_argument("--max-hold-days", dest="max_hold_days", type=int, help="最多持有 N 个交易日（默认 0=持有到数据期末）")
     p.add_argument("--entry", choices=["next_open", "rec_close"], help="买入价口径")
+    p.add_argument("--fee-rate", type=float, help="单边佣金率（默认 0.0003）")
+    p.add_argument("--stamp-duty", type=float, help="卖出印花税率（默认 0.0005）")
+    p.add_argument("--slippage-bps", type=float, help="单边滑点基点（默认 10）")
     p.add_argument("--fill-fund", action="store_true", help="兼容旧参数；历史回测禁用当前财务补齐以避免前视")
     p.add_argument("--source", choices=["baostock", "akshare"], help="行情数据源（baostock 被限流时用 akshare 直连）")
     p.add_argument("--refresh", action="store_true", help="忽略已有缓存，全部重新从接口拉取")

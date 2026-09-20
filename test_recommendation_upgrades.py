@@ -30,7 +30,7 @@ def make_df(pe=8.0, pb=0.9, end=DAY):
 
 
 def make_fund(roe=(18, 20, 22), **extra):
-    fund = {"debt_ratio": 40., "roe": 2., "annual_rows": [
+    fund = {"debt_ratio": 40., "roe": 2., "forward_ni_yoy": 12., "forward_stat_date": "2025Q1", "annual_rows": [
         {"year": y, "report_date": f"{y}-12-31", "available_date": f"{y+1}-04-20",
          "roe": r, "deducted_profit": 90., "net_profit": 100., "operating_cashflow": 110.}
         for y, r in zip((2022, 2023, 2024), roe)]}
@@ -92,17 +92,16 @@ class TestForwardConfirmation(unittest.TestCase):
         fund = make_fund(forward_ni_yoy=12.0)
         sig, reason = ev(make_df(), fund, m.StrategyConfig(USE_CACHE=False))
         self.assertEqual(reason, "PASS")
-        self.assertIn("当年净利+12%", sig.signals_hit)
+        self.assertIn("2025Q1 净利同比+12%", sig.signals_hit)
 
-    def test_missing_growth_does_not_demote_by_default(self):
-        # FORWARD_MISSING_AS_PENDING=False（默认）：缺成长数据不否决、不降级
-        sig, reason = ev(make_df(), make_fund(), m.StrategyConfig(USE_CACHE=False))
+    def test_missing_growth_pending_by_default(self):
+        sig, reason = ev(make_df(), make_fund(forward_ni_yoy=None), m.StrategyConfig(USE_CACHE=False))
         self.assertEqual(reason, "PASS")
-        self.assertEqual(sig.tier, "formal")
+        self.assertEqual(sig.tier, "pending")
 
     def test_missing_growth_pending_when_configured(self):
         cfg = m.StrategyConfig(USE_CACHE=False, FORWARD_MISSING_AS_PENDING=True)
-        sig, reason = ev(make_df(), make_fund(), cfg)
+        sig, reason = ev(make_df(), make_fund(forward_ni_yoy=None), cfg)
         self.assertEqual(reason, "PASS")
         self.assertEqual(sig.tier, "pending")
         self.assertIn("forward", sig.missing_tags)
@@ -190,6 +189,7 @@ class TestIndustryRelativeValuation(unittest.TestCase):
             return make_df(pe=float(5 + i), pb=float(0.4 + 0.1 * i))
 
         with patch.object(m, "get_stock_industry", return_value=industry), \
+             patch.object(m, "get_index_daily", return_value=pd.DataFrame({"date": [DAY]})), \
              patch.object(m, "get_daily_data", side_effect=daily):
             snap = m.build_industry_valuation_snapshot(cfg, m.CacheManager(), stocks)
         self.assertIn("银行", snap)

@@ -1,10 +1,10 @@
 """周度追踪脚本：统计推荐个股的最新表现，落库 MySQL 并飞书汇总。
 
 追踪口径：
-- 每条推荐记录自推荐日起最多追踪一个月（TRACK_MAX_WEEKS=4 次周度记录，
-  且推荐日起 TRACK_MAX_AGE_DAYS=31 天后强制退出，双保险）；
-- 每次记录当时的最新收盘价：收益值 = 最新收盘价 - 推荐时收盘价，
-  收益率 = 收益值 / 推荐时收盘价 × 100%；
+- 用沪深300行情日期定位推荐后第5/10/15/20个市场交易日，60日内允许补跑；
+- 仅记录目标日有效收盘价，停牌/缺价跳过，不以前后日期代替；
+- 同一推荐同一收盘日及同一期限幂等，历史未知期限不猜测；
+- 收益值 = 目标日收盘价 - 推荐时收盘价，收益率 = 收益值 / 推荐价 × 100%；
 - 同一股票在不同日期被重复推荐的，视为不同推荐记录，各自独立追踪。
 
 由 GitHub Actions 每周五收盘后执行（weekly_tracking.yml），也可本地手动：
@@ -56,6 +56,45 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def select_observations(rec: dict, daily: pd.DataFrame, market: pd.DataFrame) -> list[dict]:
+    """用市场交易日定位固定期限；停牌/缺价不前填，允许补跑多个到期观测。"""
+    if daily is None or daily.empty or market is None or market.empty:
+        return []
+    from store.mysql_store import TRACK_HORIZONS
+    rec_day = pd.Timestamp(rec["rec_date"]).normalize()
+    calendar = pd.to_datetime(market["date"], errors="coerce").dropna().dt.normalize()
+    calendar = calendar.drop_duplicates().sort_values()
+    # 必须覆盖推荐日，避免截断历史使第5日错位；不使用未来日期。
+    if rec_day not in set(calendar):
+        return []
+    calendar = calendar[(calendar > rec_day) & (calendar <= pd.Timestamp.today().normalize())]
+    quotes = daily.copy()
+    quotes["date"] = pd.to_datetime(quotes["date"], errors="coerce").dt.normalize()
+    quotes["close"] = pd.to_numeric(quotes["close"], errors="coerce")
+    quotes = quotes.dropna(subset=["date", "close"]).sort_values("date").drop_duplicates("date", keep="last")
+    quotes = quotes[(quotes["close"] > 0) & (quotes["close"] < float("inf"))]
+    for column in ("volume", "amount"):
+        if column in quotes:
+            quotes = quotes[pd.to_numeric(quotes[column], errors="coerce") > 0]
+    quotes = quotes.set_index("date")
+    dates = {str(d).strip()[:10] for d in str(rec.get("tracked_close_dates") or "").split(",") if d}
+    last_day = rec.get("last_close_date")
+    if last_day is not None and not pd.isna(last_day):
+        dates.add(pd.Timestamp(last_day).date().isoformat())
+    horizons = {int(d) for d in str(rec.get("tracked_horizons") or "").split(",") if d}
+    result = []
+    for horizon in TRACK_HORIZONS:
+        if horizon in horizons or len(calendar) < horizon:
+            continue
+        day = calendar.iloc[horizon - 1]
+        day_str = day.date().isoformat()
+        if day_str in dates or day not in quotes.index:
+            continue
+        result.append(dict(week_no=horizon // 5, holding_trade_days=horizon,
+                           close_date=day_str, close_price=float(quotes.loc[day, "close"])))
+    return result
+
+
 def run(argv: list[str] | None = None):
     _setup_logging()
     args = _parse_args(argv)
@@ -68,13 +107,13 @@ def run(argv: list[str] | None = None):
         StrategyConfig,
         CacheManager,
         get_daily_data,
+        get_index_daily,
         _bs_login,
         _bs_logout,
         _bs_state,
         _AK_AVAILABLE,
     )
     from store.mysql_store import (
-        TRACK_MAX_WEEKS,
         get_active_recommendations,
         is_configured,
         save_tracking,
@@ -110,64 +149,49 @@ def run(argv: list[str] | None = None):
         logger.info("已启用 --no-cache：跳过 cache/ 磁盘缓存读写，本次全部从数据源拉取")
     cache = CacheManager(expire_hours=config.CACHE_EXPIRE_HOURS)
 
-    def _fetch_close(rec: dict) -> tuple[dict, float | None, str | None]:
-        """拉取个股最新收盘价及其对应的实际交易日。"""
-        code = rec["code"]
+    def _fetch_close(rec: dict) -> tuple[dict, list[dict] | None]:
         try:
-            df = get_daily_data(code, config, cache)
+            df = get_daily_data(rec["code"], config, cache)
             if df is None or df.empty:
-                return rec, None, None
-            last = df.iloc[-1]
-            return rec, float(last["close"]), str(last["date"])
+                return rec, None
+            return rec, select_observations(rec, df, market)
         except Exception as e:
-            logger.debug("%s(%s) 拉取行情异常: %s", rec["name"], code, e)
-            return rec, None, None
+            logger.debug("%s(%s) 拉取行情异常: %s", rec["name"], rec["code"], e)
+            return rec, None
 
     # Step 3: 并发拉行情（bs_lock 保护 Baostock），主线程逐条落库
     logger.info("Step 3/4 并发拉取行情并逐条落库（%d 条，%d 线程）...", len(recs), config.MAX_WORKERS)
     report_rows: list[dict] = []
     tracked, failed = 0, 0
     try:
+        market = get_index_daily(config, cache)
+        if market is None or market.empty:
+            logger.warning("市场交易日序列缺失，跳过固定期限追踪")
+            return
         with ThreadPoolExecutor(max_workers=config.MAX_WORKERS) as pool:
             futures = [pool.submit(_fetch_close, r) for r in recs]
             for fut in as_completed(futures):
-                rec, close_price, close_date = fut.result()
+                rec, observations = fut.result()
                 code, name = rec["code"], rec["name"]
-                if close_price is None:
+                if observations is None:
                     failed += 1
                     logger.warning("%s(%s) 行情获取失败，本次跳过", name, code)
                     continue
 
-                # 行情未走出推荐日（如周任务与日任务同日执行）：收益恒为 0，
-                # 跳过且不计入追踪次数，保证 4 次追踪都是有效观测
-                rec_date_str = rec["rec_date"].strftime("%Y-%m-%d") if hasattr(rec["rec_date"], "strftime") else str(rec["rec_date"])
-                if close_date <= rec_date_str:
-                    logger.info("%s(%s) 收盘价仍为推荐日(%s)，本次不计追踪", name, code, rec_date_str)
-                    continue
-
-                week_no = int(rec["tracked_weeks"]) + 1
-                ok = save_tracking(
-                    rec_id=rec["id"],
-                    rec_date=rec["rec_date"],
-                    code=code,
-                    week_no=week_no,
-                    close_date=close_date,
-                    close_price=close_price,
-                    rec_close=float(rec["rec_close"]),
-                )
-                if ok:
-                    tracked += 1
-                    ret_pct = (close_price - float(rec["rec_close"])) / float(rec["rec_close"]) * 100
-                    logger.info("%s(%s) 第%d周: %s -> %s (%+.2f%%)", name, code, rec["rec_close"], close_price, ret_pct)
-                    report_rows.append({
-                        "name": name,
-                        "code": code,
-                        "strategy": str(rec.get("strategy") or "bottom_fishing"),
-                        "status": f"第{week_no}/{TRACK_MAX_WEEKS}周",
-                        "rec_price": float(rec["rec_close"]),
-                        "current_price": close_price,
-                        "return_pct": round(ret_pct, 2),
-                    })
+                for observation in observations:
+                    ok = save_tracking(rec_id=rec["id"], rec_date=rec["rec_date"], code=code,
+                                       rec_close=float(rec["rec_close"]), **observation)
+                    if ok:
+                        tracked += 1
+                        close_price = observation["close_price"]
+                        ret_pct = (close_price / float(rec["rec_close"]) - 1) * 100
+                        report_rows.append({
+                            "name": name, "code": code,
+                            "strategy": str(rec.get("strategy") or "bottom_fishing"),
+                            "status": f"推荐后{observation['holding_trade_days']}交易日",
+                            "rec_price": float(rec["rec_close"]), "current_price": close_price,
+                            "return_pct": round(ret_pct, 2),
+                        })
     finally:
         _bs_logout()
 

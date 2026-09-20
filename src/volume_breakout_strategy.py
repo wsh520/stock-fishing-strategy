@@ -50,6 +50,14 @@ from src.bottom_fishing_strategy import (
     _AK_AVAILABLE,
     _beijing_now,
     _effective_regime,
+    _fund_verify_state,
+    _fill_optional_fundamentals,
+    _drop_incomplete_weekly_bar,
+    _weekly_trend_data_ok,
+    _weekly_macd_data_ok,
+    _weekly_fresh_enough,
+    get_stock_industry,
+    market_crash_halt,
     evaluate_quality_value,
     _screen_quality_pool,
     get_index_daily,
@@ -622,7 +630,21 @@ def evaluate_breakout(
     _required_last = ("date", "open", "high", "low", "close", "volume", "amount", "pct_chg")
     if any(col not in d_last.index or pd.isna(d_last[col]) for col in _required_last):
         return None, "FAIL_DATA"
-    if len(out) < 2 or pd.isna(out.iloc[-2].get("close")):
+    day = pd.to_datetime(d_last["date"], errors="coerce")
+    if pd.isna(day):
+        return None, "FAIL_DATA"
+    if config.REQUIRE_FRESH_DAILY and latest_trade_date is not None:
+        benchmark = pd.to_datetime(latest_trade_date, errors="coerce")
+        if pd.isna(benchmark) or day.date() != benchmark.date():
+            return None, "FAIL_STALE"
+    values = pd.to_numeric(d_last[list(_required_last[1:])], errors="coerce")
+    if not np.isfinite(values.to_numpy(dtype=float)).all():
+        return None, "FAIL_DATA"
+    if any(float(d_last[c]) <= 0 for c in ("open", "high", "low", "close", "volume", "amount")):
+        return None, "FAIL_DATA"
+    if "tradestatus" in d_last and str(d_last["tradestatus"]) not in ("1", "1.0"):
+        return None, "FAIL_DATA"
+    if len(out) < 2 or not np.isfinite(pd.to_numeric(out.iloc[-2].get("close"), errors="coerce")):
         return None, "FAIL_DATA"
     last_close = float(d_last["close"])
 
@@ -749,7 +771,12 @@ def evaluate_breakout(
 
     _amt = pd.to_numeric(out["amount"], errors="coerce").tail(20).mean() if "amount" in out.columns else float("nan")
 
+    fund_status, fund_tags = _fund_verify_state(fund_data)
+    if latest_trade_date is None:
+        fund_tags.append("market_date")
     sig = BreakoutSignal(
+        tier="pending", fund_status=fund_status, weekly_status="unverified",
+        missing_tags=",".join(fund_tags),
         code=code, name=name,
         date=pd.to_datetime(d_last["date"]).strftime("%Y-%m-%d"),
         close=round(last_close, 2),
@@ -834,9 +861,14 @@ def main_breakout(
         market_env = get_market_environment(config, cache)
         logger.info("市场环境: %s", market_env.get("description", "unknown"))
 
+        index = get_index_daily(config, cache)
+        latest_day = (pd.to_datetime(index.iloc[-1]["date"], errors="coerce")
+                      if index is not None and not index.empty and "date" in index else pd.NaT)
+        latest = latest_day.strftime("%Y-%m-%d") if pd.notna(latest_day) else None
+        if market_crash_halt(index, config) is not None:
+            logger.warning("指数急跌触发市场熔断，突破策略暂停推荐")
+            return None
         if config.RECOMMENDATION_MODE == "quality_value":
-            index = get_index_daily(config, cache)
-            latest = str(index.iloc[-1]["date"]) if index is not None and not index.empty else None
             return _screen_quality_pool(config, cache, market_env, latest,
                                          pending_out, evaluator=evaluate_breakout)
 
@@ -887,7 +919,7 @@ def main_breakout(
                     return None, "FAIL_DATA"
                 fund_data = get_fundamentals(code, cache, config)
                 return evaluate_breakout(daily_df, code, name, config, market_env, fund_data,
-                                         volatile_out=volatile_out)
+                                         volatile_out=volatile_out, latest_trade_date=latest)
             except Exception as e:
                 logger.debug("%s(%s) 筛选异常: %s", name, code, e)
                 return None, "ERROR"
@@ -904,7 +936,7 @@ def main_breakout(
                 logger.info("[通过] %s(%s) 评分 %.1f %s级 L%d 突破幅度 %.2f%%",
                             sig.name, sig.code, sig.score, sig.grade, sig.breakout_level, sig.breakout_margin)
             elif reason == "FAIL_FUND": stats["fail_fund"] += 1
-            elif reason == "FAIL_DATA": stats["fail_data"] += 1
+            elif reason in ("FAIL_DATA", "FAIL_STALE"): stats["fail_data"] += 1
             elif reason == "FAIL_LIQUIDITY": stats["fail_liq"] += 1
             elif reason == "FAIL_HALT_GAP": stats["fail_halt"] += 1
             elif reason == "FAIL_NO_BREAKOUT": stats["fail_breakout"] += 1
@@ -988,38 +1020,76 @@ def main_breakout(
         # 确定性排序
         df = pd.DataFrame(signals).sort_values(SORT_BY, ascending=SORT_ASC).reset_index(drop=True)
 
-        # 决赛圈周线确认（继承抄底策略的 check_weekly_trend + check_weekly_macd）
-        if config.REQUIRE_WEEKLY_TREND and not df.empty:
-            logger.info("进入周线确认：%d 只候选，逐只确认最多取 %d 只", len(df), max_picks)
-            confirmed = []
-            weekly_checked = 0
-            for _, row in df.iterrows():
-                if len(confirmed) >= max_picks:
-                    break
-                weekly_checked += 1
-                wk = _fetch_weekly_dual(row["code"], config)
-                trend_ok = check_weekly_trend(wk, config)
-                macd_ok = check_weekly_macd(wk, config) if trend_ok and config.REQUIRE_WEEKLY_MACD_STABLE else True
-                if trend_ok and macd_ok:
-                    confirmed.append(row)
-                    logger.info("周线确认 %s(%s) 评分 %.1f L%d: 通过（第 %d/%d 只）",
-                                row["name"], row["code"], row["score"], row["breakout_level"],
-                                len(confirmed), max_picks)
-                else:
-                    logger.info("周线确认 %s(%s) 评分 %.1f L%d: 淘汰（%s）",
-                                row["name"], row["code"], row["score"], row["breakout_level"],
-                                "周线趋势未过" if not trend_ok else "周线MACD未企稳")
+        # 候选只有完成终审才能升级 formal；缺项不占名额，继续向后补足。
+        weekly_enabled = config.REQUIRE_WEEKLY_TREND or config.REQUIRE_WEEKLY_MACD_STABLE
+        industry_map = get_stock_industry(config, cache) if config.USE_INDUSTRY_DEDUP else {}
+        industry_used: dict[str, int] = {}
+        confirmed = []
+        for _, candidate in df.iterrows():
+            if len(confirmed) >= max_picks:
+                break
+            row = candidate.to_dict()
+            code = str(row["code"])
+            row["tier"] = "pending"
+            missing = [] if latest is not None else ["market_date"]
+            fund = get_fundamentals(code, cache, config)
+            fund = _fill_optional_fundamentals(code, dict(fund or {}), config)
+            if not check_fundamentals(fund, config, code=code, name=str(row["name"])):
+                continue
+            row["fund_status"], fund_tags = _fund_verify_state(fund)
+            missing.extend(fund_tags)
+            verified = row["fund_status"] == "verified" and latest is not None
+            row["weekly_status"] = "disabled"
+            if weekly_enabled:
+                wk = _fetch_weekly_dual(code, config)
                 time.sleep(config.FETCH_DELAY)
-            weekly_dropped = weekly_checked - len(confirmed)
-            if weekly_dropped > 0:
-                logger.info("周线确认汇总：检查 %d 只，淘汰 %d 只", weekly_checked, weekly_dropped)
-            df = pd.DataFrame(confirmed).reset_index(drop=True) if confirmed else df.iloc[0:0]
-
-        # 推荐数量上限
-        if len(df) > max_picks:
-            logger.info("通过 %d 只，按评分截取前 %d 只（淘汰 %d 只低分信号）",
-                        len(df), max_picks, len(df) - max_picks)
-            df = df.head(max_picks).reset_index(drop=True)
+                # 在数据充分性判断前去掉半成品周线，防止检查器缺数自动放行。
+                wk = _drop_incomplete_weekly_bar(wk, config)
+                if wk is not None and not wk.empty and "date" in wk:
+                    dates = pd.to_datetime(wk["date"], errors="coerce")
+                    if latest is not None:
+                        cutoff = pd.Timestamp(latest)
+                        if config.WEEKLY_REQUIRE_CLOSED_BAR:
+                            cutoff -= pd.Timedelta(days=(cutoff.weekday() - 4) % 7)
+                        wk = wk.loc[dates.notna() & (dates <= cutoff)].copy()
+                data_ok = wk is not None and not wk.empty and "close" in wk and "date" in wk
+                if data_ok:
+                    closes = pd.to_numeric(wk["close"], errors="coerce")
+                    dates = pd.to_datetime(wk["date"], errors="coerce")
+                    data_ok = bool(np.isfinite(closes).all() and (closes > 0).all()
+                                   and dates.notna().all() and not dates.duplicated().any())
+                if data_ok and config.REQUIRE_WEEKLY_TREND:
+                    data_ok = _weekly_trend_data_ok(wk, config)
+                if data_ok and config.REQUIRE_WEEKLY_MACD_STABLE:
+                    data_ok = _weekly_macd_data_ok(wk, config)
+                if data_ok and latest is not None:
+                    expected = pd.Timestamp(latest)
+                    if config.WEEKLY_REQUIRE_CLOSED_BAR:
+                        expected -= pd.Timedelta(days=(expected.weekday() - 4) % 7)
+                    data_ok = _weekly_fresh_enough(wk, expected.strftime("%Y-%m-%d"))
+                if data_ok:
+                    if config.REQUIRE_WEEKLY_TREND and not check_weekly_trend(wk, config):
+                        continue
+                    if config.REQUIRE_WEEKLY_MACD_STABLE and not check_weekly_macd(wk, config):
+                        continue
+                    row["weekly_status"] = "confirmed"
+                else:
+                    row["weekly_status"] = "unverified"
+                    missing.append("weekly")
+                    verified = False
+            row["missing_tags"] = ",".join(dict.fromkeys(missing))
+            if not verified:
+                if pending_out is not None:
+                    pending_out.append(row)
+                continue
+            industry = industry_map.get(code, "") or ""
+            if industry and industry_used.get(industry, 0) >= config.MAX_PICKS_PER_INDUSTRY:
+                continue
+            if industry:
+                industry_used[industry] = industry_used.get(industry, 0) + 1
+            row["tier"] = "formal"
+            confirmed.append(row)
+        df = pd.DataFrame(confirmed).reset_index(drop=True) if confirmed else df.iloc[0:0]
         logger.info("筛选完成，最终推荐 %d 只放量突破股票", len(df))
         return df
 

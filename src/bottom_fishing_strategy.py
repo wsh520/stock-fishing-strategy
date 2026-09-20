@@ -183,15 +183,13 @@ class StrategyConfig:
     # trailing 3 年 ROE 依旧漂亮、股价跌出低位、PE 因下跌而变低——三大闸门全部通过（价值陷阱）。
     # 本层用 Baostock query_growth_data 的最新报告期「净利润同比增长率(YOYNI)」做前瞻刹车：
     # 同比 < FORWARD_NI_YOY_MIN（%）判为当年明显恶化 → FAIL_FORWARD 否决。
-    # 数据缺失（AkShare 兜底日 / 该接口无返回）默认不否决也不降级（见 FORWARD_MISSING_AS_PENDING），
-    # 即刹车「仅在成长数据可得时生效」，避免主源不可用当天把全部正式推荐打成待核验。
+    # 数据缺失或报告期过旧默认降级为待核验，不把未确认的近期业绩视为通过。
     REQUIRE_FORWARD_CONFIRMATION: bool = True
     FORWARD_NI_YOY_MIN: float = -30.0
     # 成长数据缺失（AkShare 兜底日 / 离线环境 / 该接口无返回）时是否降级为待核验。
-    # 默认 False：刹车「仅在数据可得时生效」，缺失不否决也不降级——与商誉/扣非等
-    # 可选指标「缺失不误杀」一致，避免主源不可用当天把全部正式推荐打成 pending。
-    # 设 True 则缺失即记「forward」缺项 → pending（更严，但 baostock 不可用当天会零推荐）。
-    FORWARD_MISSING_AS_PENDING: bool = False
+    # 默认 True；显式 False 可恢复缺失放行，标签仍显示未核验。
+    # 主源不可用时可能没有正式推荐，应按数据覆盖不足处理。
+    FORWARD_MISSING_AS_PENDING: bool = True
 
     # ===== 综合分下限（#3：宁缺毋滥）=====
     # quality_value 综合分 = 0.50×质量 + 0.35×估值 + 0.15×技术（0~100）。
@@ -1457,8 +1455,8 @@ def _fund_verify_state(fund_data: Optional[dict]) -> tuple[str, list[str]]:
         return "missing", ["fund"]
     tags: list[str] = []
     core_ok = True
-    if fund_data.get("roe") is None: core_ok = False; tags.append("fund_roe")
-    if fund_data.get("debt_ratio") is None: core_ok = False; tags.append("fund_debt")
+    if _num_or_none(fund_data.get("roe")) is None: core_ok = False; tags.append("fund_roe")
+    if _num_or_none(fund_data.get("debt_ratio")) is None: core_ok = False; tags.append("fund_debt")
     if fund_data.get("goodwill_ratio") is None: tags.append("fund_goodwill")
     if fund_data.get("deducted_profit_ratio") is None: tags.append("fund_deducted")
     return ("verified" if core_ok else "partial"), tags
@@ -1752,7 +1750,7 @@ def _num_or_none(v: Any) -> Optional[float]:
         f = float(v)
     except (TypeError, ValueError):
         return None
-    return None if pd.isna(f) else f
+    return f if np.isfinite(f) else None
 
 
 def _atr_risk_level(atr_pct: float, limit: float) -> str:
@@ -2431,6 +2429,10 @@ def build_industry_valuation_snapshot(config: StrategyConfig, cache: CacheManage
     pe_by_ind: dict[str, list] = {}
     pb_by_ind: dict[str, list] = {}
     lock = threading.Lock()
+    index = get_index_daily(config, cache)
+    if index is None or index.empty:
+        return {}
+    snapshot_day = str(index.iloc[-1]["date"])[:10]
 
     def collect(stock: dict) -> None:
         code = str(stock.get("code", ""))
@@ -2441,6 +2443,8 @@ def build_industry_valuation_snapshot(config: StrategyConfig, cache: CacheManage
         if daily is None or daily.empty:
             return
         last = daily.iloc[-1]
+        if str(last.get("date", ""))[:10] != snapshot_day:
+            return
         pe = _finite_positive_or_none(last.get("peTTM"))
         pb = _finite_positive_or_none(last.get("pbMRQ"))
         if pe is None and pb is None:
@@ -2545,6 +2549,8 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
     if ((window["high"] < window[["open", "close", "low"]].max(axis=1)) |
             (window["low"] > window[["open", "close", "high"]].min(axis=1))).any():
         return None, "FAIL_DATA"
+    if float(df["amount"].tail(20).mean()) < config.MIN_AMOUNT:
+        return None, "FAIL_LIQUIDITY"
     last = df.iloc[-1]
     close = float(last["close"])
     lo, hi = float(window["low"].min()), float(window["high"].max())
@@ -2602,16 +2608,29 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
     missing.extend(quality.get("missing_tags", []))
     if quality["status"] != "verified" and not quality.get("missing_tags"):
         missing.append("fund_annual")
-    # 前瞻确认（#4b）：当年净利同比明显恶化 → 否决（价值陷阱刹车）。仅对非金融企业生效
-    # （金融股已走 financial_review 待核验，不套普通企业成长规则）。成长数据缺失时默认
-    # 不否决也不降级（FORWARD_MISSING_AS_PENDING=False，刹车仅在数据可得时生效）；
-    # 置 True 则缺失记「forward」缺项 → 待核验。
+    # 最近应披露季度的同比核验；缺失、报告期过旧或晚于决策日均不算已确认。
+    forward_verified = False
     if getattr(config, "REQUIRE_FORWARD_CONFIRMATION", False) and not financial:
         ni_yoy = finite(fund.get("forward_ni_yoy"))
-        if ni_yoy is not None:
+        period = str(fund.get("forward_stat_date") or "")
+        decision = datetime.strptime(day, _DATE_FMT)
+        expected_year, expected_quarter = _quarter_candidates(decision, n=1)[0]
+        # 1–4月年报尚未全部披露，允许上一年三季报；已披露年报也有效。
+        if decision.month < 5:
+            expected_quarter = 3
+        try:
+            year_text, quarter_text = period.split("Q")
+            year, quarter = int(year_text), int(quarter_text)
+            period_end = pd.Timestamp(year=year, month=quarter * 3, day=1) + pd.offsets.MonthEnd(0)
+            forward_verified = (1 <= quarter <= 4 and
+                (year, quarter) >= (expected_year, expected_quarter) and
+                period_end.date() <= decision.date() and ni_yoy is not None)
+        except (ValueError, TypeError, OverflowError):
+            forward_verified = False
+        if forward_verified:
             if ni_yoy < float(config.FORWARD_NI_YOY_MIN):
                 return None, "FAIL_FORWARD"
-        elif getattr(config, "FORWARD_MISSING_AS_PENDING", False):
+        elif getattr(config, "FORWARD_MISSING_AS_PENDING", True):
             missing.append("forward")
     # 技术缺项只影响标签/分数，绝不覆盖财务和估值的待核验状态。
     df = _recompute_pct_chg(df)
@@ -2630,11 +2649,15 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
         if not kdj_not_overheated(technical, config.KDJ_K_HARD_MAX, config.KDJ_DEAD_CROSS_K):
             return None, "FAIL_KDJ_HIGH"
     quality_score = float(quality.get("quality_score", 0))
-    valuation_score = (50 * (1 - pe / config.MAX_PE_TTM) +
-                       50 * (1 - pb / config.MAX_PB_MRQ)) if pe is not None and pb is not None else 0.0
-    # 行业相对估值下，「行业内便宜」的票绝对 PE/PB 可能超过 MAX_PE_TTM/MAX_PB_MRQ，
-    # 上式会变负；排序分钳到 [0,100]，避免负估值分把行业相对便宜票错误压到末位。
-    valuation_score = min(100.0, max(0.0, valuation_score))
+    # 每个指标的评分与其准入口径一致；样本不足的单项仍用绝对估值。
+    valuation_components = []
+    for value, cap, key in ((pe, config.MAX_PE_TTM, "pe_pct"),
+                            (pb, config.MAX_PB_MRQ, "pb_pct")):
+        pct = val_context.get(key) if industry_mode else None
+        component = 100 * (1 - pct) if pct is not None else (
+            100 * (1 - value / cap) if value is not None else 0.0)
+        valuation_components.append(min(100.0, max(0.0, component)))
+    valuation_score = sum(valuation_components) / 2 if pe is not None and pb is not None else 0.0
     score = round(config.QUALITY_SCORE_WEIGHT * quality_score +
                   config.VALUATION_SCORE_WEIGHT * valuation_score +
                   config.TECHNICAL_SCORE_WEIGHT * tech_score, 2)
@@ -2667,7 +2690,10 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
             tags.append("行业估值分位" + "/".join(_pp))
     _ni = finite(fund.get("forward_ni_yoy"))
     if _ni is not None:
-        tags.append(f"当年净利{_ni:+.0f}%")
+        label = "净利同比" if forward_verified else "历史净利同比（未确认）"
+        tags.append(f"{fund.get('forward_stat_date') or '报告期未知'} {label}{_ni:+.0f}%")
+    elif getattr(config, "REQUIRE_FORWARD_CONFIRMATION", False):
+        tags.append("近期业绩待核验")
     atr = finite(d.get("atr"))
     rr = compute_risk_reward(close, config, atr)
     return Signal(

@@ -8,9 +8,9 @@
   （schema.sql 保留为表结构文档与手动建库参考，二者内容保持一致）。
 
 追踪口径：
-- 每条推荐记录最多追踪 TRACK_MAX_WEEKS=4 周（约一个月），且推荐日起 TRACK_MAX_AGE_DAYS=31
-  天后强制退出追踪（双保险，防止周任务中断导致超期）；
-- 收益值 = 最新收盘价 - 推荐时收盘价；收益率 = 收益值 / 推荐时收盘价 × 100%。
+- 固定推荐后第5/10/15/20个市场交易日；推荐后60日内允许补跑；
+- 同一推荐、收盘日期唯一；历史重复保留并标记，不以错误周号判定完成；
+- 收益值 = 目标日收盘价 - 推荐时收盘价；收益率 = 收益值 / 推荐价 × 100%。
 
 信号归因：get_attribution_rows() 返回近 N 天推荐 × 周度追踪的明细，
 由 run_monthly_attribution.py 聚合为各信号维度（等级/底背离/市场环境/持有周次）的
@@ -35,9 +35,10 @@ except ImportError:
     pymysql = None
     _PYMYSQL_AVAILABLE = False
 
-# 追踪窗口：推荐日起 31 天内、最多 4 次周度追踪（≈ 一个月）
-TRACK_MAX_AGE_DAYS = 31
+# 查询窗口保留补跑余量；实际收益期限固定，不使用任意最新价。
+TRACK_MAX_AGE_DAYS = 60  # 为长假及周任务补跑保留余量；观测期限仍止于第20交易日
 TRACK_MAX_WEEKS = 4
+TRACK_HORIZONS = (5, 10, 15, 20)
 
 _ENV_KEYS = ("MYSQL_HOST", "MYSQL_USER", "MYSQL_PASSWORD", "MYSQL_DATABASE")
 
@@ -85,12 +86,17 @@ CREATE TABLE IF NOT EXISTS stock_tracking (
     week_no       TINYINT         NOT NULL COMMENT '第几次追踪（1起，最多4）',
     track_date    DATE            NOT NULL COMMENT '本次追踪执行日期',
     close_date    DATE            NOT NULL COMMENT '收盘价对应的实际交易日',
-    close_price   DECIMAL(10, 3)  NOT NULL COMMENT '最新收盘价（元）',
+    holding_trade_days TINYINT UNSIGNED NULL COMMENT '推荐后市场交易日数；旧记录未知为NULL',
+    legacy_duplicate TINYINT NOT NULL DEFAULT 0 COMMENT '保留的历史同日重复记录',
+    unique_close_date DATE GENERATED ALWAYS AS (CASE WHEN legacy_duplicate = 0 THEN close_date ELSE NULL END) STORED,
+    close_price   DECIMAL(10, 3)  NOT NULL COMMENT '目标交易日收盘价（元）',
     return_value  DECIMAL(10, 3)  NOT NULL COMMENT '收益值 = close_price - 推荐时收盘价（元）',
     return_pct    DECIMAL(8, 3)   NOT NULL COMMENT '收益率 = return_value / 推荐时收盘价 × 100（%）',
     created_at    DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '写入时间',
     PRIMARY KEY (id),
-    UNIQUE KEY uk_rec_week (rec_id, week_no),
+    KEY idx_rec_week (rec_id, week_no),
+    UNIQUE KEY uk_rec_close_date (rec_id, unique_close_date),
+    UNIQUE KEY uk_rec_horizon (rec_id, holding_trade_days),
     KEY idx_code_track (code, track_date),
     KEY idx_track_date (track_date),
     CONSTRAINT fk_tracking_rec FOREIGN KEY (rec_id) REFERENCES stock_recommendation (id)
@@ -188,7 +194,45 @@ def _ensure_tables(conn) -> None:
                 "ADD UNIQUE KEY uk_rec_date_code_strategy (rec_date, code, strategy)"
             )
             logger.info("stock_recommendation 唯一键已升级为 (rec_date, code, strategy)")
+    _ensure_tracking_schema(conn)
     _tables_ready = True
+
+
+def _ensure_tracking_schema(conn) -> None:
+    """非破坏迁移：同日历史重复保留原值，仅最早一行参与日期唯一约束。"""
+    with conn.cursor() as cur:
+        cur.execute("SELECT GET_LOCK('stock_tracking_schema_v2', 30)")
+        if cur.fetchone()[0] != 1:
+            raise RuntimeError("无法获取追踪表迁移锁")
+        try:
+            cur.execute("SELECT COLUMN_NAME FROM information_schema.COLUMNS "
+                        "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'stock_tracking'")
+            columns = {r[0] for r in cur.fetchall()}
+            additions = {
+                "holding_trade_days": "TINYINT UNSIGNED NULL COMMENT '推荐后市场交易日数；旧记录未知为NULL'",
+                "legacy_duplicate": "TINYINT NOT NULL DEFAULT 0 COMMENT '保留的历史同日重复记录'",
+                "unique_close_date": "DATE GENERATED ALWAYS AS (CASE WHEN legacy_duplicate = 0 THEN close_date ELSE NULL END) STORED",
+            }
+            for name, definition in additions.items():
+                if name not in columns:
+                    cur.execute(f"ALTER TABLE stock_tracking ADD COLUMN {name} {definition}")
+            cur.execute("SELECT DISTINCT INDEX_NAME FROM information_schema.STATISTICS "
+                        "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'stock_tracking'")
+            indexes = {r[0] for r in cur.fetchall()}
+            if "uk_rec_close_date" not in indexes:
+                cur.execute("UPDATE stock_tracking t JOIN stock_tracking earlier "
+                            "ON earlier.rec_id = t.rec_id AND earlier.close_date = t.close_date "
+                            "AND earlier.id < t.id SET t.legacy_duplicate = 1")
+                cur.execute("ALTER TABLE stock_tracking ADD UNIQUE KEY "
+                            "uk_rec_close_date (rec_id, unique_close_date)")
+            if "uk_rec_horizon" not in indexes:
+                cur.execute("ALTER TABLE stock_tracking ADD UNIQUE KEY "
+                            "uk_rec_horizon (rec_id, holding_trade_days)")
+            if "uk_rec_week" in indexes:
+                cur.execute("ALTER TABLE stock_tracking DROP INDEX uk_rec_week, "
+                            "ADD KEY idx_rec_week (rec_id, week_no)")
+        finally:
+            cur.execute("SELECT RELEASE_LOCK('stock_tracking_schema_v2')")
 
 
 def _f(v: Any) -> Optional[float]:
@@ -262,19 +306,26 @@ def save_recommendations(df: Optional[pd.DataFrame], strategy: str = STRATEGY_BO
 
 def get_active_recommendations(max_age_days: int = TRACK_MAX_AGE_DAYS,
                                max_weeks: int = TRACK_MAX_WEEKS) -> list[dict]:
-    """查询仍在追踪期内的推荐记录：推荐日起 max_age_days 天内，且已追踪次数 < max_weeks。"""
+    """查询窗口内尚未完成固定期限的推荐；返回上次日期及已观测日期/期限。
+
+    tracked_weeks 保留兼容字段，含义改为不同收盘日数，历史错计周号不占额度。
+    """
     if not is_configured():
         logger.info("MySQL 未配置，无法执行周度追踪")
         return []
 
     sql = """
         SELECT r.id, r.rec_date, r.code, r.name, r.rec_close, r.strategy,
-               COALESCE(MAX(t.week_no), 0) AS tracked_weeks
+               COUNT(DISTINCT t.close_date) AS tracked_weeks,
+               MAX(t.close_date) AS last_close_date,
+               GROUP_CONCAT(DISTINCT t.close_date) AS tracked_close_dates,
+               GROUP_CONCAT(DISTINCT t.holding_trade_days) AS tracked_horizons,
+               COUNT(DISTINCT t.holding_trade_days) AS completed_horizons
         FROM stock_recommendation r
         LEFT JOIN stock_tracking t ON t.rec_id = r.id
         WHERE r.rec_date >= CURDATE() - INTERVAL %s DAY
         GROUP BY r.id, r.rec_date, r.code, r.name, r.rec_close, r.strategy
-        HAVING tracked_weeks < %s
+        HAVING completed_horizons < %s
         ORDER BY r.rec_date DESC, r.id
     """
     try:
@@ -317,11 +368,19 @@ def fetch_rec_codes_for_date(rec_date: str) -> set[str]:
 
 
 def save_tracking(rec_id: int, rec_date: Any, code: str, week_no: int,
-                  close_date: str, close_price: float, rec_close: float) -> bool:
-    """写入一条周度追踪记录。收益值/收益率在写入前计算；(rec_id, week_no) 重复时忽略。"""
+                  close_date: str, close_price: float, rec_close: float,
+                  holding_trade_days: int | None = None) -> bool:
+    """同推荐同收盘日幂等；可选固定期限保持旧调用兼容，未知期限不猜测。"""
     if not is_configured():
         return False
 
+    close_date = pd.Timestamp(close_date).date().isoformat()
+    if (close_date <= pd.Timestamp(rec_date).date().isoformat()
+            or not 1 <= int(week_no) <= TRACK_MAX_WEEKS
+            or (holding_trade_days is not None and holding_trade_days != int(week_no) * 5)
+            or not 0 < float(rec_close) < float('inf')
+            or not 0 < float(close_price) < float('inf')):
+        return False
     return_value = round(float(close_price) - float(rec_close), 3)
     return_pct = round(return_value / float(rec_close) * 100, 3) if rec_close else 0.0
     track_date = date.today().strftime("%Y-%m-%d")
@@ -329,8 +388,11 @@ def save_tracking(rec_id: int, rec_date: Any, code: str, week_no: int,
 
     sql = """
         INSERT IGNORE INTO stock_tracking
-        (rec_id, rec_date, code, week_no, track_date, close_date, close_price, return_value, return_pct)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+        (rec_id, rec_date, code, week_no, track_date, close_date, close_price, return_value, return_pct, holding_trade_days)
+        SELECT %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+        FROM DUAL WHERE NOT EXISTS (
+            SELECT 1 FROM stock_tracking WHERE rec_id = %s AND close_date = %s
+        )
     """
     try:
         conn = _connect()
@@ -341,7 +403,8 @@ def save_tracking(rec_id: int, rec_date: Any, code: str, week_no: int,
                 inserted = cur.execute(sql, (
                     int(rec_id), rec_date_str, str(code), int(week_no),
                     track_date, str(close_date), round(float(close_price), 3),
-                    return_value, return_pct,
+                    return_value, return_pct, holding_trade_days,
+                    int(rec_id), close_date,
                 ))
             return bool(inserted)
         finally:
@@ -356,7 +419,8 @@ def get_attribution_rows(days: int = 90) -> list[dict]:
 
     返回逐条明细（一条 = 某推荐的第某周观测），字段：
     rec_date / code / name / grade / has_divergence / market_env / score / daily_score
-    / week_no / return_pct；聚合（每条推荐的最新收益、峰值收益等）由调用方用 pandas 完成。
+    / week_no / return_pct / track_date / close_date / holding_trade_days / holding_calendar_days；
+    固定期限聚合由调用方完成，旧行 holding_trade_days=NULL，不从旧 week_no 推断。
     仅返回至少有一次追踪记录的推荐（尚未被追踪的新推荐不参与归因）。
     """
     if not is_configured():
@@ -365,7 +429,10 @@ def get_attribution_rows(days: int = 90) -> list[dict]:
 
     sql = """
         SELECT r.id, r.rec_date, r.code, r.name, r.grade, r.has_divergence, r.market_env,
-               r.score, r.daily_score, r.strategy, t.week_no, t.return_pct
+               r.score, r.daily_score, r.strategy, t.week_no, t.return_pct,
+               t.id AS tracking_id, t.track_date, t.close_date, t.holding_trade_days,
+               DATEDIFF(t.close_date, r.rec_date) AS holding_calendar_days,
+               t.legacy_duplicate
         FROM stock_recommendation r
         JOIN stock_tracking t ON t.rec_id = r.id
         WHERE r.rec_date >= CURDATE() - INTERVAL %s DAY
