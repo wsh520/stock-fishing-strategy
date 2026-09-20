@@ -2,22 +2,29 @@
 
 ## 目标与资格
 
-默认 RECOMMENDATION_MODE=quality_value。bottom_fishing 与 volume_breakout 共用 evaluate_quality_value 和 _screen_quality_pool。保留 technical 模式供旧规则回归对照，不更改交易撮合。
+默认 RECOMMENDATION_MODE=quality_value（**抄底入口 run.py**）。bottom_fishing 的 quality_value 路径使用 evaluate_quality_value 和 _screen_quality_pool。**放量突破入口 run_breakout.py 已改为独立的 technical 模式**（#1），跑自己的七层突破漏斗，不再委派 quality_value 资格；两入口的重叠由组合层同日去重、合计上限 DAILY_TOTAL_MAX_PICKS 约束。保留 technical 模式供旧规则回归对照，不更改交易撮合。
 
 1. 非金融企业最近连续3个可用完整年度：ROE中位数至少10%、各年至少5%、扣非净利各年为正；累计经营现金流/累计合并净利润至少0.8，累计净利润须为正。季度年化ROE不再代替年度质量。年度缺失、非有限数不能进入正式推荐。
-2. 当前 PE TTM 和 PB MRQ 必须齐全、有限且为正，分别不超过25、3；即使关闭旧USE_VALUATION_FILTER，新模式也必须核验。已知估值不达标直接否决，缺项为pending。
+2. 估值（#4a 行业相对）：默认 USE_INDUSTRY_RELATIVE_VALUATION=True，个股 PE/PB 在其所属行业当日横截面的分位 ≤ VALUATION_INDUSTRY_PERCENTILE_MAX(0.60) 才算便宜；行业数据缺失或行业内可比样本 < VALUATION_INDUSTRY_MIN_PEERS(5) 时自动回退绝对阈值（0<PE TTM≤25、0<PB MRQ≤3）。两种口径下 PE/PB 必须齐全、有限、为正，≤0 直接否决，缺项为 pending。横截面快照由 build_industry_valuation_snapshot 在筛选前用全池日线构建一次（复用缓存、不额外取数）。
 3. 价格处于最近250根有效成交日线最高/最低区间的下40%。至少250根；最新零量/零成交额、日期滞后、不合法OHLC否决。取数窗口从120增为600自然日。中期低位不代表低估，必须同时通过前两条。
-4. 保留已知商誉超限排雷及负债率<=70%核验。金融企业依旧按现有名称/代码识别，输出financial_review并留待行业专项核验，不套普通企业现金转换率。行业识别仍需后续完善，不能据此声称覆盖全部金融子行业。
+4. 前瞻确认（#4b）：REQUIRE_FORWARD_CONFIRMATION=True 时，用 Baostock query_growth_data 最新报告期净利润同比(YOYNI)做刹车，同比 < FORWARD_NI_YOY_MIN(-30%) → FAIL_FORWARD 否决（对治「trailing 年报漂亮、当年正在崩」的价值陷阱）。成长数据缺失默认不否决也不降级（FORWARD_MISSING_AS_PENDING=False，刹车仅在数据可得时生效）；置 True 则缺失记「forward」缺项 → pending。仅主源 Baostock 提供，AkShare 兜底日按缺失处理。
+5. 综合分下限（#3）：MIN_QV_SCORE=60，综合分 < 60 的 formal 候选否决（FAIL_QV_SCORE）。仅对「将要成为正式推荐」（missing 为空）的候选生效——pending 的估值分因数据缺失被记为 0、综合分被人为压低，对其套下限无意义。设 0 关闭。
+6. 保留已知商誉超限排雷及负债率<=70%核验。金融企业依旧按现有名称/代码识别，输出financial_review并留待行业专项核验，不套普通企业现金转换率与前瞻确认。行业识别仍需后续完善，不能据此声称覆盖全部金融子行业。
+
+## 市场级刹车（#2）
+
+此前 quality_value 在 main() 提前 return，绕过了组合层风控（急跌中反而出票更多）。现已把以下两项移到 quality_value 分支之前、两种模式共用：
+
+- 急跌熔断：沪深300 近 MARKET_CRASH_LOOKBACK(5) 个交易日累计跌幅 ≤ MARKET_CRASH_HALT_PCT(-4%) → 本次运行不推荐。
+- 推荐数量按 regime 收缩：牛 MAX_PICKS(5) / 中性 NEUTRAL_MAX_PICKS(4) / 熊 BEAR_MAX_PICKS(2)，由 resolve_max_picks 解析后作为 max_picks 传入 _screen_quality_pool 截取；unknown 经 _effective_regime 折叠为熊。
+
+ATR 交易风险门槛、20日位置、短期涨幅、RSI上限、KDJ确认、周线确认仍只作用于 technical 路径，不作为 quality_value 的硬闸门。
 
 ## 排序与标签
 
-score=0.50*quality_score+0.35*valuation_score+0.15*daily_score，各项0至100。质量分为连续ROE中位数/最低ROE/现金转换率分数，权重50%/25%/25%；各维度达到准入阈值为50分，默认25%/15%/1.5饱和100分。扣非盈利是硬条件，不重复计分。缺项候选分数仅用于待核验顺序。
+score=0.50*quality_score+0.35*valuation_score+0.15*daily_score，各项0至100。质量分为连续ROE中位数/最低ROE/现金转换率分数，权重50%/25%/25%；各维度达到准入阈值为50分，默认25%/15%/1.5饱和100分。扣非盈利是硬条件，不重复计分。估值分在绝对上限内按PE/PB线性评分，行业相对模式下「行业内便宜但绝对 PE/PB 偏高」的票估值分会被钳到 [0,100]（不为负）。缺项候选分数仅用于待核验顺序。
 
-估值分=50*(1-PE/25)+50*(1-PB/3)，仅在已满足正值与上限时计算；未引入历史分位或行业估值以避免增加数据依赖。该分数不是低估幅度或收益概率。
-
-技术沿用既有日线计算，MA/EMA、MACD、RSI、量价提供分数，底背离及放量突破提供标签。放量突破使用旧形态检测器，仅标签，不作为第二个独立荐股资格。两个入口共享标签以免去重后丢失信息。
-
-20日位置、短期涨幅、RSI上限、KDJ确认、周线确认、ATR与市场急跌不再作为新模式的硬闸门；大盘仅说明，推荐数固定MAX_PICKS上限，行业上限继续保留。价格跌得更深不再加分。综合分不需要达到旧技术B级门槛，等级只是展示。
+技术沿用既有日线计算，MA/EMA、MACD、RSI、量价提供分数，底背离提供标签。入选依据另会附加「行业估值分位PE../PB..」「当年净利±..%」（对应数据可得时），便于人工裁量。价格跌得更深不再加分。等级只是展示，不再有旧技术B级准入门槛（准入由 MIN_QV_SCORE 综合分下限承担）。
 
 ## 数据与分层
 
@@ -33,9 +40,14 @@ formal要求年度、负债率、PE、PB及行情日期均已核验；pending单
 
 - python -B -m unittest test_fundamental_quality test_quality_recommendations -v
 - python -B -m unittest discover -s tests -p test_quality_backtest_persistence.py -v
+- python -B -m unittest test_recommendation_upgrades -v   # 本次四项升级（#1~#4）专用回归
 - python -B test_entry_filters.py
 - python -B test_main_layering.py
 - python -B test_strategy_fixes.py
 - python -B test_optimizations_p0.py
+- python -B test_momentum_gates.py
+- python -B test_breakout_ab.py
 
-旧四个脚本显式设technical，验证旧对照分支；新测试验证默认规则，包括缺估值/年报只能pending、已知质量失败不可被技术分掩盖、长期低位但短期已反弹仍可推荐、两入口一致、核验后再取TopN及严格落库。全部为离线合成/真实字段fixture，不代表盈利能力验证。
+旧脚本显式设technical，验证旧对照分支；新测试验证默认规则，包括缺估值/年报只能pending、已知质量失败不可被技术分掩盖、长期低位但短期已反弹仍可推荐、核验后再取TopN及严格落库。test_recommendation_upgrades 覆盖四项升级：综合分下限（仅 formal 生效、pending 不受其累）、前瞻确认（恶化否决/健康放行并打标签/缺失行为可配/边界等于阈值放行）、行业相对估值（分位计算、回退条件、行业便宜放行而绝对贵、行业贵否决而绝对便宜、负PE仍否决、快照构建与空行业回退）、突破独立（technical 不委派 quality_value、run_breakout 强制 technical）、市场级刹车（急跌熔断在筛选前拦截、熊/牛 regime 数量收缩、_screen_quality_pool 按 max_picks 截取）。全部为离线合成/真实字段fixture，不代表盈利能力验证。
+
+注：test_quality_recommendations 的合格样本 fixture 已上调（年度 ROE 18/20/22、PE8/PB0.9），使其综合分稳过生产默认下限 MIN_QV_SCORE=60；test_momentum_gates 的 quality_value 节关闭该下限（MIN_QV_SCORE=0）以隔离 KDJ/MACD 闸门归因。

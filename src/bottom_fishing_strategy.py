@@ -165,6 +165,41 @@ class StrategyConfig:
     # 市净率（MRQ）上限：> 上限判为偏贵，否决；≤ 0（净资产为负/异常）一并否决
     MAX_PB_MRQ: float = 3.0
 
+    # ===== 行业相对估值（#4a）=====
+    # 绝对阈值（PE≤25 / PB≤3）全市场一刀切，会系统性误杀「高估值但优质」的成长/科技/医药，
+    # 并把名单压向银行/地产/周期等低 PE/PB 板块（低 PE 本身常是市场对衰退的定价＝价值陷阱）。
+    # 开启后估值闸门改为「行业内分位」：个股 PE/PB 在其所属行业当日横截面中的分位 ≤
+    # VALUATION_INDUSTRY_PERCENTILE_MAX 才算便宜（0.60＝至少比业内 40% 的同行便宜）。
+    # 行业数据缺失、或行业内可比样本 < VALUATION_INDUSTRY_MIN_PEERS 时，**自动回退**到上面的
+    # 绝对阈值（USE_VALUATION_FILTER / MAX_PE_TTM / MAX_PB_MRQ），保证行业接口挂掉时不误放行。
+    # 横截面快照由 build_industry_valuation_snapshot 在筛选前一次性构建（复用缓存的日线，
+    # 不额外增加取数成本）；回测/单测未提供快照时同样走绝对阈值回退，口径与改动前一致。
+    USE_INDUSTRY_RELATIVE_VALUATION: bool = True
+    VALUATION_INDUSTRY_PERCENTILE_MAX: float = 0.60
+    VALUATION_INDUSTRY_MIN_PEERS: int = 5
+
+    # ===== 前瞻确认：当年成长未恶化（#4b）=====
+    # 年度质量（最近3个完整年报）与 PE/PB 都是「后视镜」：一家公司当年基本面刚崩，
+    # trailing 3 年 ROE 依旧漂亮、股价跌出低位、PE 因下跌而变低——三大闸门全部通过（价值陷阱）。
+    # 本层用 Baostock query_growth_data 的最新报告期「净利润同比增长率(YOYNI)」做前瞻刹车：
+    # 同比 < FORWARD_NI_YOY_MIN（%）判为当年明显恶化 → FAIL_FORWARD 否决。
+    # 数据缺失（AkShare 兜底日 / 该接口无返回）默认不否决也不降级（见 FORWARD_MISSING_AS_PENDING），
+    # 即刹车「仅在成长数据可得时生效」，避免主源不可用当天把全部正式推荐打成待核验。
+    REQUIRE_FORWARD_CONFIRMATION: bool = True
+    FORWARD_NI_YOY_MIN: float = -30.0
+    # 成长数据缺失（AkShare 兜底日 / 离线环境 / 该接口无返回）时是否降级为待核验。
+    # 默认 False：刹车「仅在数据可得时生效」，缺失不否决也不降级——与商誉/扣非等
+    # 可选指标「缺失不误杀」一致，避免主源不可用当天把全部正式推荐打成 pending。
+    # 设 True 则缺失即记「forward」缺项 → pending（更严，但 baostock 不可用当天会零推荐）。
+    FORWARD_MISSING_AS_PENDING: bool = False
+
+    # ===== 综合分下限（#3：宁缺毋滥）=====
+    # quality_value 综合分 = 0.50×质量 + 0.35×估值 + 0.15×技术（0~100）。
+    # 此前只用于排序、无下限：只要有票通过硬闸门就凑满 MAX_PICKS。开启后综合分 <
+    # MIN_QV_SCORE 的候选直接否决（FAIL_QV_SCORE），弱市自然收敛到少推/不推。
+    # 设 0 关闭该闸门（恢复改动前行为）。
+    MIN_QV_SCORE: float = 60.0
+
     DAILY_MA5: int = 5
     DAILY_MA10: int = 10
     DAILY_EMA5: int = 5
@@ -806,6 +841,65 @@ def _fetch_fundamentals_bs(code: str, config: Optional[StrategyConfig] = None) -
     if path: _write_cache_json(result, path)
     return result
 
+def _fetch_growth_bs(code: str, config: Optional[StrategyConfig] = None) -> Optional[dict]:
+    """Baostock 成长能力（query_growth_data）：取最新已披露报告期的净利润同比(YOYNI)。
+
+    用于「前瞻确认」闸门（REQUIRE_FORWARD_CONFIRMATION）：年度质量与 PE/PB 都是后视镜，
+    当年净利大幅下滑（同比 < FORWARD_NI_YOY_MIN）即判为基本面正在恶化（价值陷阱）。
+    返回 {"ni_yoy": 百分比float|None, "stat_date": "YYYYQn"|None}；无数据/熔断返回 None
+    （上层记 missing_tag「forward」降级为待核验，不硬否决）。仅主源 Baostock 提供，
+    AkShare 兜底日拿不到成长数据 → 同样按缺失处理。
+    """
+    config = config or StrategyConfig()
+    if not _BS_AVAILABLE:
+        return None
+    bs_code = _format_bs_code(code)
+    quarters = _quarter_candidates(datetime.now(), n=config.FUND_LOOKBACK_QUARTERS)
+    path = ""
+    if config.USE_CACHE:
+        path = _cache_path(config, f"growth_v1_{bs_code}_{quarters[0][0]}Q{quarters[0][1]}.json")
+        if _cache_fresh(path, config.FUND_CACHE_TTL_DAYS):
+            if (cached := _read_cache_json(path)) is not None:
+                return cached
+
+    result: dict[str, Optional[float] | Optional[str]] = {"ni_yoy": None, "stat_date": None}
+    for (year, quarter) in quarters:
+        if result["ni_yoy"] is not None:
+            break
+
+        def fetch_growth(_y: int = year, _q: int = quarter):
+            _bs_guard(f"bs_growth({bs_code},{_y}Q{_q})")
+            with bs_lock:
+                rs = bs.query_growth_data(code=bs_code, year=_y, quarter=_q)
+            if getattr(rs, "error_code", None) == "0":
+                _bs_mark_success()
+                return rs
+            _bs_mark_failure()
+            raise RuntimeError(f"bs_growth({bs_code}) 查询失败: {getattr(rs, 'error_msg', '')}")
+
+        rs = _fetch_with_retry(fetch_growth, config.MAX_RETRY, f"bs_growth({bs_code},{year}Q{quarter})")
+        if not rs:
+            if _bs_state["circuit_open"]:
+                break
+            continue
+        try:
+            if getattr(rs, "error_code", None) == "0" and len(rs.data) > 0:
+                df = rs.get_data()
+                if "YOYNI" in df.columns:
+                    ni = pd.to_numeric(df["YOYNI"].iloc[0], errors="coerce")
+                    if not pd.isna(ni):
+                        # Baostock 同比为小数（0.15=15%）：×100 转百分比，与 FORWARD_NI_YOY_MIN 同口径
+                        result["ni_yoy"] = float(ni) * 100
+                        result["stat_date"] = f"{year}Q{quarter}"
+        except Exception as e:  # noqa: BLE001
+            logging.debug("成长数据解析失败(%s): %s", bs_code, e)
+
+    if result["ni_yoy"] is None:
+        return None
+    if path:
+        _write_cache_json(result, path)
+    return result
+
 def _fetch_stock_pool_bs(config: Optional[StrategyConfig] = None) -> list[dict]:
     config = config or StrategyConfig()
     path = ""
@@ -1187,6 +1281,15 @@ def get_fundamentals(code: str, cache: Optional[CacheManager] = None, config: Op
     if cache and data is not None: cache.set(cache_key, data)
     return data
 
+def get_growth(code: str, cache: Optional[CacheManager] = None, config: Optional[StrategyConfig] = None) -> Optional[dict]:
+    """最新报告期成长能力（净利润同比），供前瞻确认闸门使用。仅 Baostock 提供，
+    主源不可用/无返回时为 None（上层记「forward」缺项降级为待核验）。"""
+    cache_key = f"growth_{code}"
+    if cache and (cached := cache.get(cache_key)) is not None: return cached
+    data = _fetch_growth_bs(code, config) if _bs_available() else None
+    if cache and data is not None: cache.set(cache_key, data)
+    return data
+
 def get_stock_list(config: StrategyConfig, cache: Optional[CacheManager] = None) -> list[dict]:
     cache_key = "stock_list"
     if cache and (cached := cache.get(cache_key)) is not None: return cached
@@ -1561,6 +1664,7 @@ _MISSING_TAG_ZH = {
     "financial_review": "金融企业待专项核验",
     "valuation": "估值缺失", "pct_chg": "涨幅数据缺失", "gap": "开盘价缺失",
     "macd_mom": "MACD柱数据缺失", "kdj": "KDJ数据缺失",
+    "forward": "当年成长未核验", "valuation_industry": "行业估值样本不足",
 }
 
 def _missing_tags_zh(tags: str) -> str:
@@ -2083,18 +2187,20 @@ def _signal_hits(d_last) -> list[str]:
     return hits
 
 
-def evaluate(daily_df: Optional[pd.DataFrame], code: str = "", name: str = "", config: Optional[StrategyConfig] = None, market_env: Optional[dict] = None, fund_data: Optional[dict] = None, latest_trade_date: Optional[str] = None, volatile_out: Optional[list] = None) -> tuple[Optional[Signal], str]:
+def evaluate(daily_df: Optional[pd.DataFrame], code: str = "", name: str = "", config: Optional[StrategyConfig] = None, market_env: Optional[dict] = None, fund_data: Optional[dict] = None, latest_trade_date: Optional[str] = None, volatile_out: Optional[list] = None, val_context: Optional[dict] = None) -> tuple[Optional[Signal], str]:
     """评估单只股票。
 
     latest_trade_date：市场（沪深300）最新交易日，用于行情时效校验——
     个股最新K线日期与之一致才评估（停牌/数据滞后 → 暂不推荐），None 时跳过校验。
     volatile_out：可选 list，传入后被 FAIL_VOLATILE 否决的个股会以明细 dict 追加进去
     （供日志逐只打印与飞书高风险观察池展示）；不影响返回值与准入判定。
+    val_context：行业相对估值上下文（仅 quality_value 模式使用，见 _industry_valuation_context）；
+    None 时估值闸门回退绝对阈值。technical 模式忽略该参数。
     """
     if config is None: config = StrategyConfig()
     if config.RECOMMENDATION_MODE == "quality_value":
         return evaluate_quality_value(daily_df, code, name, config, market_env,
-                                      fund_data, latest_trade_date)
+                                      fund_data, latest_trade_date, val_context=val_context)
     regime = (market_env or {}).get("regime", "unknown")
 
     if not check_fundamentals(fund_data, config, code=code, name=name): return None, "FAIL_FUND"
@@ -2271,11 +2377,136 @@ def enrich_annual_fundamentals(code: str, fund_data: Optional[dict], config: Str
     return result
 
 
+def enrich_forward_growth(code: str, fund_data: Optional[dict], config: StrategyConfig,
+                          cache: Optional[CacheManager] = None) -> dict:
+    """把「最新报告期净利润同比」并入 fund_data（forward_ni_yoy / forward_stat_date）。
+
+    前瞻确认闸门（REQUIRE_FORWARD_CONFIRMATION）读取该字段：当年净利大幅下滑即否决，
+    对治「trailing 3 年年报漂亮、但当年基本面正在崩」的价值陷阱。拿不到成长数据时
+    不写该键 → evaluate_quality_value 记「forward」缺项降级为待核验（不硬否决）。
+    """
+    result = dict(fund_data or {})
+    if not getattr(config, "REQUIRE_FORWARD_CONFIRMATION", False):
+        return result
+    if "forward_ni_yoy" in result:
+        return result
+    growth = get_growth(code, cache, config)
+    if growth and growth.get("ni_yoy") is not None:
+        result["forward_ni_yoy"] = growth.get("ni_yoy")
+        result["forward_stat_date"] = growth.get("stat_date")
+    return result
+
+
+def _finite_positive_or_none(value) -> Optional[float]:
+    """有限且为正的浮点，否则 None（用于行业估值横截面，剔除亏损/异常/缺失）。"""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    return v if np.isfinite(v) and v > 0 else None
+
+
+def _percentile_of(sorted_vals: Optional[np.ndarray], value: float) -> Optional[float]:
+    """value 在升序数组中的分位（≤value 的占比，0~1）；数组空/None 返回 None。"""
+    if sorted_vals is None or len(sorted_vals) == 0:
+        return None
+    return float(np.searchsorted(sorted_vals, value, side="right")) / float(len(sorted_vals))
+
+
+def build_industry_valuation_snapshot(config: StrategyConfig, cache: CacheManager,
+                                      stock_list: list[dict]) -> dict:
+    """构建「行业 -> 当日 PE/PB 横截面（升序数组）」快照，供行业相对估值闸门使用。
+
+    - 关闭 USE_INDUSTRY_RELATIVE_VALUATION 或行业数据不可用 → 返回空 dict
+      （上层全市场回退到绝对阈值 MAX_PE_TTM / MAX_PB_MRQ，行业接口挂掉时不误放行）。
+    - 复用 get_daily_data 缓存：与随后的筛选阶段共享同一份日线，不额外增加取数成本
+      （快照阶段触发取数并写入内存/磁盘缓存，筛选阶段直接命中）。
+    - 仅纳入 peTTM/pbMRQ 有限且为正的样本（亏损/异常值会扭曲分位）。
+    """
+    if not getattr(config, "USE_INDUSTRY_RELATIVE_VALUATION", False):
+        return {}
+    industry_map = get_stock_industry(config, cache)
+    if not industry_map:
+        return {}
+    pe_by_ind: dict[str, list] = {}
+    pb_by_ind: dict[str, list] = {}
+    lock = threading.Lock()
+
+    def collect(stock: dict) -> None:
+        code = str(stock.get("code", ""))
+        ind = industry_map.get(code, "")
+        if not ind:
+            return
+        daily = get_daily_data(code, config, cache)
+        if daily is None or daily.empty:
+            return
+        last = daily.iloc[-1]
+        pe = _finite_positive_or_none(last.get("peTTM"))
+        pb = _finite_positive_or_none(last.get("pbMRQ"))
+        if pe is None and pb is None:
+            return
+        with lock:
+            if pe is not None:
+                pe_by_ind.setdefault(ind, []).append(pe)
+            if pb is not None:
+                pb_by_ind.setdefault(ind, []).append(pb)
+
+    try:
+        with ThreadPoolExecutor(max_workers=config.MAX_WORKERS) as pool:
+            list(pool.map(collect, stock_list))
+    except Exception as e:  # noqa: BLE001  快照失败不得阻断选股，降级为绝对阈值
+        logger.warning("行业估值快照构建失败，本次回退绝对估值阈值: %s", e)
+        return {}
+    snapshot: dict[str, dict] = {}
+    for ind in set(pe_by_ind) | set(pb_by_ind):
+        snapshot[ind] = {
+            "pe": np.sort(np.asarray(pe_by_ind.get(ind, []), dtype=float)),
+            "pb": np.sort(np.asarray(pb_by_ind.get(ind, []), dtype=float)),
+        }
+    if snapshot:
+        logger.info("行业估值快照：%d 个行业纳入横截面（行业相对估值闸门生效）", len(snapshot))
+    return snapshot
+
+
+def _industry_valuation_context(snapshot: Optional[dict], industry: str,
+                                pe: Optional[float], pb: Optional[float],
+                                config: StrategyConfig) -> Optional[dict]:
+    """计算个股在其行业内的 PE/PB 分位；返回 None 表示应回退绝对阈值。
+
+    回退条件：功能关闭 / 无快照 / 无行业归属 / 行业内可比样本 < VALUATION_INDUSTRY_MIN_PEERS。
+    返回 {"mode":"industry","pe_pct":float|None,"pb_pct":float|None,"peers":int}。
+    pe_pct/pb_pct 为 None 表示该指标在行业内样本不足，单指标各自回退绝对阈值。
+    """
+    if not getattr(config, "USE_INDUSTRY_RELATIVE_VALUATION", False):
+        return None
+    if not snapshot or not industry:
+        return None
+    bucket = snapshot.get(industry)
+    if not bucket:
+        return None
+    pe_arr, pb_arr = bucket.get("pe"), bucket.get("pb")
+    min_peers = int(getattr(config, "VALUATION_INDUSTRY_MIN_PEERS", 5))
+    pe_pct = _percentile_of(pe_arr, pe) if (pe is not None and pe_arr is not None
+                                            and len(pe_arr) >= min_peers) else None
+    pb_pct = _percentile_of(pb_arr, pb) if (pb is not None and pb_arr is not None
+                                            and len(pb_arr) >= min_peers) else None
+    if pe_pct is None and pb_pct is None:
+        return None
+    peers = max(len(pe_arr) if pe_arr is not None else 0,
+                len(pb_arr) if pb_arr is not None else 0)
+    return {"mode": "industry", "pe_pct": pe_pct, "pb_pct": pb_pct, "peers": peers}
+
+
 def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: str,
                            config: StrategyConfig, market_env: Optional[dict] = None,
                            fund_data: Optional[dict] = None,
-                           latest_trade_date: Optional[str] = None) -> tuple[Optional[Signal], str]:
-    """统一荐股资格：多年质量 + 低估值 + 250日低位；技术面不作否决。"""
+                           latest_trade_date: Optional[str] = None,
+                           val_context: Optional[dict] = None) -> tuple[Optional[Signal], str]:
+    """统一荐股资格：多年质量 + 低估值 + 250日低位 + 当年成长未恶化；技术面不作否决。
+
+    val_context：行业相对估值上下文（见 _industry_valuation_context）。None 时估值闸门
+    回退到绝对阈值（MAX_PE_TTM / MAX_PB_MRQ），与改动前口径一致。
+    """
     from src.fundamental_quality import evaluate_annual_quality
     if daily_df is None or daily_df.empty:
         return None, "FAIL_DATA"
@@ -2330,11 +2561,26 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
         except (ValueError, TypeError):
             return None
     pe, pb = finite(last.get("peTTM")), finite(last.get("pbMRQ"))
-    for value, cap, tag in ((pe, config.MAX_PE_TTM, "valuation_pe"),
-                             (pb, config.MAX_PB_MRQ, "valuation_pb")):
+    # 估值闸门（A：低估值）。两种口径：
+    #   - 行业相对（val_context 非空）：个股 PE/PB 在行业内分位 ≤ VALUATION_INDUSTRY_PERCENTILE_MAX
+    #     即算便宜（认可「高估值行业里的相对便宜票」，避免绝对阈值误杀成长/科技/医药）；
+    #   - 绝对回退（val_context 为空，或该指标行业内样本不足）：PE ≤ MAX_PE_TTM、PB ≤ MAX_PB_MRQ。
+    # 两种口径下 peTTM/pbMRQ ≤ 0（亏损/净资产异常）一律否决；缺值记缺项降级为待核验。
+    industry_mode = bool(val_context and val_context.get("mode") == "industry")
+    pct_cap = float(getattr(config, "VALUATION_INDUSTRY_PERCENTILE_MAX", 0.60))
+    for value, cap, pct_key, tag in (
+            (pe, config.MAX_PE_TTM, "pe_pct", "valuation_pe"),
+            (pb, config.MAX_PB_MRQ, "pb_pct", "valuation_pb")):
         if value is None:
             missing.append(tag)
-        elif value <= 0 or value > cap:
+            continue
+        if value <= 0:
+            return None, "FAIL_VALUATION"
+        pct = val_context.get(pct_key) if industry_mode else None
+        if pct is not None:
+            if pct > pct_cap:
+                return None, "FAIL_VALUATION"
+        elif value > cap:
             return None, "FAIL_VALUATION"
     fund = fund_data or {}
     debt = finite(fund.get("debt_ratio"))
@@ -2356,6 +2602,17 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
     missing.extend(quality.get("missing_tags", []))
     if quality["status"] != "verified" and not quality.get("missing_tags"):
         missing.append("fund_annual")
+    # 前瞻确认（#4b）：当年净利同比明显恶化 → 否决（价值陷阱刹车）。仅对非金融企业生效
+    # （金融股已走 financial_review 待核验，不套普通企业成长规则）。成长数据缺失时默认
+    # 不否决也不降级（FORWARD_MISSING_AS_PENDING=False，刹车仅在数据可得时生效）；
+    # 置 True 则缺失记「forward」缺项 → 待核验。
+    if getattr(config, "REQUIRE_FORWARD_CONFIRMATION", False) and not financial:
+        ni_yoy = finite(fund.get("forward_ni_yoy"))
+        if ni_yoy is not None:
+            if ni_yoy < float(config.FORWARD_NI_YOY_MIN):
+                return None, "FAIL_FORWARD"
+        elif getattr(config, "FORWARD_MISSING_AS_PENDING", False):
+            missing.append("forward")
     # 技术缺项只影响标签/分数，绝不覆盖财务和估值的待核验状态。
     df = _recompute_pct_chg(df)
     technical = compute_daily_signals(df, config)
@@ -2375,9 +2632,19 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
     quality_score = float(quality.get("quality_score", 0))
     valuation_score = (50 * (1 - pe / config.MAX_PE_TTM) +
                        50 * (1 - pb / config.MAX_PB_MRQ)) if pe is not None and pb is not None else 0.0
+    # 行业相对估值下，「行业内便宜」的票绝对 PE/PB 可能超过 MAX_PE_TTM/MAX_PB_MRQ，
+    # 上式会变负；排序分钳到 [0,100]，避免负估值分把行业相对便宜票错误压到末位。
+    valuation_score = min(100.0, max(0.0, valuation_score))
     score = round(config.QUALITY_SCORE_WEIGHT * quality_score +
                   config.VALUATION_SCORE_WEIGHT * valuation_score +
                   config.TECHNICAL_SCORE_WEIGHT * tech_score, 2)
+    # 综合分下限（#3：宁缺毋滥）。低于 MIN_QV_SCORE 的候选不推荐——弱市自然收敛到少推/不推，
+    # 不再「只要有票过硬闸门就凑满 MAX_PICKS」。设 0 关闭该闸门。
+    # 仅对「将要成为正式推荐」（missing 为空）的候选生效：待核验候选的估值分因数据缺失被
+    # 记为 0、综合分被人为压低，对其套下限没有意义（且 pending 本就不进正式推荐）。
+    min_qv = float(getattr(config, "MIN_QV_SCORE", 0.0) or 0.0)
+    if min_qv > 0 and not missing and score < min_qv:
+        return None, "FAIL_QV_SCORE"
     tags = ["优质低估低位" if not missing else "低位候选待核验"]
     hits = _signal_hits(d)
     tags.append("动能改善" if hits else "趋势待确认")
@@ -2388,6 +2655,19 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
     breakout, _ = evaluate_breakout(df, code, name, breakout_config, market_env, None)
     if breakout is not None:
         tags.append("放量突破")
+    # 入选依据补充：行业相对估值分位（#4a）与当年成长（#4b），便于人工裁量时一眼看清
+    # 「为什么算便宜」「当年是否还在恶化」。仅在对应数据可得时展示，缺失不伪造。
+    if industry_mode and val_context:
+        _pp = []
+        if val_context.get("pe_pct") is not None:
+            _pp.append(f"PE{val_context['pe_pct']:.0%}")
+        if val_context.get("pb_pct") is not None:
+            _pp.append(f"PB{val_context['pb_pct']:.0%}")
+        if _pp:
+            tags.append("行业估值分位" + "/".join(_pp))
+    _ni = finite(fund.get("forward_ni_yoy"))
+    if _ni is not None:
+        tags.append(f"当年净利{_ni:+.0f}%")
     atr = finite(d.get("atr"))
     rr = compute_risk_reward(close, config, atr)
     return Signal(
@@ -2408,24 +2688,48 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
 
 def _screen_quality_pool(config: StrategyConfig, cache: CacheManager, market_env: dict,
                          latest_trade_date: Optional[str], pending_out: Optional[list] = None,
-                         evaluator=None) -> Optional[pd.DataFrame]:
-    """先廉价行情筛选、后年度财务核验；核验完所有候选才排序和行业限额。"""
+                         evaluator=None, max_picks: Optional[int] = None) -> Optional[pd.DataFrame]:
+    """先廉价行情筛选、后年度财务核验；核验完所有候选才排序和行业限额。
+
+    max_picks：本次推荐数量上限（由 main 按市场环境 resolve_max_picks 解析后传入）；
+    None 时退回 config.MAX_PICKS（兼容回测/单测直接调用）。
+    行业相对估值开启时，先用全池日线构建「行业 PE/PB 横截面快照」（复用缓存，不额外取数），
+    再据此为每只候选计算行业内分位上下文 val_context 传入评估器；快照不可用时自动回退绝对阈值。
+    """
     evaluator = evaluator or evaluate
     stocks = get_stock_list(config, cache)
+    cap = int(config.MAX_PICKS if max_picks is None else max_picks)
+    # 行业估值横截面快照（#4a）：行业数据不可用 → 空 dict → 全市场回退绝对阈值
+    industry_map = get_stock_industry(config, cache) if getattr(config, "USE_INDUSTRY_RELATIVE_VALUATION", False) else {}
+    snapshot = build_industry_valuation_snapshot(config, cache, stocks) if industry_map else {}
+
     def screen(stock):
         code, name = stock["code"], stock["name"]
         daily = get_daily_data(code, config, cache)
+        # 行业相对估值上下文：个股 PE/PB 在其行业内的分位（无快照/样本不足 → None → 绝对回退）
+        val_ctx = None
+        if snapshot:
+            _pe = _finite_positive_or_none(daily.iloc[-1].get("peTTM")) if daily is not None and not daily.empty else None
+            _pb = _finite_positive_or_none(daily.iloc[-1].get("pbMRQ")) if daily is not None and not daily.empty else None
+            val_ctx = _industry_valuation_context(snapshot, industry_map.get(str(code), ""), _pe, _pb, config)
         pre, reason = evaluator(daily, code, name, config, market_env, None,
-                                latest_trade_date=latest_trade_date)
+                                latest_trade_date=latest_trade_date, val_context=val_ctx)
         if pre is None:
             return None, reason
         fund = get_fundamentals(code, cache, config)
         if not _is_financial_stock(code, name, config):
             fund = enrich_annual_fundamentals(code, fund, config, as_of=pre.date)
+            fund = enrich_forward_growth(code, fund, config, cache)  # 前瞻确认（#4b）
         return evaluator(daily, code, name, config, market_env, fund,
-                         latest_trade_date=latest_trade_date)
+                         latest_trade_date=latest_trade_date, val_context=val_ctx)
     results, processed, timed_out = run_concurrent_screen(stocks, screen, config, logger)
     rows = [sig.to_dict() for sig, reason in results if sig is not None and reason == "PASS"]
+    # 否决归因计数：让「今天为什么没推荐」在 quality_value 路径也可观测（此前只印候选数）
+    from collections import Counter
+    reasons = Counter(reason for sig, reason in results if sig is None)
+    if reasons:
+        top = "，".join(f"{k} {v}" for k, v in reasons.most_common(6))
+        logger.info("优质低估低位否决归因（前6）：%s", top)
     logger.info("优质低估低位筛选：已处理 %d/%d，候选 %d，时间预算耗尽=%s", processed, len(stocks), len(rows), timed_out)
     if not rows:
         return None
@@ -2436,7 +2740,9 @@ def _screen_quality_pool(config: StrategyConfig, cache: CacheManager, market_env
     formal = frame[frame["tier"] == "formal"]
     if config.USE_INDUSTRY_DEDUP and not formal.empty:
         formal = _dedup_by_industry(formal, config, cache)
-    return formal.head(config.MAX_PICKS).reset_index(drop=True)
+    if len(formal) > cap:
+        logger.info("通过 formal %d 只，按综合分截取前 %d 只（市场环境上限）", len(formal), cap)
+    return formal.head(cap).reset_index(drop=True)
 
 
 def get_market_environment(config: StrategyConfig, cache: CacheManager) -> dict:
@@ -2574,10 +2880,9 @@ def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] 
         if latest_trade_date is None:
             logger.warning("无法获取指数行情，本次运行跳过行情时效校验（停牌股可能混入待核验流程）")
 
-        if config.RECOMMENDATION_MODE == "quality_value":
-            return _screen_quality_pool(config, cache, market_env, latest_trade_date, pending_out)
-
-        # ===== 市场级熔断：指数急跌期间全市场抄底信号批量触发，直接不推荐 =====
+        # ===== 市场级熔断（#2）：指数急跌期间全市场抄底信号批量触发，直接不推荐 =====
+        # 置于 quality_value 分支之前，使两种模式都受组合层风控保护——此前 quality_value
+        # 在分支处提前 return，crash-halt 与 regime 数量收缩对其完全不生效（急跌中反而出票更多）。
         halt_ret = market_crash_halt(index_df, config)
         if halt_ret is not None:
             logger.warning("市场级熔断：沪深300 近 %d 个交易日累计 %.2f%%（阈值 %.2f%%），"
@@ -2585,7 +2890,7 @@ def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] 
                            config.MARKET_CRASH_LOOKBACK, halt_ret, config.MARKET_CRASH_HALT_PCT)
             return None
 
-        # ===== 推荐数量上限按市场环境收缩（与 volume_breakout_strategy 口径对齐）=====
+        # ===== 推荐数量上限按市场环境收缩（#2，quality_value 与 technical 两种模式共用）=====
         regime_raw = market_env.get("regime", "unknown")
         regime_eff = _effective_regime(regime_raw, config)
         max_picks = resolve_max_picks(regime_raw, config)
@@ -2597,6 +2902,10 @@ def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] 
         if max_picks <= 0:
             logger.info("当前市场环境推荐上限为 0，跳过全市场筛选")
             return None
+
+        if config.RECOMMENDATION_MODE == "quality_value":
+            return _screen_quality_pool(config, cache, market_env, latest_trade_date, pending_out,
+                                        max_picks=max_picks)
 
         stock_list = get_stock_list(config, cache)
         if not stock_list:
@@ -2631,6 +2940,9 @@ def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] 
                 stats["pass"] += 1
                 signals.append(sig.to_dict())
             elif reason == "FAIL_FUND": stats["fail_fund"] += 1
+            # FAIL_VALUATION（估值闸门）位于基本面层与技术层之间，计入 fail_fund 桶，
+            # 否则漏斗的逐层相减链（pass_fund = pass_liq - fail_fund …）会因未计数而失真。
+            elif reason == "FAIL_VALUATION": stats["fail_fund"] += 1
             elif reason == "FAIL_DATA": stats["fail_data"] += 1
             elif reason == "FAIL_LIQUIDITY": stats["fail_liq"] += 1
             elif reason == "FAIL_STALE": stats["fail_stale"] += 1

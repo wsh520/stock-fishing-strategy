@@ -15,16 +15,21 @@ DAY = "2025-06-30"
 def prices(end=DAY):
     close = np.r_[np.linspace(20, 10, 250), np.linspace(10, 11, 50)]
     dates = pd.bdate_range(end=end, periods=len(close)).strftime("%Y-%m-%d")
+    # peTTM=8 / pbMRQ=0.9：让「合格」样本的综合分稳过生产默认下限 MIN_QV_SCORE=60
+    # （0.50×质量 + 0.35×估值 + 0.15×技术）。各估值/质量闸门测试会在末根覆盖这两个值，
+    # 故基准取值不影响它们；这里只需保证「应当入选」的样本分数达标。
     return pd.DataFrame(dict(date=dates, open=close, high=close * 1.01,
                              low=close * .99, close=close, volume=1e7,
-                             amount=close * 1e7, peTTM=12., pbMRQ=1.2))
+                             amount=close * 1e7, peTTM=8., pbMRQ=0.9))
 
 
 def fundamentals():
+    # 年度 ROE 18/20/22：质量分稳过下限；季度 roe=2 仍保留，用于验证「最新季度低 ROE
+    # 不再否决连续盈利的年度质量」（见 test_low_long_term_but_high_short_term_is_eligible）。
     return {"debt_ratio": 40., "roe": 2., "annual_rows": [
         {"year": year, "report_date": f"{year}-12-31", "available_date": f"{year+1}-04-20",
          "roe": roe, "deducted_profit": 90., "net_profit": 100., "operating_cashflow": 110.}
-        for year, roe in [(2022, 11), (2023, 12), (2024, 13)]]}
+        for year, roe in [(2022, 18), (2023, 20), (2024, 22)]]}
 
 
 class QualityRecommendations(unittest.TestCase):

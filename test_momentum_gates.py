@@ -240,8 +240,11 @@ def qv_fund() -> dict:
 
 
 def qv_evaluate(close, veto: bool):
+    # MIN_QV_SCORE=0：本节只验证 KDJ/MACD 下限闸门，关闭与之无关的综合分下限，
+    # 避免样本分数（~53）触发 FAIL_QV_SCORE 掩盖被测闸门的归因。
     return m.evaluate(qv_df(close), "600001", "工业企业",
-                      m.StrategyConfig(USE_CACHE=False, QV_ENFORCE_KDJ_MACD_VETO=veto),
+                      m.StrategyConfig(USE_CACHE=False, QV_ENFORCE_KDJ_MACD_VETO=veto,
+                                       MIN_QV_SCORE=0),
                       {"regime": "bear"}, qv_fund(), latest_trade_date=_QV_DAY)
 
 

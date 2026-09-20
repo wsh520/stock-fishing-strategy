@@ -84,6 +84,14 @@ def run(argv: list[str] | None = None):
     logger.info("放量突破选股任务启动")
 
     config = VolumeBreakoutConfig()
+    # ===== 突破策略＝独立的第二信号源（#1）=====
+    # 抄底入口（run.py）跑 quality_value（优质低估低位）。若突破入口也用 quality_value，
+    # evaluate_breakout 会委派同一个 evaluate_quality_value 资格判定，两套策略产出完全相同，
+    # 再经下方组合层去重后突破卡片恒为空——等于花双份成本拿一份结果。
+    # 这里强制 technical 模式，让突破走自己独立的「七层漏斗」（突破/量能/形态/平台/趋势/
+    # 假突破/RSI/动能/波动率/评分 + 决赛圈周线确认 + 熊市空仓），成为真正独立的信号源；
+    # 与抄底的重叠由下方 fetch_rec_codes_for_date 去重、合计上限由 DAILY_TOTAL_MAX_PICKS 约束。
+    config.RECOMMENDATION_MODE = "technical"
     if args.no_cache:
         config.USE_CACHE = False
         logger.info("已启用 --no-cache：跳过 cache/ 磁盘缓存读写，本次全部从数据源拉取")

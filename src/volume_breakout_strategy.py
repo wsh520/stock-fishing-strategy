@@ -554,6 +554,7 @@ def evaluate_breakout(
     fund_data: Optional[dict] = None,
     volatile_out: Optional[list] = None,
     latest_trade_date: Optional[str] = None,
+    val_context: Optional[dict] = None,
 ) -> tuple[Optional[BreakoutSignal], str]:
     """评估单只股票是否满足放量突破入场条件。
 
@@ -564,12 +565,15 @@ def evaluate_breakout(
     volatile_out：可选 list，FAIL_VOLATILE 的个股会以明细 dict 追加进去（供日志逐只
     打印与飞书高风险观察池展示）。注意本策略的波动率检查位于评分定级之前，
     因此其中的标的只保证「突破/量能/形态/趋势」各层已过，评分等级尚未校验。
+
+    val_context：行业相对估值上下文，仅在 quality_value 委派路径下透传给
+    evaluate_quality_value；technical（独立突破）路径忽略。
     """
     if config is None:
         config = VolumeBreakoutConfig()
     if config.RECOMMENDATION_MODE == "quality_value":
         base, reason = evaluate_quality_value(daily_df, code, name, config, market_env,
-                                              fund_data, latest_trade_date)
+                                              fund_data, latest_trade_date, val_context=val_context)
         if base is None:
             return None, reason
         # 突破仅作为统一候选池内的标签，不另设荐股资格或排序权重。
