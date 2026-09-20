@@ -37,7 +37,7 @@ import threading
 import time
 from collections import Counter
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, replace
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -905,6 +905,43 @@ def _screen_day(bc: BacktestConfig, config: StrategyConfig, day: str,
     return formal, pending, reasons
 
 
+def replay_core(bc: BacktestConfig, config: StrategyConfig, index: pd.DataFrame,
+                panels: dict, industry_map: dict) -> tuple[list, list, Counter, list]:
+    """在已加载的数据面板上逐日重放选股（供 replay 与 ab 复用）。
+
+    抽出的动机：A/B 需要对同一份面板跑多组配置，而 `replay` 每次都会重新
+    读盘加载面板/股票池/行业映射。抽出后 ab 只需加载一次，重复成本只剩逐日
+    评估本身（真实开销所在），也保证各变体看到**逐字相同**的行情与行业数据。
+    """
+    cal = [d for d in index["date"].tolist() if bc.BT_START <= d <= bc.BT_END]
+    logger.info("回测区间交易日 %d 天：%s ~ %s", len(cal), cal[0] if cal else "-", cal[-1] if cal else "-")
+
+    index_dates = index["date"].tolist()
+    all_picks: list[dict] = []
+    all_pending: list[dict] = []
+    overall_reasons: Counter = Counter()
+    day_funnels: list[dict] = []
+    for n, day in enumerate(cal, 1):
+        t = time.time()
+        j = bisect.bisect_right(index_dates, day) - 1
+        index_upto = index.iloc[: j + 1]
+        formal, pending, reasons = _screen_day(bc, config, day, panels, index_upto, industry_map)
+        overall_reasons.update(reasons)
+        day_funnels.append({"date": day, "n_pool": len(panels),
+                            "n_formal": len(formal), "n_pending": len(pending), **dict(reasons)})
+        for r in formal:
+            r["rec_date"] = day
+            all_picks.append(r)
+        for r in pending:
+            r["rec_date"] = day
+            all_pending.append(r)
+        top = ", ".join(f"{_REASON_ZH.get(k, k)}={v}" for k, v in reasons.most_common(4) if k != "PASS")
+        logger.info("[%d/%d] %s 正式推荐 %d 只，待核验 %d 只（%.1fs）| 主要否决：%s%s",
+                    n, len(cal), day, len(formal), len(pending), time.time() - t, top,
+                    " | 入选 " + ", ".join(f"{r['name']}({r['code']}){r['score']}" for r in formal) if formal else "")
+    return all_picks, all_pending, overall_reasons, day_funnels
+
+
 def replay(bc: BacktestConfig, config: StrategyConfig) -> tuple[list, list, pd.DataFrame, Counter, list]:
     _ensure_dirs(bc)
     # 行情面板走磁盘缓存，筛选阶段无需联网；baostock 仅决赛圈拉基本面时需要。
@@ -928,34 +965,8 @@ def replay(bc: BacktestConfig, config: StrategyConfig) -> tuple[list, list, pd.D
         if not panels:
             raise RuntimeError("无可用面板缓存，请先运行 prefetch")
 
-        # 交易日历：指数在 [BT_START, BT_END] 内的交易日
-        cal = [d for d in index["date"].tolist() if bc.BT_START <= d <= bc.BT_END]
-        logger.info("回测区间交易日 %d 天：%s ~ %s", len(cal), cal[0] if cal else "-", cal[-1] if cal else "-")
-
-        index_dates = index["date"].tolist()
-        all_picks: list[dict] = []
-        all_pending: list[dict] = []
-        overall_reasons: Counter = Counter()
-        day_funnels: list[dict] = []
-        for n, day in enumerate(cal, 1):
-            t = time.time()
-            j = bisect.bisect_right(index_dates, day) - 1
-            index_upto = index.iloc[: j + 1]
-            formal, pending, reasons = _screen_day(bc, config, day, panels, index_upto, industry_map)
-            overall_reasons.update(reasons)
-            day_funnels.append({"date": day, "n_pool": len(panels),
-                                "n_formal": len(formal), "n_pending": len(pending), **dict(reasons)})
-            for r in formal:
-                r["rec_date"] = day
-                all_picks.append(r)
-            for r in pending:
-                r["rec_date"] = day
-                all_pending.append(r)
-            top = ", ".join(f"{_REASON_ZH.get(k, k)}={v}" for k, v in reasons.most_common(4) if k != "PASS")
-            logger.info("[%d/%d] %s 正式推荐 %d 只，待核验 %d 只（%.1fs）| 主要否决：%s%s",
-                        n, len(cal), day, len(formal), len(pending), time.time() - t, top,
-                        " | 入选 " + ", ".join(f"{r['name']}({r['code']}){r['score']}" for r in formal) if formal else "")
-        return all_picks, all_pending, index, overall_reasons, day_funnels
+        picks, pending, reasons, funnels = replay_core(bc, config, index, panels, industry_map)
+        return picks, pending, index, reasons, funnels
     finally:
         try:
             bs.logout()
@@ -1377,6 +1388,195 @@ def _render_report(bc: BacktestConfig, stats: dict, picks_df: pd.DataFrame, trad
 # CLI
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# P1：KDJ / MACD 闸门 A/B 对照
+# ---------------------------------------------------------------------------
+
+# 变体定义：模式 → {变体名: 相对「该模式基准配置」的覆盖项}
+# 基准 = StrategyConfig() 只替换 RECOMMENDATION_MODE，其余全用生产默认值，
+# 因此 baseline 行就是当前实盘口径，任意差异都只来自被改动的那一个参数。
+#
+# 为什么分两个模式：KDJ/MACD 闸门在两条路径上生效位置不同——
+#   technical      ：evaluate() 的严格确认层，KDJ/MACD 是硬闸门，可直接调松/调严；
+#   quality_value  ：默认「技术面不作否决」，闸门需显式开启 QV_ENFORCE_KDJ_MACD_VETO。
+# 生产默认是 quality_value，所以真正决定「是否上线 KDJ/MACD 荐股控制」的是第一组。
+AB_VARIANTS: dict[str, dict[str, dict]] = {
+    "quality_value": {
+        "baseline": {},                                            # 现状：技术面不否决
+        "qv_veto": {"QV_ENFORCE_KDJ_MACD_VETO": True},              # 接入下限否决（连续 2 日走弱）
+        "qv_veto_d1": {"QV_ENFORCE_KDJ_MACD_VETO": True, "MACD_WEAK_DAYS": 1},
+        "qv_veto_d3": {"QV_ENFORCE_KDJ_MACD_VETO": True, "MACD_WEAK_DAYS": 3},
+    },
+    "technical": {
+        "baseline": {},                                            # MACD 连 2 日改善 + KDJ 金叉 K≤55 且 K 上行
+        "no_kdj": {"REQUIRE_KDJ_GOLDEN": False},                    # 完全关掉 KDJ 闸门
+        "kdj_k70": {"KDJ_K_MAX": 70.0},                             # K 上限 55 → 70（放行更热的标的）
+        "macd_d1": {"MACD_MOMENTUM_DAYS": 1},                       # 连续改善 2 日 → 1 日（放行单日反抽）
+    },
+}
+
+_AB_COLUMNS = ("n_formal", "n_trades", "win_rate", "avg_return", "avg_peak",
+               "portfolio_return", "max_drawdown")
+
+
+def _ab_metrics(bc: BacktestConfig, config: StrategyConfig, index: pd.DataFrame,
+                panels: dict, industry_map: dict) -> dict:
+    """跑完一个变体的「重放 → 收益模拟 → 统计」，返回可横向对比的标量指标。"""
+    picks, pending, reasons, funnels = replay_core(bc, config, index, panels, industry_map)
+    cal = [d for d in index["date"].tolist() if bc.BT_START <= d <= bc.BT_END]
+    trades = simulate_all(bc, picks, panels, cal)
+    stats = build_monthly_stats(bc, trades, index, reasons, funnels, n_pool=len(panels))
+    pt, pf = stats["per_trade"], stats["portfolio"]
+    m = {
+        "n_formal": len(picks),
+        "n_pending": len(pending),
+        "n_trades": pt["n_trades"],
+        "win_rate": pt["win_rate"],
+        "avg_return": pt["avg_return"],
+        "avg_peak": pt["avg_peak"],
+        "portfolio_return": pf["portfolio_return_pct"],
+        "max_drawdown": pf["max_drawdown_pct"],
+        "benchmark": stats.get("benchmark_csi300_pct"),
+    }
+    # 逐日关键否决数：用于分辨「收益变化」是闸门真起作用，还是样本太小纯噪声。
+    for r, key in (("FAIL_MACD_WEAK", "veto_macd_weak"), ("FAIL_KDJ_HIGH", "veto_kdj_high")):
+        m[key] = int(reasons.get(r, 0))
+    m["n_days"] = len(funnels)
+    return m
+
+
+def render_ab_report(bc: BacktestConfig, results: dict, sets: Optional[list] = None) -> str:
+    """把 A/B 结果渲染成 Markdown 对照表（写入 backtest_output/ab_report.md）。"""
+    lines = ["# KDJ / MACD 闸门 A/B 对照", "",
+             f"- 回测区间：{bc.BT_START} ~ {bc.BT_END}",
+             f"- 行情数据源：{bc.DATA_SOURCE}；股票池上限：{bc.LIMIT or '全量'}",
+             "- 基准口径：每笔等权平均 + 每日等额投入的组合净值；买卖价与实盘回测一致"]
+    if sets:
+        lines.append(f"- ⚠️ **已覆盖环境参数，非实盘默认口径**：`{'`, `'.join(sets)}`")
+    lines.append("")
+    by_mode: dict[str, list] = {}
+    for key, m in results.items():
+        by_mode.setdefault(key.split("/", 1)[0], []).append((key.split("/", 1)[1], m))
+    for mode, rows in by_mode.items():
+        lines += [f"## 模式：{mode}", "",
+                  "| 变体 | 正式推荐 | 可成交 | 胜率% | 平均收益% | 平均峰值% | 组合收益% | 最大回撤% | MACD走弱否决 | KDJ高位否决 |",
+                  "|---|---|---|---|---|---|---|---|---|---|"]
+        for name, m in rows:
+            lines.append(
+                f"| {name} | {m['n_formal']} | {m['n_trades']} | {m['win_rate']} | {m['avg_return']} | "
+                f"{m['avg_peak']} | {m['portfolio_return']} | {m['max_drawdown']} | "
+                f"{m['veto_macd_weak']} | {m['veto_kdj_high']} |")
+        base = dict(rows).get("baseline")
+        if base:
+            lines += ["", f"基准变体（baseline）同期沪深300：{base['benchmark']}%", ""]
+    lines += ["## 读表须知", "",
+              "- 样本量优先：`可成交` 笔数低于 30 时，胜率与平均收益的差异不具统计意义，"
+              "只可作为方向性参考，结论必须等样本累积。",
+              "- 看 `MACD走弱否决` / `KDJ高位否决` 两列：若为 0，说明该变体与基准的差异"
+              "并非来自闸门，而是排序或数据抖动造成，不能据此判定闸门有效。",
+              "- 判定标准：否决数显著 > 0 且 平均收益/胜率不降 → 闸门在过滤低质量信号；"
+              "否决数显著 > 0 但 平均收益下降 → 闸门误杀，应放宽阈值或关闭。",
+              ""]
+    return "\n".join(lines)
+
+
+def _coerce_config_value(current, raw: str):
+    """按现有字段类型转换 --set 的字符串值（bool 需显式识别，int 不能用 float 兜底）。"""
+    if isinstance(current, bool):
+        return str(raw).strip().lower() in ("1", "true", "yes", "on")
+    if isinstance(current, int):
+        return int(raw)
+    if isinstance(current, float):
+        return float(raw)
+    return raw
+
+
+def _apply_overrides(base: StrategyConfig, sets: Optional[list]) -> StrategyConfig:
+    """把 `--set KEY=VALUE` 叠加到基准配置上（A/B 共用的「环境」参数）。
+
+    存在的意义：变体只应改动被考察的那一两个参数，其余条件必须完全一致。
+    用它固定住入场门槛、估值开关等环境参数后，各变体之间就只剩目标差异。
+    """
+    if not sets:
+        return base
+    kwargs = {}
+    for item in sets:
+        key, _, raw = str(item).partition("=")
+        key = key.strip()
+        if not hasattr(base, key):
+            raise SystemExit(f"--set 未知配置项：{key}")
+        kwargs[key] = _coerce_config_value(getattr(base, key), raw)
+    return replace(base, **kwargs)
+
+
+def cmd_ab(bc: BacktestConfig, modes: Optional[list] = None,
+           variant_names: Optional[list] = None, sets: Optional[list] = None) -> dict:
+    """对 KDJ/MACD 闸门做多组配置的横向 A/B。
+
+    数据（行情面板 / 股票池 / 行业映射）只加载一次，所有变体共用同一份，
+    因此各变体之间的差异全部来自被改动的策略参数，不含数据抖动。
+    """
+    _ensure_dirs(bc)
+    modes = modes or ["quality_value", "technical"]
+    global _BS_OK
+    if bc.DATA_SOURCE == "akshare":
+        _BS_OK = False
+        logger.info("数据源=AkShare：跳过 baostock 登录")
+    else:
+        _BS_OK = _bs_login_safe(max_retry=2)
+        if not _BS_OK:
+            logger.warning("baostock 登录失败（可能被限流）；行情走缓存继续，"
+                           "决赛圈基本面缺失的候选降级为待核验")
+
+    base_config = _apply_overrides(StrategyConfig(), sets)
+    if sets:
+        # 环境参数与实盘默认值不同，必须在报告里留痕，否则结论会被误当成实盘口径。
+        logger.warning("A/B 已覆盖环境参数（非实盘默认口径）：%s", ", ".join(sets))
+    try:
+        index = fetch_index_panel(bc)
+        # 股票池不随闸门参数变化（同一 MAIN_BOARD_ONLY / 过滤集合），只取一次
+        pool = fetch_pool(bc, base_config)
+        industry_map = fetch_industry(bc)
+        panels = load_panels(bc, pool)
+        if not panels:
+            raise RuntimeError("无可用面板缓存，请先运行 `python backtest.py prefetch`")
+        logger.info("A/B 共用面板 %d 只，行业映射 %d 条", len(panels), len(industry_map))
+
+        results: dict[str, dict] = {}
+        for mode in modes:
+            variants = AB_VARIANTS.get(mode)
+            if not variants:
+                logger.warning("未知模式 %s，已跳过（可选：%s）", mode, ", ".join(AB_VARIANTS))
+                continue
+            base = replace(base_config, RECOMMENDATION_MODE=mode)
+            for name, overrides in variants.items():
+                if variant_names and name not in variant_names:
+                    continue
+                cfg = replace(base, **overrides)
+                key = f"{mode}/{name}"
+                logger.info("=" * 60)
+                logger.info("[A/B] %s ：%s", key,
+                            ", ".join(f"{k}={v}" for k, v in overrides.items()) or "生产默认口径")
+                t0 = time.time()
+                results[key] = _ab_metrics(bc, cfg, index, panels, industry_map)
+                logger.info("[A/B] %s 完成，用时 %.1f 分钟", key, (time.time() - t0) / 60)
+    finally:
+        try:
+            bs.logout()
+        except Exception:  # noqa: BLE001
+            pass
+
+    report = render_ab_report(bc, results, sets)
+    path = os.path.join(bc.OUT_DIR, "ab_report.md")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(report)
+    # 控制台同时打印精简对照表，便于直接读结论
+    for line in report.splitlines():
+        logger.info(line)
+    logger.info("A/B 报告：%s", path)
+    return results
+
+
 def _setup_logging() -> None:
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -1433,6 +1633,15 @@ def main(argv: Optional[list] = None) -> None:
     _add_common(p_run)
     p_all = sub.add_parser("all", help="prefetch 后直接 run")
     _add_common(p_all)
+    p_ab = sub.add_parser("ab", help="KDJ/MACD 闸门 A/B 对照（多组配置共用同一份行情面板）")
+    _add_common(p_ab)
+    p_ab.add_argument("--mode", default="quality_value,technical",
+                      help="逗号分隔的模式：quality_value / technical（默认两者都跑）")
+    p_ab.add_argument("--variants", default="",
+                      help="逗号分隔的变体名（默认跑该模式全部变体）")
+    p_ab.add_argument("--set", dest="sets", action="append", default=[],
+                      help="KEY=VALUE，叠加到 A/B 基准配置（可多次），"
+                           "用于固定住与考察目标无关的环境参数，如 --set USE_VALUATION_FILTER=False")
     args = parser.parse_args(argv)
 
     bc = _apply_args(BacktestConfig(), args)
@@ -1440,6 +1649,12 @@ def main(argv: Optional[list] = None) -> None:
     _ensure_dirs(bc)
 
     t0 = time.time()
+    if args.cmd == "ab":
+        modes = [x.strip() for x in (getattr(args, "mode", "") or "").split(",") if x.strip()]
+        names = [x.strip() for x in (getattr(args, "variants", "") or "").split(",") if x.strip()]
+        cmd_ab(bc, modes, names, getattr(args, "sets", None))
+        logger.info("总耗时 %.1f 分钟", (time.time() - t0) / 60)
+        return
     if args.cmd in ("prefetch", "all"):
         logger.info("=" * 60)
         logger.info("Step 1/2 预取行情数据 ...")

@@ -277,6 +277,30 @@ class StrategyConfig:
     KDJ_K_MAX: float = 55.0
     # KDJ 动能：要求 K 值较昨日上行（仅 K>D 不够，K 掉头时容易误判为金叉）
     REQUIRE_KDJ_RISING: bool = True
+
+    # ===== KDJ / MACD 下限否决（荐股控制；两条策略共用同一套阈值与实现）=====
+    # 背景：KDJ/MACD 在此前各策略中要么只作「评分项」、要么只作「严格确认项」，
+    # 在 quality_value（当前生产默认模式）路径下完全不参与否决。实测暴露的控制
+    # 漏洞：放量突破策略的动能分仅占 10/100，分档失守仍可守住 B 级 60 分准入线，
+    # 对「推荐与否」没有约束力。
+    # 本组是「只拦明显转弱 / 明显偏高」的下限闸门，刻意不要求金叉——理由见
+    # kdj_not_overheated 的 docstring（同源指标双重闸门 + 金叉滞后误杀目标形态）。
+    # MACD 侧为**双条件 AND**（深度弱势 + 仍在恶化），理由见
+    # macd_not_deeply_weak 的 docstring：单用「柱值递减」会误杀匀速上行的健康形态。
+    MACD_WEAK_DAYS: int = 2            # 柱值连续递减天数（末 N+1 根严格递减）
+    MACD_WEAK_HIST_PCT: float = -0.5   # 深度弱势阈值：柱值/收盘价 × 100 的上限（%）
+    KDJ_K_HARD_MAX: float = 85.0       # K 值硬上限（评分线另有更严的软阈值，如突破 80）
+    # 高位死叉判定：K<D 且 K ≥ 该值。阈值必须贴近 KDJ_K_HARD_MAX 而不是放在中位——
+    # 匀速上行时 9 日 RSV 稳定在 ~0.72，K 与 D 在 70 附近交替领先，把阈值设在 60
+    # 会让「K<D」在约半数交易日成立，把整类健康形态误杀（P1 回测前置校验实测，
+    # 已固化为回归测试）。设在区间顶部区域后，只有「已到顶且开始掉头」才否决。
+    KDJ_DEAD_CROSS_K: float = 80.0
+    # quality_value（生产默认模式）是否接入该下限否决。
+    # 默认 False —— 保持「技术面不作否决」的现有荐股口径逐字节不变；
+    # 置 True 后由 evaluate_quality_value 生效。切换前须先用
+    # `python backtest.py ab --mode quality_value` 取得样本内证据。
+    QV_ENFORCE_KDJ_MACD_VETO: bool = False
+
     # 周线趋势确认：仅对通过全部日线筛选的决赛圈股票拉取周线；
     # WEEKLY_MA_BOTH_REQUIRED=True 时须同时满足「收盘站上周线 MA10（容忍 2%）」和「MA10 在上行」，
     # 设为 False 退回旧行为（两条件满足其一即可）
@@ -1870,6 +1894,78 @@ def _kdj_ok(daily_out: pd.DataFrame, config: StrategyConfig) -> bool:
         if not pd.isna(k_prev) and float(k) <= float(k_prev): return False
     return True
 
+def macd_not_deeply_weak(daily_out: pd.DataFrame, days: int = 2,
+                         hist_pct_max: float = -0.5) -> bool:
+    """MACD 柱未处于「深度弱势且仍在恶化」状态（双条件 AND，缺一不否决）。
+
+    判定为弱势需**同时**满足：
+      1. 深度弱势：末根柱值 / 收盘价 × 100 ≤ hist_pct_max（默认 -0.5%），
+         即 DIF 已明显位于 DEA 下方，属真实的空头动能区间；
+      2. 仍在恶化：末 days+1 根柱值严格递减。
+
+    为什么不能只用「柱值递减」：MACD 柱度量的是**加速度**而非趋势。匀速上行
+    （斜率恒定）必然使柱值向 0 收敛——实测标准「长期下跌 → 稳步回升」的优质
+    低估形态柱值为 [+0.0088, +0.0082, +0.0076]，递减但完全健康。只用递减条件
+    会把整类健康形态判为走弱（P1 回测前置校验发现，已固化为回归测试）。
+    加上「深度弱势」这一合取项后，柱值 >0 的匀速上行与小幅回踩不再触发。
+
+    与 _macd_momentum_ok 的区别在门槛方向：后者要求「连续改善」（抄底策略的入场
+    确认层），本函数只否决「深度弱势且继续恶化」（动能下限），供放量突破策略与
+    quality_value 模式的荐股控制使用。
+    数据不足或含 NaN 一律放行——不因缺数据误杀，数据缺失由上层 FAIL_DATA 兜底。
+    """
+    if daily_out is None or len(daily_out) == 0:
+        return True
+    if "macd_histogram" not in daily_out.columns or "close" not in daily_out.columns:
+        return True
+    n = max(1, int(days))
+    if len(daily_out) < n + 1:
+        return True
+    hist = daily_out["macd_histogram"].iloc[-(n + 1):]
+    if hist.isna().any():
+        return True
+    vals = [float(v) for v in hist.tolist()]
+    try:
+        close = float(daily_out["close"].iloc[-1])
+    except (TypeError, ValueError):
+        return True
+    if not np.isfinite(close) or close <= 0:
+        return True
+    deeply_weak = (vals[-1] / close * 100) <= float(hist_pct_max)
+    deteriorating = all(vals[i] > vals[i + 1] for i in range(len(vals) - 1))
+    return not (deeply_weak and deteriorating)
+
+
+def kdj_not_overheated(daily_out: pd.DataFrame, k_hard_max: float, dead_cross_k: float) -> bool:
+    """KDJ 未处于「高位滞涨」状态（单侧下限闸门，不要求金叉）。
+
+    只拦两种形态：
+    1. K > k_hard_max：K 值已在高位，属高位接力；
+    2. K < D 且 K ≥ dead_cross_k：已到区间顶部且开始掉头，属高位死叉。
+    K 处于低位/中位时的 K<D 不拦：那既可能是下跌末段常态，也可能是匀速上行中
+    K/D 交替领先的噪声（见 KDJ_DEAD_CROSS_K 的阈值说明）。
+
+    刻意不要求金叉（K>D）：那会与抄底策略的严格确认层重复（同源指标双重闸门），
+    且突破日 RSV 直接打到 100、K 值单日跳升，金叉常滞后 1-2 日——硬金叉会系统性
+    漏掉「窄幅整理后首根放量阳线」这一目标形态。
+    数据缺失/空表一律放行。
+    """
+    if daily_out is None or len(daily_out) == 0:
+        return True
+    if "kdj_k" not in daily_out.columns or "kdj_d" not in daily_out.columns:
+        return True
+    last = daily_out.iloc[-1]
+    k, d = last.get("kdj_k"), last.get("kdj_d")
+    if k is None or d is None or pd.isna(k) or pd.isna(d):
+        return True
+    k, d = float(k), float(d)
+    if k > float(k_hard_max):
+        return False
+    if k < d and k >= float(dead_cross_k):
+        return False
+    return True
+
+
 def _drop_incomplete_weekly_bar(weekly_df: Optional[pd.DataFrame], config: StrategyConfig) -> Optional[pd.DataFrame]:
     """剔除未收盘的周 bar（WEEKLY_REQUIRE_CLOSED_BAR 开启时）。
 
@@ -2267,6 +2363,15 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
         return None, "FAIL_DATA"
     d = technical.iloc[-1]
     tech_score = float(d["daily_score"])
+    # KDJ / MACD 下限否决（默认关闭）：quality_value 模式的原有设计是「技术面不作
+    # 否决」，此处只在显式开启 QV_ENFORCE_KDJ_MACD_VETO 时收紧，且只拦「动能连续
+    # 走弱 / KDJ 高位滞涨」，不改变质量、估值、低位三大闸门的口径。
+    if getattr(config, "QV_ENFORCE_KDJ_MACD_VETO", False):
+        if not macd_not_deeply_weak(technical, config.MACD_WEAK_DAYS,
+                                    config.MACD_WEAK_HIST_PCT):
+            return None, "FAIL_MACD_WEAK"
+        if not kdj_not_overheated(technical, config.KDJ_K_HARD_MAX, config.KDJ_DEAD_CROSS_K):
+            return None, "FAIL_KDJ_HIGH"
     quality_score = float(quality.get("quality_score", 0))
     valuation_score = (50 * (1 - pe / config.MAX_PE_TTM) +
                        50 * (1 - pb / config.MAX_PB_MRQ)) if pe is not None and pb is not None else 0.0

@@ -67,7 +67,9 @@ from src.bottom_fishing_strategy import (
     get_market_environment,
     get_stock_list,
     has_halt_gap,
+    kdj_not_overheated,
     log_volatile_rejects,
+    macd_not_deeply_weak,
     run_concurrent_screen,
     sort_volatile,
 )
@@ -188,6 +190,14 @@ class VolumeBreakoutConfig(StrategyConfig):
 
     # 动能组参数（突破版）
     KDJ_K_MAX_BREAKOUT: float = 80.0         # 突破日 KDJ K 值上限（比抄底 60 放宽）
+
+    # ===== 层 3.8：KDJ / MACD 下限否决（荐股控制）=====
+    # 原实现里 KDJ/MACD 只贡献 W_MOMENTUM_BR=10 分（占满分 10%），分档失守仍可守住
+    # B 级 60 分准入线——动能已转弱的高位突破照样进正式名单，是本策略唯一的控制漏洞。
+    # 本组开关把两个指标升级为硬闸门，阈值与实现与 quality_value 模式共用
+    # （MACD_WEAK_DAYS / KDJ_K_HARD_MAX / KDJ_DEAD_CROSS_K 定义在 StrategyConfig）。
+    REQUIRE_BR_MACD_NOT_WEAK: bool = True    # MACD 柱连续走弱 → FAIL_MACD_WEAK
+    REQUIRE_BR_KDJ_NOT_HIGH: bool = True     # KDJ 高位或高位死叉 → FAIL_KDJ_HIGH
 
 
 # ===========================================================================
@@ -686,6 +696,18 @@ def evaluate_breakout(
     if rsi_prev is not None and not pd.isna(rsi_prev) and float(rsi_prev) > config.DAILY_RSI_ENTRY_MAX_BREAKOUT:
         return None, "FAIL_RSI_HIGH"
 
+    # 层 3.8：KDJ / MACD 下限否决（荐股控制）
+    # 这两个指标原先是纯评分项（W_MOMENTUM_BR=10），丢分不淘汰，对推荐与否没有
+    # 约束力；此处补上硬闸门，只拦「动能连续走弱」与「KDJ 高位滞涨」，不要求金叉。
+    # 刻意放在 RSI 层之后、波动率层之前：归因上属「日线技术入场质量」，
+    # 与 FAIL_RSI_HIGH 同层可比，也与 volatile 观察池的语义（各层已过、仅 ATR 超限）不冲突。
+    if getattr(config, "REQUIRE_BR_MACD_NOT_WEAK", True) \
+            and not macd_not_deeply_weak(out, config.MACD_WEAK_DAYS, config.MACD_WEAK_HIST_PCT):
+        return None, "FAIL_MACD_WEAK"
+    if getattr(config, "REQUIRE_BR_KDJ_NOT_HIGH", True) \
+            and not kdj_not_overheated(out, config.KDJ_K_HARD_MAX, config.KDJ_DEAD_CROSS_K):
+        return None, "FAIL_KDJ_HIGH"
+
     # 层 4：波动率风控
     atr_val = d_last.get("atr")
     atr_val = float(atr_val) if atr_val is not None and not pd.isna(atr_val) else None
@@ -848,6 +870,9 @@ def main_breakout(
             "fail_breakout": 0, "fail_vol": 0, "fail_pattern": 0, "fail_trend": 0,
             "fail_fake": 0, "fail_chase": 0, "fail_rsi": 0, "fail_volatile": 0,
             "fail_tech": 0, "pass": 0,
+            # 层 3.8 新增：KDJ/MACD 下限否决。独立计数便于复核「动能闸门是否已成
+            # 日线淘汰主因」——两个指标原先只扣分不淘汰，现在能淘汰了，必须可观测。
+            "fail_macd_weak": 0, "fail_kdj_high": 0,
         }
 
         def _screen_one(stock: dict) -> tuple[Optional[BreakoutSignal], str]:
@@ -886,6 +911,8 @@ def main_breakout(
             elif reason in ("FAIL_CHASE", "FAIL_GAP", "FAIL_BREAKOUT_WEAK"): stats["fail_chase"] += 1
             elif reason == "FAIL_RECENT_FAILED_BREAKOUT": stats["fail_chase"] += 1
             elif reason == "FAIL_RSI_HIGH": stats["fail_rsi"] += 1
+            elif reason == "FAIL_MACD_WEAK": stats["fail_macd_weak"] += 1
+            elif reason == "FAIL_KDJ_HIGH": stats["fail_kdj_high"] += 1
             elif reason == "FAIL_VOLATILE": stats["fail_volatile"] += 1
             elif reason == "FAIL_TECH": stats["fail_tech"] += 1
             elif reason == "ERROR": stats["error"] += 1
@@ -904,19 +931,26 @@ def main_breakout(
         logger.info("3. 基本面防雷通过: %d 只 (淘汰 %d)",
                     _pass_data - stats["fail_fund"],
                     stats["fail_fund"])
+        # 各层通过数 = pass + 该层之后所有层的淘汰数（层序见 evaluate_breakout）：
+        # 3.1 突破 → 3.2 量能 → 3.3 K线形态 → 3.4 平台 → 3.5 趋势 → 3.6 假突破
+        # → 3.7 RSI → 3.8 KDJ/MACD 动能下限 → 4 波动率 → 5 评分定级
+        _mom = stats["fail_macd_weak"] + stats["fail_kdj_high"]
         logger.info("4. 突破 & 量能确认: %d 只 (未突破 %d, 量能不足/天量/额不足 %d)",
                     stats["pass"] + stats["fail_pattern"] + stats["fail_trend"] + stats["fail_fake"] +
-                    stats["fail_chase"] + stats["fail_rsi"] + stats["fail_volatile"] + stats["fail_tech"],
+                    stats["fail_chase"] + stats["fail_rsi"] + _mom + stats["fail_volatile"] + stats["fail_tech"],
                     stats["fail_breakout"], stats["fail_vol"])
         logger.info("5. 平台整理 & 趋势背景: %d 只 (无平台 %d, 趋势下行 %d)",
                     stats["pass"] + stats["fail_fake"] + stats["fail_chase"] + stats["fail_rsi"] +
-                    stats["fail_volatile"] + stats["fail_tech"],
+                    _mom + stats["fail_volatile"] + stats["fail_tech"],
                     stats["fail_pattern"], stats["fail_trend"])
         logger.info("6. K线形态 & 假突破过滤: %d 只 (假突破 %d, 追高/跳空 %d)",
-                    stats["pass"] + stats["fail_rsi"] + stats["fail_volatile"] + stats["fail_tech"],
+                    stats["pass"] + stats["fail_rsi"] + _mom + stats["fail_volatile"] + stats["fail_tech"],
                     stats["fail_fake"], stats["fail_chase"])
-        logger.info("7. RSI & 波动率 & 评分: %d 只 (RSI过高 %d, 波动率超限 %d, 评分不达 %d)",
-                    stats["pass"], stats["fail_rsi"], stats["fail_volatile"], stats["fail_tech"])
+        logger.info("7. RSI & 动能下限 & 波动率 & 评分: %d 只 "
+                    "(RSI过高 %d, MACD走弱 %d, KDJ高位 %d, 波动率超限 %d, 评分不达 %d)",
+                    stats["pass"] + _mom + stats["fail_volatile"] + stats["fail_tech"],
+                    stats["fail_rsi"], stats["fail_macd_weak"], stats["fail_kdj_high"],
+                    stats["fail_volatile"], stats["fail_tech"])
         logger.info("日线取数来源: Baostock %d 只，AkShare 兜底 %d 只，双源均失败 %d 只",
                     fetch_stats["bs_ok"], fetch_stats["ak_ok"], fetch_stats["fail"])
         logger.info("=" * 50)
@@ -932,9 +966,11 @@ def main_breakout(
             _upstream = {
                 "数据/流动性/停牌缺口": stats["fail_data"] + stats["fail_liq"] + stats["fail_halt"] + stats["error"],
                 "基本面防雷": stats["fail_fund"],
-                "突破形态/量能/趋势/RSI/评分": (stats["fail_breakout"] + stats["fail_vol"] + stats["fail_pattern"]
-                                              + stats["fail_trend"] + stats["fail_fake"] + stats["fail_chase"]
-                                              + stats["fail_rsi"] + stats["fail_tech"]),
+                "突破形态/量能/趋势/RSI/动能下限/评分": (
+                    stats["fail_breakout"] + stats["fail_vol"] + stats["fail_pattern"]
+                    + stats["fail_trend"] + stats["fail_fake"] + stats["fail_chase"]
+                    + stats["fail_rsi"] + stats["fail_macd_weak"] + stats["fail_kdj_high"]
+                    + stats["fail_tech"]),
             }
             _layer = max(_upstream, key=lambda k: _upstream[k])
             if _upstream[_layer] > 0:

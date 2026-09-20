@@ -120,6 +120,43 @@
 
 失败码 `FAIL_RSI_HIGH`。
 
+**3.8 KDJ / MACD 下限否决（荐股控制）**
+
+失败码 `FAIL_MACD_WEAK` / `FAIL_KDJ_HIGH`，由 `REQUIRE_BR_MACD_NOT_WEAK`（默认开）与 `REQUIRE_BR_KDJ_NOT_HIGH`（默认开）控制。
+
+改动的动机：这两个指标此前**只是层 5 里的评分项**（`W_MOMENTUM_BR=10`，占满分 10%）。丢掉全部分档仍可守住 B 级 60 分准入线，因此它们对「推荐与否」没有任何约束力——这是本策略唯一的控制漏洞。
+
+闸门只拦两种形态，**刻意不要求金叉**：
+
+- `FAIL_MACD_WEAK`：**深度弱势 AND 仍在恶化**（双条件，见 `macd_not_deeply_weak`）
+  - 深度弱势：`柱值 / 收盘价 × 100 ≤ MACD_WEAK_HIST_PCT`（默认 −0.5%）
+  - 仍在恶化：末 `MACD_WEAK_DAYS+1`（默认 3）根柱值严格递减
+- `FAIL_KDJ_HIGH`（见 `kdj_not_overheated`）：
+  - `K > KDJ_K_HARD_MAX`（默认 85），或
+  - `K < D` 且 `K ≥ KDJ_DEAD_CROSS_K`（默认 80）
+
+**为什么不是「柱值递减就否决」**：MACD 柱度量的是**加速度**而非趋势，匀速上行的柱值必然向 0 收敛递减。实测标准「长期下跌 → 稳步回升」形态柱值为 `[+0.0088, +0.0082, +0.0076]`——递减但完全健康。单用递减条件会把整类健康形态判为走弱。加上「深度弱势」这一合取项后，正柱与小负柱都不再触发。
+
+**为什么死叉阈值必须贴近 K 上限**：匀速上行时 9 日 RSV 稳定在 ~0.72，K 与 D 在 70 附近交替领先（实测 K=71.222 / D=71.268，差 0.05）。阈值若设在中位（如 60），「K<D」会在约半数交易日成立，造成大面积误杀。
+
+**为什么放层 3.7 之后、层 4 之前**：归因上属「日线技术入场质量」，与 `FAIL_RSI_HIGH` 同层可比；同时不与层 4 观察池语义冲突（观察池要求各层已过、仅 ATR 超限）。
+
+> **实测结论：`FAIL_MACD_WEAK` 在本策略中结构性不可达。**
+> `brk_l2 = above_l2 & ~above_l2.shift(1)` —— 只认**首次**站上阻力位那天；该日 close 必须 > 前 20 日最高 ×1.005 且涨幅 ≥ `MIN_BREAKOUT_PCT`，这个上跳必然使 `ΔDIF > 0`；而柱值下降的条件是 `ΔDIF_t < hist_{t−1}/4`，横盘阶段 `hist_{t−1} ≤ 0`，不等式永不成立（参数扫描 36 个形态命中 0）。
+> 因此本策略的**实际新增控制力来自 KDJ 高位闸门**（可触发区间实测 K=85~86），MACD 侧保留为「突破口径被放宽（例如关闭 `REQUIRE_L1_OR_L2`、允许非首次突破）时的保险丝」。该结论已固化为 `test_momentum_gates.py` 的扫描断言：一旦口径放宽导致命中，测试会失败并提示复核。
+
+阈值定义在 `StrategyConfig`（`MACD_WEAK_DAYS` / `MACD_WEAK_HIST_PCT` / `KDJ_K_HARD_MAX` / `KDJ_DEAD_CROSS_K`），与 quality_value 模式共用，避免两处阈值漂移。
+
+**实证复核（本地缓存 798 只面板，2025-12-24 ~ 2026-09-18，technical/bull）**：新 KDJ 闸门在真实数据上可触发，已捕获两例——
+`600025` 2026-07-20（K=89.01 / D=86.45）与 `600039` 2026-09-01（K=85.04 / D=75.39），均走 `K > KDJ_K_HARD_MAX(85)` 分支。
+`FAIL_MACD_WEAK` 在真实数据上同样 0 次命中，与上面的结构性推理一致。
+
+**验证工具与两个必须知道的前提**（命令见 README「突破策略闸门 A/B 与漏斗归因」）：
+
+1. 层 3.8 **只在 `RECOMMENDATION_MODE == "technical"` 时执行**。生产默认 `quality_value`（`run_breakout.py` 用的就是它）下，`evaluate_breakout` 会先委派 `evaluate_quality_value`，本层只影响「放量突破」标签，**不影响荐股资格**；要让 KDJ/MACD 真正管荐股，需开启 `QV_ENFORCE_KDJ_MACD_VETO` 或切 technical 模式。
+2. `src/volume_breakout_backtest.py` 目前**恒不成交**（既有缺陷）：它只收 `tier == "formal"` 的信号，但本策略从不给 `Signal.tier` 赋值（默认 `"pending"`），只有抄底策略会写 `tier="formal"`。因此该独立回测在任何输入下都是 0 事件/0 成交。已固化为 `test_breakout_ab.py` 最后一节的断言；修复会改变行为，按「改产线口径前先 A/B」的约定未擅自修改。
+3. 用 `--funnel` 先看漏斗再谈闸门：实测 80 只 × 120 日共 9600 次评估中 `FAIL_NO_BREAKOUT` 占 94.75%、随后 `FAIL_VOL_INSUFFICIENT`（`daily_vol_ratio < 1.8`）与 `FAIL_LIQUIDITY` 是主要淘汰项，**PASS = 0**——即漏斗在评分定级之前就已闭合。此时 A/B 对照表全为 0，不能用来判断闸门有效性。
+
 #### 层 4｜波动率风控
 
 ATR / 现价 ≤ `MAX_ATR_PCT_BREAKOUT=4.0`%。突破股天然波动更大，比抄底 3.33% 略放宽。ATR 缺失放行。失败码 `FAIL_VOLATILE`。
@@ -239,6 +276,12 @@ ATR / 现价 ≤ `MAX_ATR_PCT_BREAKOUT=4.0`%。突破股天然波动更大，比
 | W_PATTERN | 15.0 | 平台整理权重 |
 | W_TREND_BR | 15.0 | 趋势背景权重 |
 | W_MOMENTUM_BR | 10.0 | 动能确认权重 |
+| REQUIRE_BR_MACD_NOT_WEAK | True | 层 3.8 开关：MACD 柱深度弱势且仍在恶化 → `FAIL_MACD_WEAK`（本策略中结构性不可达，见上） |
+| REQUIRE_BR_KDJ_NOT_HIGH | True | 层 3.8 开关：KDJ 已在区间顶部 → `FAIL_KDJ_HIGH`（本策略的实际新增控制力来源） |
+| MACD_WEAK_DAYS | 2 | 柱值连续递减天数（定义在 StrategyConfig，与 quality_value 共用） |
+| MACD_WEAK_HIST_PCT | −0.5 | 深度弱势阈值：柱值/收盘 × 100 的上限（%） |
+| KDJ_K_HARD_MAX | 85.0 | K 值硬上限（层 5 的评分软阈值为 `KDJ_K_MAX_BREAKOUT=80`，硬线特意更宽） |
+| KDJ_DEAD_CROSS_K | 80.0 | 高位死叉判定：K<D 且 K ≥ 该值 |
 
 ---
 

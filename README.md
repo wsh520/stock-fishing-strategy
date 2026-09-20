@@ -13,6 +13,8 @@
 | 价格位置 | 至少250根有效日线，(现价−250日最低)/(250日最高−最低)≤40%；取数窗口600自然日 |
 | 基础核验 | 最新行情与指数基准日一致、负债率已核验且≤70%、已知商誉超限否决；金融股独立待专项核验 |
 
+**可选的 KDJ/MACD 下限否决**：默认关闭（`QV_ENFORCE_KDJ_MACD_VETO=False`），保持「技术面不作否决」的现有口径逐字节不变。显式开启后，`FAIL_MACD_WEAK`（MACD 柱深度弱势且仍在恶化）与 `FAIL_KDJ_HIGH`（KDJ 已在区间顶部）会成为资格判定的一道硬闸门，与放量突破策略共用同一套阈值与实现。**切换前必须先用 `python backtest.py ab --mode quality_value` 取得样本内证据**：该闸门修掉过两次已实测的误杀（匀速上行的柱值递减、「K 略低于 D」的交替领先噪声），说明这类「下限」阈值极易误伤健康形态，不能凭直觉设定。
+
 排序为 **50%质量分 + 35%估值分 + 15%技术分**。质量分使用ROE稳定性及现金转换率的连续值；估值分是在绝对上限内按PE/PB线性评分，不声称是历史或行业估值分位。技术信号（金叉、背离、量价、放量突破）仅作排序/标签，缺少金叉、短期涨幅高、20日位置高、周线尚未企稳不会否决符合三大条件的公司。取消奖励更深回撤的排序偏好。大盘状态仅作说明，默认模式不执行市场急跌、熊市数量或ATR交易风险门槛；`MAX_PICKS`仍为显示上限，行业分散继续有效。
 
 年度数据来自AkShare新浪财务摘要的准确字段（ROE%、扣非净利、合并净利、经营现金流净额，金额元）。有公告日时按公告日可用；摘要不提供公告日时保守按次年5月1日可用。缺最新年度不能用更旧年度顶替；取数失败/NaN/金融专项未核验均为pending。该接口不是历史财报修订版本库，历史报告仍有重述数据局限。
@@ -70,6 +72,7 @@
    - **趋势背景**：MA20 上行、MA60 走平或上行、现价站上 MA20
    - **近期假突破过滤**：近 10 日无「突破 L1 后 3 日内跌回」记录（事件锚定突破日 L1；**向量化实现**，区间差分替代三重循环）
    - 突破**前一日** RSI ≤80（突破日天然推高 RSI，检查当日会误杀正常突破）
+   - **KDJ/MACD 下限否决**（`FAIL_MACD_WEAK` / `FAIL_KDJ_HIGH`）：把这两个指标从纯评分项升级为硬闸门。此前它们只贡献 `W_MOMENTUM_BR`=10 分（占满分 10%），分档失守仍可守住 B 级 60 分准入线，对「推荐与否」没有约束力。闸门只拦两种形态——**MACD 柱深度弱势且仍在恶化**（柱值/收盘 ≤ −0.5% 且连续 2 日递减，双条件 AND）与 **KDJ 已在区间顶部**（K > 85，或 K ≥ 80 且 K < D）；刻意不要求金叉（突破日 RSV 直接打到 100、K 单日跳升，金叉常滞后 1–2 日，硬金叉会系统性漏掉「窄幅整理后首根放量阳线」）。**实测结论：MACD 侧在突破策略中结构性不可达**——`brk_l2` 只认「首次站上阻力位」那天，该日必然 ≥2% 涨幅使 DIF 上行，而柱值下降需 `ΔDIF < hist/4`，横盘阶段 `hist ≤ 0`，不等式永不成立（已固化为参数扫描回归断言）。因此**突破策略的实际新增控制力来自 KDJ 高位闸门**，MACD 侧保留为「突破口径被放宽」时的保险丝。
 4. **波动率风控**：ATR ≤4.0% 现价（比抄底 3.33% 略放宽）
 5. **综合评分与等级**：突破强度(35，**0.55×级别 + 0.45×幅度** 加法混合——替代旧纯乘法，旧公式下 L2/L3 级别系数把幅度分压得极低、B 级准入事实上只推 L1) + 量能质量(25，0.7×放量 + 0.3×整理充分度) + 平台整理(15) + 趋势背景(15) + 动能确认(10)；B 级 ≥60 准入，熊市 +15
 6. **决赛圈周线确认**（继承 `check_weekly_trend` + `check_weekly_macd`，同样只用已收盘周 bar）
@@ -205,7 +208,7 @@ SOURCE schema.sql;
 ├── run_breakout.py                   # 放量突破选股入口（含组合层去重/总量上限）
 ├── run_weekly_tracking.py            # 周度追踪入口
 ├── run_monthly_attribution.py        # 信号归因月报入口
-├── backtest.py                       # 抄底策略历史回测（逐日重放，复用实盘纯函数避免未来函数；prefetch/run/all 三种模式）
+├── backtest.py                       # 抄底策略历史回测（逐日重放，复用实盘纯函数避免未来函数；prefetch/run/all/ab 四种模式）
 ├── docs/                             # 策略设计文档
 │   ├── volume_breakout_strategy.md   # 放量突破策略设计说明（分层漏斗 + 参数速查）
 │   └── TOP5改进说明.md               # 荐股质量分层/底背离修正等改进落地记录
@@ -213,6 +216,8 @@ SOURCE schema.sql;
 ├── test_main_layering.py             # main() 编排分层回归测试（打桩数据源，不联网）
 ├── test_strategy_fixes.py            # 2026-09 双策略评审修复项回归测试（合成数据，不联网）
 ├── test_optimizations_p0.py          # P0 优化项验证（pct_chg 口径统一 / 停牌缺口 / 排序质量分 / 数量上限与熔断）
+├── test_momentum_gates.py            # KDJ/MACD 下限闸门回归（纯函数边界 / 两策略接线 / MACD 不可达扫描断言）
+├── test_backtest_ab.py               # backtest ab 子命令离线测试（变体定义自检 / --set 解析 / 报告渲染）
 ├── schema.sql                        # MySQL 表结构（文档 + 手动建库参考）
 ├── requirements.txt                  # Python 依赖
 └── README.md
@@ -280,6 +285,46 @@ python backtest.py all                                   # prefetch 后直接 ru
 
 收益模拟为「信号日收盘生成、次日开盘买入」，持有期内用盘中高低价模拟触发 +10% 止盈 / −5% 止损（同根 K 线两者都触及时按止损保守处理）。需联网预取数据；`src/volume_breakout_backtest.py` 则是突破策略的离线事件回测（本地 CSV，不联网）。
 
+### KDJ / MACD 闸门 A/B 对照（`ab`）
+
+调整 KDJ/MACD 闸门参数前应先用样本内对照确认方向，不要拍脑袋改实盘。`ab` 子命令对同一份行情面板跑多组配置并输出横向对照表：**数据只加载一次、所有变体共用**，因此各变体之间的差异全部来自被改动的策略参数，不含数据抖动。
+
+```bash
+python backtest.py ab                                   # 两个模式全部变体
+python backtest.py ab --mode quality_value              # 只看生产默认模式
+python backtest.py ab --mode technical --variants baseline,no_kdj,kdj_k70,macd_d1
+python backtest.py ab --limit 300 --start 2026-06-01    # 冒烟：小股票池
+# 用 --set 固定与考察目标无关的「环境」参数（可多次），使变体之间只剩目标差异：
+python backtest.py ab --mode technical --variants baseline,no_kdj \
+  --set USE_VALUATION_FILTER=False --set MIN_PASS_GRADE=C
+```
+
+> `--set` 覆盖的是 A/B 的**基准配置**（所有变体共享）。覆盖后报告首行会打印「⚠️ 已覆盖环境参数，非实盘默认口径」，避免把冒烟结论误当成实盘结论。它解决的实际问题：本策略在部分区间/股票池上每日正式推荐可能为 0，此时所有变体都是 0 笔交易、对照表毫无信息量；固定住准入门槛后仍能观察闸门对信号集的影响（但结论只适用于该环境口径）。
+
+变体定义见 `backtest.py` 的 `AB_VARIANTS`：`quality_value` 模式为 `baseline` / `qv_veto` / `qv_veto_d1` / `qv_veto_d3`（后者回答「要不要在生产默认模式接入 KDJ/MACD 否决」）；`technical` 模式为 `baseline` / `no_kdj` / `kdj_k70` / `macd_d1`（回答「闸门调松的边际影响」）。报告写入 `backtest_output/ab_report.md`。
+
+> **⚠️ 覆盖范围边界**：`backtest.py ab` 的两个模式都走**抄底策略**的 `evaluate()`（见 `_screen_day`），因此它**无法**验证放量突破策略层 3.8 的两个闸门。突破策略的闸门 A/B 与漏斗归因请用 `src/volume_breakout_backtest.py`（下节）。
+
+### 突破策略闸门 A/B 与漏斗归因
+
+`src/volume_breakout_backtest.py` 是突破策略的离线事件回测（吃本地 CSV，不联网），可直接指向预取缓存：
+
+```bash
+# 漏斗归因：定位「0 信号」卡在哪一层（先跑这个，再谈闸门有效性）
+python -m src.volume_breakout_backtest --input backtest_cache/daily --funnel \
+  --max-stocks 80 --tail-bars 180 --regime bull
+
+# 闸门 A/B：gates_on / gates_off / kdj_off / macd_off
+python -m src.volume_breakout_backtest --input backtest_cache/daily --ab-gates \
+  --max-stocks 80 --tail-bars 180 --regime bull
+```
+
+- `--max-stocks` / `--tail-bars` 用于控制耗时（突破判定逐日重算指标，全量 798 只 × 全历史会非常慢）。
+- A/B 强制 `RECOMMENDATION_MODE="technical"`：`quality_value` 下 `evaluate_breakout` 会先委派 `evaluate_quality_value`（需多年财务数据），OHLCV 面板必然在层 1 失败 → 恒 0 信号，对照表没有意义。
+- 该模块会把信号 `tier` 过滤在 `"formal"`。**当前已知缺陷**：`volume_breakout_strategy.py` 从不给 `tier` 赋值（`Signal.tier` 默认 `"pending"`），所以该模块目前恒不成交——该事实已固化为 `test_breakout_ab.py` 最后一节的断言；修复会改变行为，按「改产线口径前先 A/B」的约定未擅自修改。
+
+**读表须知**：`可成交` 笔数低于 30 时，胜率与平均收益的差异不具统计意义，只可作方向性参考；必须同时看 `MACD走弱否决` / `KDJ高位否决` 两列——若为 0，说明差异并非来自闸门，不能据此判定闸门有效。
+
 ### 直接运行策略脚本（不落库、不发送通知）
 
 ```bash
@@ -292,13 +337,17 @@ python src/volume_breakout_strategy.py screen
 
 ### 运行单元测试
 
-四个测试均使用合成数据/打桩数据源、不访问网络，改动策略或主流程后应先跑它们（当前全部通过，合计 224 项断言）：
+以下测试均使用合成数据/打桩数据源、不访问网络，改动策略或主流程后应先跑它们（当前全部通过）：
 
 ```bash
 python test_entry_filters.py      # 单只判定：15 个入场场景 + 分层/时效/双低点背离/量价分档/评级同源/排序可复现（68 项断言）
 python test_main_layering.py      # main() 编排：周线路径与禁用路径下的正式推荐/待核验候选分层（15 项断言）
-python test_strategy_fixes.py     # 2026-09 修复回归：配置/ROE年化/流动性与波动率归因/波动率观察池采集与渲染/周线已收盘bar/regime滞回（含每自然日最多推进一次）/北京时区/向量化对拍/突破评分校准（66 项断言）
+python test_strategy_fixes.py     # 2026-09 修复回归：配置/ROE年化/流动性与波动率归因/波动率观察池采集与渲染/周线已收盘bar/regime滞回（含每自然日最多推进一次）/北京时区/向量化对拍/突破评分校准（66 项断言；飞书区块渲染 4 项在缺 requests 时自动跳过）
 python test_optimizations_p0.py   # P0 优化项：pct_chg 双源口径统一/停牌缺口过滤/排序质量分 rank_score/推荐数量上限与市场级熔断（75 项断言）
+python test_momentum_gates.py     # KDJ/MACD 下限闸门：纯函数边界与缺数据行为/突破接线（既有形态无回归 + KDJ 高位拦截可开关复现）/FAIL_MACD_WEAK 结构性不可达的扫描断言/quality_value 接线（默认口径不变 + 深度弱势被拦 + 健康匀速上行不误杀）/「新闸门在抄底 technical 路径会被既有严格确认层架空」的覆盖关系断言（40 项断言）
+python test_backtest_ab.py        # backtest ab 子命令离线测试：变体定义自检（模式名/重名/字段拼写）--set 类型强转与非法字段报错/报告渲染与警示留痕/CLI 接线（24 项断言，不联网）
+python test_breakout_ab.py        # 突破策略闸门 A/B 与漏斗诊断：GATE_VARIANTS 字段自检/_technical_cfg 不污染默认值/funnel_counts 计数守恒/gate_ab 变体与非法名报错/报告渲染口径/CLI 四开关/空标记文件跳过与坏文件仍报错/「tier 从不提升为 formal → 独立回测恒不成交」的缺陷固化（30 项断言，不联网）
+python -m unittest test_fundamental_quality test_quality_recommendations   # 年度质量与默认荐股口径（26 + 12 项）
 ```
 
 ## 数据持久化
@@ -339,6 +388,7 @@ python test_optimizations_p0.py   # P0 优化项：pct_chg 双源口径统一/�
 | RSI14 上限 / 量比上限 | 日线 | 已反弹一段否决（RSI>60）/ 天量出货否决（量比>4）；突破策略检查**前一日** RSI ≤80 |
 | 60日高点回撤（下限/上限） | 日线 | 底部区域过滤（回撤 <10% 判上涨中继；>70% 判崩盘型/价值陷阱） |
 | 20日区间位置 / MACD柱 / KDJ | 日线 | 严格确认：区间下半部 + MACD柱连续2日改善 + KDJ金叉、K≤55 且 K 上行 |
+| MACD 柱深度弱势 / KDJ 高位 | 日线 | **荐股控制闸门**（`FAIL_MACD_WEAK` / `FAIL_KDJ_HIGH`）：柱值/收盘 ≤−0.5% 且连续 2 日递减（双条件 AND）／K >85 或 K ≥80 且 K<D。突破策略默认开启；quality_value 模式由 `QV_ENFORCE_KDJ_MACD_VETO` 控制（默认关闭，保持「技术面不作否决」口径） |
 | ATR% | 日线 | 波动率风控（抄底 ≤3.33% / 突破 ≤4.0%，超限否决 FAIL_VOLATILE） |
 | 周线 MA10 / MACD | 周线 | 决赛圈确认（站上MA10且MA10上行 + MACD柱翻红或绿柱连收2周；**只用已收盘周 bar**；数据缺失/滞后 → 待核验候选） |
 | RSI14/7/21 | 日线 | 超卖反弹 + 底背离判断（前一个价格低点当根的 RSI 对比）+ 多周期共振 |
