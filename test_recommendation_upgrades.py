@@ -78,6 +78,67 @@ class TestScoreFloor(unittest.TestCase):
         self.assertLess(sig.score, 60.0)
 
 
+class TestScoreFloorEquivalence(unittest.TestCase):
+    """把「MIN_QV_SCORE=60 的实际等效门槛」固化成可执行断言。
+
+    背景：评分口径决定了「恰好压线达标」的公司拿不到 60 分——
+      · 质量分：_dimension_score 在阈值处恰好给 50 分；
+      · 估值分：行业口径在分位 0.60（闸门上限）处给 40 分；绝对口径在 PE=25/PB=3
+        （闸门上限）处给 0 分。
+    于是三道硬闸门全部恰好达标的公司，综合分上限分别是 54.0（行业）与 40.0（绝对），
+    都不足 60 —— 即本下限严格强于三道硬闸门之和，硬闸门的阈值形同虚设。
+    该算术此前只存在于口头约定，改动评分权重/闸门值就会静默失真，故在此锁死；
+    并直接校验随产品代码发布的 qv_floor_equivalence()，避免文档与实现漂移。
+    """
+
+    def test_quality_score_floor_for_verified_sample(self):
+        from src.fundamental_quality import evaluate_annual_quality
+        # 三档同时压线的最小可达样本：3 年 ROE=(5,10,10)（中位 10=阈值、最低 5=阈值）
+        # + 现金转换 0.8=阈值 → 仍判 verified，但质量分只有 50
+        rows = [{"year": y, "report_date": f"{y}-12-31", "available_date": f"{y+1}-04-20",
+                 "roe": roe, "deducted_profit": 90., "net_profit": 100.,
+                 "operating_cashflow": 80.} for y, roe in ((2022, 5.), (2023, 10.), (2024, 10.))]
+        q = evaluate_annual_quality(rows, DAY, years=3)
+        self.assertEqual(q["status"], "verified")
+        self.assertAlmostEqual(q["quality_score"], 50.0, places=2)
+        # 对照：三年皆 10（看起来更"均匀"）也只有 56.25，同样远低于 60
+        even = [dict(r, roe=10.0) for r in rows]
+        self.assertAlmostEqual(evaluate_annual_quality(even, DAY, years=3)["quality_score"],
+                               56.25, places=2)
+
+    def test_shipped_helper_reports_floor_stricter_than_gates(self):
+        cfg = m.StrategyConfig()
+        e = m.qv_floor_equivalence(cfg)
+        self.assertAlmostEqual(e["min_verified_quality"], 50.0, places=2)
+        self.assertAlmostEqual(e["valuation_industry_at_cap"], 40.0, places=6)
+        self.assertAlmostEqual(e["valuation_absolute_at_cap"], 0.0, places=6)
+        # 压线合格者即便技术分满分，综合分上限也低于下限 —— 三种口径都过不了
+        for key in ("ceiling_industry", "ceiling_absolute"):
+            self.assertLess(e[key], cfg.MIN_QV_SCORE, f"{key}={e[key]} 应低于下限")
+        self.assertAlmostEqual(e["ceiling_industry"], 54.0, places=2)
+        self.assertAlmostEqual(e["ceiling_absolute"], 40.0, places=2)
+        # 日志说明必须点出"严格强于硬闸门"这一结论，且随配置实时计算
+        self.assertIn("严格强于三道硬闸门", m.describe_qv_floor(cfg))
+
+    def test_implied_technical_requirement_matches_documented_table(self):
+        # 反解 0.5q + 0.35v + 0.15t ≥ 60 所需技术分，与配置注释/README 中的表格一致。
+        cfg = m.StrategyConfig()
+
+        def required_tech(quality_score, valuation_score):
+            return (cfg.MIN_QV_SCORE - cfg.QUALITY_SCORE_WEIGHT * quality_score
+                    - cfg.VALUATION_SCORE_WEIGHT * valuation_score) / cfg.TECHNICAL_SCORE_WEIGHT
+
+        # 质量分=压线下限 50：两个口径的技术分要求都不可达
+        self.assertGreater(required_tech(50, 40), 100.0)
+        self.assertGreater(required_tech(50, 0.0), 100.0)
+        # 质量分 70：行业口径需 73 左右；绝对口径仍不可达
+        self.assertAlmostEqual(required_tech(70, 40), 73.33, places=1)
+        self.assertGreater(required_tech(70, 0.0), 100.0)
+        # 质量分 90：行业口径几乎无约束；绝对口径必须技术分满分
+        self.assertAlmostEqual(required_tech(90, 40), 6.67, places=1)
+        self.assertAlmostEqual(required_tech(90, 0.0), 100.0, places=1)
+
+
 # ===========================================================================
 # #4b 前瞻确认（当年成长未恶化）
 # ===========================================================================

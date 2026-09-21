@@ -229,6 +229,83 @@ except ImportError as _e:  # requests 等依赖缺失的环境：跳过并明确
     print(f"[SKIP] 飞书区块渲染测试（依赖缺失: {_e}）")
 
 # ===========================================================================
+# 4b) 数据源降级 / 估值口径 / 口径名 的显式声明（通知可观测性补强）
+# ===========================================================================
+# 三个必须显式说清的场景（此前都会让用户误读）：
+#   ① 主源熔断导致的零推荐 —— 是数据问题，不是"今天没好票"，标题就要写明；
+#   ② 行业相对估值回退绝对阈值 —— 名单口径已经换了（偏向低 PE/PB 的传统板块）；
+#   ③ 标题里的口径名 —— bottom_fishing 这个 DB 值覆盖 quality_value 与 technical
+#      两种口径，零推荐时无法从数据推断，必须由调用方传 recommendation_mode。
+try:
+    import notify.feishu as _fs
+
+    _cards: list[dict] = []
+    _orig_send = _fs._send_feishu
+    _fs._send_feishu = lambda card: (_cards.append(card), True)[1]
+    try:
+        _fs.notify_screening_result(None, market_env="偏空", strategy="bottom_fishing",
+                                    data_degraded=True, valuation_mode="absolute",
+                                    recommendation_mode="quality_value")
+        _blob = json.dumps(_cards[-1], ensure_ascii=False)
+        check("飞书: 降级零推荐标题写明「数据源不足，本次无正式推荐」（而非「今日无信号」）",
+              "数据源不足，本次无正式推荐" in _blob and "今日无信号" not in _blob)
+        check("飞书: 降级卡片点明「原因是数据源，不是市场」", "不是市场" in _blob)
+        check("飞书: 绝对估值口径被显式声明且提示不可与行业口径直接比较",
+              "绝对阈值回退" in _blob and "请勿与" in _blob)
+
+        _cards.clear()
+        _rec = pd.DataFrame([{"code": "600000", "name": "测试股", "date": "2025-06-30",
+                              "close": 10.0, "score": 70.0, "grade": "B", "tier": "formal",
+                              "fund_status": "verified", "weekly_status": "not_required",
+                              "stop_loss": 9.5, "take_profit": 11.0, "rr_ratio": 2.0,
+                              "signals_hit": "优质低估低位", "position_250": 0.2}])
+        _fs.notify_screening_result(_rec, market_env="中性", strategy="bottom_fishing",
+                                    valuation_mode="mixed",
+                                    recommendation_mode="quality_value")
+        _blob2 = json.dumps(_cards[-1], ensure_ascii=False)
+        check("飞书: 有推荐时混合口径同样显式声明", "混合口径" in _blob2)
+        check("飞书: 标题按实际口径取名（【优质低估低位】），不再出现自相矛盾的【抄底策略】",
+              "【优质低估低位】" in _blob2 and "【抄底策略】" not in _blob2)
+
+        # 零推荐时不可依赖数据推断口径：同一份"无 df"，technical 必须显示【低位企稳】
+        _cards.clear()
+        _fs.notify_screening_result(None, market_env="中性", strategy="bottom_fishing",
+                                    recommendation_mode="technical")
+        _blob3 = json.dumps(_cards[-1], ensure_ascii=False)
+        check("飞书: 零推荐 + technical 口径 → 标题为【低位企稳】（不误标为优质低估低位）",
+              "【低位企稳】" in _blob3 and "【优质低估低位】" not in _blob3)
+
+        # 突破入口两种口径下都应显示【放量突破】
+        _cards.clear()
+        _fs.notify_screening_result(None, market_env="偏空", strategy="volume_breakout",
+                                    recommendation_mode="technical")
+        check("飞书: 突破入口标题为【放量突破】",
+              "【放量突破】" in json.dumps(_cards[-1], ensure_ascii=False))
+    finally:
+        _fs._send_feishu = _orig_send
+except ImportError as _e:  # requests 等依赖缺失的环境：跳过并明确提示
+    print(f"[SKIP] 飞书降级/口径声明测试（依赖缺失: {_e}）")
+
+# ===========================================================================
+# 4c) 估值口径逐行标注（_tag_valuation_mode）
+# ===========================================================================
+# 行业相对估值回退是合法降级，但必须可观测：口径要落到数据里（valuation_mode 列），
+# 才能由 run.py 汇总后告知用户"本次名单是绝对阈值口径"。
+_frame_vm = pd.DataFrame([{"code": "600000", "pe_ttm": 12.0, "pb_mrq": 1.2},
+                          {"code": "600001", "pe_ttm": 8.0, "pb_mrq": 0.9}])
+_tagged = m._tag_valuation_mode(_frame_vm, {}, {}, m.StrategyConfig())
+check("估值口径: 快照为空时逐行标注为 absolute（全市场回退绝对阈值）",
+      _tagged["valuation_mode"].tolist() == ["absolute", "absolute"])
+check("估值口径: 标注不丢失原有列与行序",
+      list(_tagged["code"]) == ["600000", "600001"] and "pe_ttm" in _tagged.columns)
+_snap = {"工业": {"pe": np.array([8.0, 10.0, 12.0, 14.0, 16.0, 18.0]),
+                  "pb": np.array([0.8, 1.0, 1.2, 1.4, 1.6, 1.8])}}
+_tagged2 = m._tag_valuation_mode(_frame_vm, _snap, {"600000": "工业", "600001": "金融"},
+                                 m.StrategyConfig())
+check("估值口径: 行业样本充足者为 industry、无行业归属者回退 absolute",
+      _tagged2["valuation_mode"].tolist() == ["industry", "absolute"])
+
+# ===========================================================================
 # 5) 周线未收盘 bar 剔除
 # ===========================================================================
 _today = m._beijing_now().date()

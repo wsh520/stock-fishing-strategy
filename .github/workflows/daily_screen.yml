@@ -28,7 +28,7 @@ on:
         type: boolean
         default: false
       skip_breakout:
-        description: "只跑抄底策略，跳过放量突破"
+        description: "只跑优质低估低位策略，跳过放量突破"
         type: boolean
         default: false
       breakout_no_save:
@@ -92,7 +92,7 @@ jobs:
           # 删除「恢复回来的」行情类缓存（daily_/weekly_/index_daily_）：
           # 这三类的新鲜度由文件 mtime 判定（_cache_fresh_today），复用与否取决于
           # actions/cache 是否保留了 mtime —— 实盘推荐的正确性不应建立在这个假设上。
-          # 删除不影响本 workflow 的策略间共享：同一 runner 上先跑的抄底会全量拉取
+          # 删除不影响本 workflow 的策略间共享：同一 runner 上先跑的优质低估低位会全量拉取
           # 并重新写入当天行情，随后突破步骤直接读同一份文件（共享正是发生在这里）。
           # 保留 stock_list(6天) / fund_v2(7天) / industry(30天) / market_regime_state.json：
           # 它们是真正时间不敏感的数据，用 TTL 判定、与 mtime 无关，跨天复用是正确且必要的
@@ -141,7 +141,7 @@ jobs:
           # 关闭 stdout 缓冲：否则 Python 输出按块缓冲，任务超时/取消后缓冲的日志全部丢失
           PYTHONUNBUFFERED: "1"
           # 定时任务【使用】磁盘缓存（不再强制 --no-cache）：这是共享当日行情的前提 ——
-          # 抄底必须把当天日线/基本面写进 cache/，同一 runner 上的突破步骤才能零重拉复用。
+          # 优质低估低位必须把当天日线/基本面写进 cache/，同一 runner 上的突破步骤才能零重拉复用。
           # 定时运行「必须基于当日最新行情」这一正确性要求，由上面的 Purge restored quote
           # cache 步骤承担（仅在 schedule 或勾选 purge_cache 时执行）；手动运行则由
           # Reuse last close snapshot 步骤复用最近一次收盘快照，白天的反复测试因此从
@@ -153,21 +153,21 @@ jobs:
           ARGS=""
           if [ "$NO_CACHE" = "true" ]; then
             ARGS="$ARGS --no-cache"
-            echo "::notice::已勾选 no_cache：抄底与突破均跳过 cache/，全部从数据源拉取（本次不共享）"
+            echo "::notice::已勾选 no_cache：优质低估低位与突破均跳过 cache/，全部从数据源拉取（本次不共享）"
           fi
           if [ "$NO_SAVE" = "true" ]; then
             ARGS="$ARGS --no-save"
-            echo "::notice::已勾选 no_save：抄底本次跳过 MySQL 落库（测试推荐不会与晚间正式结果混在同一天）"
+            echo "::notice::已勾选 no_save：优质低估低位本次跳过 MySQL 落库（测试推荐不会与晚间正式结果混在同一天）"
           fi
           if [ "$NO_NOTIFY" = "true" ]; then
             ARGS="$ARGS --no-notify"
-            echo "::notice::已勾选 no_notify：抄底本次跳过飞书通知"
+            echo "::notice::已勾选 no_notify：优质低估低位本次跳过飞书通知"
           fi
-          echo "::notice::抄底策略开始：run.py $ARGS"
+          echo "::notice::优质低估低位策略开始：run.py $ARGS"
           python -u run.py $ARGS
 
-      # if: always() —— 抄底失败/异常时突破仍要执行：两套策略是独立信号源，
-      # 不应互相阻塞。抄底未写出的缓存由突破自行补拉（慢但结果正确）。
+      # if: always() —— 优质低估低位失败/异常时突破仍要执行：两套策略是独立信号源，
+      # 不应互相阻塞。优质低估低位未写出的缓存由突破自行补拉（慢但结果正确）。
       - name: Run breakout strategy
         if: always() && inputs.skip_breakout != true
         env:
@@ -197,11 +197,11 @@ jobs:
             ARGS="$ARGS --no-notify"
             echo "::notice::已勾选 no_notify / breakout_no_notify：突破本次跳过飞书通知"
           fi
-          # 组合层去重（fetch_rec_codes_for_date 剔除当日已被抄底推荐的个股）
-          # 依赖运行顺序，本步骤排在抄底之后即为顺序保证。
-          # 注意：抄底若带 --no-save，当天 MySQL 里没有抄底记录，本步骤的去重自然不生效
+          # 组合层去重（fetch_rec_codes_for_date 剔除当日已被优质低估低位推荐的个股）
+          # 依赖运行顺序，本步骤排在优质低估低位之后即为顺序保证。
+          # 注意：优质低估低位若带 --no-save，当天 MySQL 里没有优质低估低位记录，本步骤的去重自然不生效
           # （测试运行期望的行为——没有落库就没有可去重的样本）。
-          echo "::notice::突破策略开始（复用抄底写下的当天行情缓存）：run_breakout.py $ARGS"
+          echo "::notice::突破策略开始（复用优质低估低位写下的当天行情缓存）：run_breakout.py $ARGS"
           python -u run_breakout.py $ARGS
 
       - name: Upload diagnostics

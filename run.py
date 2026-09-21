@@ -73,6 +73,25 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _valuation_mode_of(df) -> str | None:
+    """从策略层写入的 valuation_mode 列推断本次实际生效的估值口径。
+
+    策略层（_screen_quality_pool → _tag_valuation_mode）已逐行标注 industry / absolute；
+    这里收敛成一个卡片声明值，避免「口径悄悄回退到绝对阈值」在通知里没有任何痕迹。
+    返回 None 表示无需声明（未启用行业相对估值，或拿不到该列）。
+    """
+    if df is None or getattr(df, "empty", True) or "valuation_mode" not in df.columns:
+        return None
+    modes = {str(m) for m in df["valuation_mode"].dropna().tolist()}
+    if modes == {"industry"}:
+        return "industry"
+    if modes == {"absolute"}:
+        return "absolute"
+    if modes:
+        return "mixed"
+    return None
+
+
 def run(argv: list[str] | None = None):
     """主执行流程"""
     _setup_logging()
@@ -97,11 +116,13 @@ def run(argv: list[str] | None = None):
         logger.info("已启用 --no-notify：本次不推送飞书通知")
 
     config = StrategyConfig()
-    # ===== P1：生产启用「熊市抄底侧止跌闸门」=====
-    # 库级默认关闭（保持既有口径与单测不变），仅在生产入口开启：熊市（含 unknown 折叠）
-    # 的正式推荐必须满足最低止跌证据（站上 MA20 或 MACD 柱连续改善），否则否决。
-    # 修复"突破策略熊市空仓、抄底侧却仍在纯左侧接飞刀"的组合暴露失衡。
-    config.QV_BEAR_TIMING_GATE = True
+    # 注：熊市止跌闸门（QV_BEAR_TIMING_GATE）已收进 StrategyConfig 的库级默认值（True），
+    # 本入口不再单独覆盖——此前库级为 False、仅此处置 True，会让任何用默认 config 跑的实验
+    # （backtest.py ab、单测）跑在一个生产并不存在的策略上，A/B 结论无法采信。
+    # 现生产口径 == 库级口径，无需覆盖；需要关掉时显式 config.QV_BEAR_TIMING_GATE = False。
+    logger.info("生效口径：RECOMMENDATION_MODE=%s | 熊市止跌闸门=%s | 综合分下限=%s",
+                config.RECOMMENDATION_MODE, "启用" if config.QV_BEAR_TIMING_GATE else "关闭",
+                config.MIN_QV_SCORE)
     if args.no_cache:
         config.USE_CACHE = False
         logger.info("已启用 --no-cache：跳过 cache/ 磁盘缓存读写，本次全部从数据源拉取")
@@ -171,9 +192,16 @@ def run(argv: list[str] | None = None):
             # 待核验候选（pending）仅在上方 CI 日志中打印计数，不再进入飞书卡片：
             # 数据不全的标的既不构成推荐也不该被误读为备选，飞书只展示正式推荐 Top-3。
             volatile_df = pd.DataFrame(volatile_rows) if volatile_rows else None
+            # 估值口径声明：行业相对估值回退到绝对阈值时必须显式告知，否则用户会拿一份
+            # 「口径已换」的名单与往常对比（绝对口径系统性偏向低 PE/PB 的传统板块）。
+            vmode = _valuation_mode_of(output_df)
+            if vmode in ("absolute", "mixed"):
+                logger.warning("本次估值口径为 %s（行业相对估值未完全生效），飞书卡片将显式声明",
+                               "绝对阈值回退" if vmode == "absolute" else "混合口径")
             notify_screening_result(output_df, market_env=market_env_desc,
                                     strategy="bottom_fishing", volatile=volatile_df,
-                                    data_degraded=degraded)
+                                    data_degraded=degraded, valuation_mode=vmode,
+                                    recommendation_mode=config.RECOMMENDATION_MODE)
             logger.info("Step 4/4 完成 (%.1f 秒)", time.time() - t)
         else:
             logger.info("Step 4/4 已跳过（--no-notify）：不推送飞书")
@@ -184,7 +212,8 @@ def run(argv: list[str] | None = None):
         logger.exception("策略执行失败: %s", e)
         # 发送错误通知（--no-notify 时同样跳过，避免测试运行刷屏；失败详情见上方 traceback）
         if notify_enabled:
-            notify_screening_result(None, market_env=market_env_desc, error_msg=str(e))
+            notify_screening_result(None, market_env=market_env_desc, error_msg=str(e),
+                                    recommendation_mode=config.RECOMMENDATION_MODE)
         sys.exit(1)
 
 

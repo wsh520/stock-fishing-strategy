@@ -26,9 +26,11 @@
 
 ---
 
-### 一、策略定位与抄底策略的差异
+### 一、策略定位与低位企稳口径（bottom_fishing 的 technical 模式）的差异
 
-| 维度 | bottom_fishing（抄底） | volume_breakout（放量突破） |
+> 名称为准：`bottom_fishing_strategy.py` 的生产默认口径是 **quality_value（优质低估低位）**，不是技术抄底；下表的阈值对照针对的是该模块的 **technical 对照口径（对外称「低位企稳」）**，即真正的技术抄底逻辑。
+
+| 维度 | bottom_fishing（低位企稳 / technical） | volume_breakout（放量突破） |
 | --- | --- | --- |
 | 入场时机 | 下跌末端、底背离、超卖反弹 | 整理末端、放量突破关键位 |
 | 位置偏好 | 近 20 日区间下半部（低位） | 近 60 日新高附近（相对高位） |
@@ -154,7 +156,7 @@
 **验证工具与两个必须知道的前提**（命令见 README「突破策略闸门 A/B 与漏斗归因」）：
 
 1. 层 3.8 **只在 `RECOMMENDATION_MODE == "technical"` 时执行**。生产默认 `quality_value`（`run_breakout.py` 用的就是它）下，`evaluate_breakout` 会先委派 `evaluate_quality_value`，本层只影响「放量突破」标签，**不影响荐股资格**；要让 KDJ/MACD 真正管荐股，需开启 `QV_ENFORCE_KDJ_MACD_VETO` 或切 technical 模式。
-2. `src/volume_breakout_backtest.py` 目前**恒不成交**（既有缺陷）：它只收 `tier == "formal"` 的信号，但本策略从不给 `Signal.tier` 赋值（默认 `"pending"`），只有抄底策略会写 `tier="formal"`。因此该独立回测在任何输入下都是 0 事件/0 成交。已固化为 `test_breakout_ab.py` 最后一节的断言；修复会改变行为，按「改产线口径前先 A/B」的约定未擅自修改。
+2. `src/volume_breakout_backtest.py` 目前**恒不成交**（既有缺陷）：它只收 `tier == "formal"` 的信号，但 `evaluate_breakout()` 在构造 `BreakoutSignal` 时就显式写死 `tier="pending"`；`formal` 提升发生在 `main_breakout()` 的决赛圈终审（市场日期、财务核心项、补齐后否决项、周线数据充分性/新鲜度与条件、行业名额全过才置 formal），而该独立回测直接调用 `evaluate_breakout`、不经过该路径。因此该回测在任何输入下都是 0 事件/0 成交。已固化为 `test_breakout_ab.py` 最后一节的断言；修复会改变行为，按「改产线口径前先 A/B」的约定未擅自修改。
 3. 用 `--funnel` 先看漏斗再谈闸门：实测 80 只 × 120 日共 9600 次评估中 `FAIL_NO_BREAKOUT` 占 94.75%、随后 `FAIL_VOL_INSUFFICIENT`（`daily_vol_ratio < 1.8`）与 `FAIL_LIQUIDITY` 是主要淘汰项，**PASS = 0**——即漏斗在评分定级之前就已闭合。此时 A/B 对照表全为 0，不能用来判断闸门有效性。
 
 #### 层 4｜波动率风控

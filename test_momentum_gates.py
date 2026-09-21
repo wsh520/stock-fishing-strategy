@@ -242,11 +242,14 @@ def qv_fund() -> dict:
 
 
 def qv_evaluate(close, veto: bool):
-    # MIN_QV_SCORE=0：本节只验证 KDJ/MACD 下限闸门，关闭与之无关的综合分下限，
-    # 避免样本分数（~53）触发 FAIL_QV_SCORE 掩盖被测闸门的归因。
+    # 本节只验证 KDJ/MACD 下限闸门，关闭两个与之无关的闸门以隔离被测维度：
+    #   · MIN_QV_SCORE=0 —— 样本分数（~53）会触发 FAIL_QV_SCORE 掩盖真正的归因；
+    #   · QV_BEAR_TIMING_GATE=False —— 该闸门现为**库级默认开启**（生产口径已收进
+    #     StrategyConfig，不再由 run.py 覆盖），而本节的 regime 固定为 bear，
+    #     深度回落形态会被它先拦成 FAIL_BEAR_TIMING。它自身的行为在下方有专节断言。
     return m.evaluate(qv_df(close), "600001", "工业企业",
                       m.StrategyConfig(USE_CACHE=False, QV_ENFORCE_KDJ_MACD_VETO=veto,
-                                       MIN_QV_SCORE=0),
+                                       MIN_QV_SCORE=0, QV_BEAR_TIMING_GATE=False),
                       {"regime": "bear"}, qv_fund(), latest_trade_date=_QV_DAY)
 
 
@@ -301,6 +304,36 @@ _, _r_dc = m.evaluate(qv_df(_healthy), "600001", "工业企业", _qv_dc,
 _kd_pair = (float(_healthy_tech["kdj_k"].iloc[-1]), float(_healthy_tech["kdj_d"].iloc[-1]))
 check(f"QV: KDJ 顶部死叉分支可被真实触发（K/D={_kd_pair}）: {_r_dc}",
       _r_dc == "FAIL_KDJ_HIGH")
+
+# ===========================================================================
+# 5b) 熊市止跌闸门（QV_BEAR_TIMING_GATE）—— 已从 run.py 覆盖收进库级默认
+# ===========================================================================
+# 该闸门此前「库级 False、仅 run.py 置 True」，导致库级口径 ≠ 生产口径；现默认值为 True。
+# 本节锁定两件事：默认确实是开启的；且它只作用于熊市（含 unknown 折叠），牛市完全不受影响。
+_bear_default = m.StrategyConfig()
+check(f"熊市止跌闸门: 库级默认已开启（不再由 run.py 单独覆盖），实际={_bear_default.QV_BEAR_TIMING_GATE}",
+      _bear_default.QV_BEAR_TIMING_GATE is True)
+
+_gate_cfg = m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0)
+_, _r_bear = m.evaluate(qv_df(_weak), "600001", "工业企业", _gate_cfg,
+                        {"regime": "bear"}, qv_fund(), latest_trade_date=_QV_DAY)
+check(f"熊市止跌闸门: 熊市下未止跌形态被拦: {_r_bear}", _r_bear == "FAIL_BEAR_TIMING")
+
+_, _r_unknown = m.evaluate(qv_df(_weak), "600001", "工业企业", _gate_cfg,
+                           {"regime": "unknown"}, qv_fund(), latest_trade_date=_QV_DAY)
+check(f"熊市止跌闸门: unknown 经 _effective_regime 折叠为熊，同样被拦: {_r_unknown}",
+      _r_unknown == "FAIL_BEAR_TIMING")
+
+_, _r_bull_gate = m.evaluate(qv_df(_weak), "600001", "工业企业", _gate_cfg,
+                             {"regime": "bull"}, qv_fund(), latest_trade_date=_QV_DAY)
+check(f"熊市止跌闸门: 牛市完全不生效（同形态放行）: {_r_bull_gate}", _r_bull_gate == "PASS")
+
+_, _r_bear_off = m.evaluate(qv_df(_weak), "600001", "工业企业",
+                            m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0,
+                                             QV_BEAR_TIMING_GATE=False),
+                            {"regime": "bear"}, qv_fund(), latest_trade_date=_QV_DAY)
+check(f"熊市止跌闸门: 显式关闭即恢复放行（证明拦截来自该闸门）: {_r_bear_off}",
+      _r_bear_off == "PASS")
 
 # ===========================================================================
 # 6) 为什么新闸门没有加进抄底策略的 technical 路径

@@ -63,15 +63,36 @@ def _divider() -> dict:
     return {"tag": "hr"}
 
 
-_STRATEGY_ZH = {"bottom_fishing": "抄底", "volume_breakout": "突破"}
-# 卡片标题按策略加统一前缀，避免不同策略通知看起来像同一条消息。
-# 例：【抄底策略】优质低估低位荐股 / 【突破策略】放量突破选股结果
-_STRATEGY_TITLE_PREFIX = {"bottom_fishing": "【抄底策略】", "volume_breakout": "【突破策略】"}
-_VOLATILE_STRATEGY_LABEL = {"bottom_fishing": "抄底信号", "volume_breakout": "突破信号"}
+_STRATEGY_ZH = {"bottom_fishing": "优质低估低位", "volume_breakout": "放量突破"}
+# 卡片标题前缀 = 该次运行**实际生效的资格口径名**，而不是落库用的 strategy 值。
+# 原因：DB 的 strategy='bottom_fishing' 是一个覆盖两种口径的 sleeve 标识——
+#   · quality_value（生产默认）：多年质量 + 行业相对低估 + 250 日低位，**不是技术抄底**；
+#   · technical（对照/旧规则）：RSI 超卖 + 底背离 + 回撤深度，才是真正的技术抄底。
+# 此前统一显示为【抄底策略】，会把前者（绝大多数）误标成后者，故按实际口径取名。
+# 例：【优质低估低位】选股结果 / 【放量突破】选股结果 / 【低位企稳】选股结果（technical）
+_LOW_POSITION_ROLE = "低位企稳"
+_STRATEGY_ROLE_ZH = {"bottom_fishing": "优质低估低位", "volume_breakout": "放量突破"}
+_VOLATILE_STRATEGY_LABEL = {"bottom_fishing": "优质低估低位信号", "volume_breakout": "放量突破信号"}
 VOLATILE_CARD_TOP = 5   # 卡片内逐只展示上限（超出仅提示条数，避免卡片过长）
 # 飞书通知每策略最多展示的股票数。策略层已按 MAX_PICKS/NEUTRAL_MAX_PICKS/BEAR_MAX_PICKS
 # 截取正式推荐，这里再做一次通知口径的收敛：宁缺毋滥，用户只看 Top-3。
 NOTIFY_TOP_PER_STRATEGY = 3
+
+# ===== 估值口径声明 =====
+# 行业相对估值依赖单一 Baostock 接口 query_stock_industry；它不可用时全市场回退绝对阈值
+# （PE≤25 / PB≤3）——而绝对阈值正是本项目刻意避开的「名单压向银行/地产/周期」口径。
+# 回退是合法降级，但不能让用户在一份「看起来正常」的名单上误判口径，故在卡片显式声明。
+_VALUATION_MODE_NOTE = {
+    "absolute": (
+        "\n⚠️ **估值口径：本次为绝对阈值回退**（行业相对估值未生效——行业分类/行业快照不可用，"
+        "或行业内可比样本不足）。名单会偏向低 PE/PB 的银行、地产、周期板块，"
+        "**请勿与「行业相对低估」口径的结果直接比较**。"
+    ),
+    "mixed": (
+        "\n⚠️ **估值口径：本次为混合口径**——部分标的因行业样本不足回退到绝对阈值"
+        "（PE≤25 / PB≤3），同一份名单内的「便宜」含义不完全可比。"
+    ),
+}
 
 
 def _volatile_elements(volatile: Optional[pd.DataFrame], strategy: str = "bottom_fishing",
@@ -131,6 +152,8 @@ def notify_screening_result(
     strategy: str = "bottom_fishing",
     volatile: Optional[pd.DataFrame] = None,
     data_degraded: bool = False,
+    valuation_mode: Optional[str] = None,
+    recommendation_mode: str = "quality_value",
 ) -> None:
     """发送选股结果通知。
 
@@ -142,8 +165,23 @@ def notify_screening_result(
     展示口径：df 为正式推荐，每策略最多 NOTIFY_TOP_PER_STRATEGY=3 只（宁缺毋滥）；
     volatile 为「波动率风控否决」的高风险观察池（技术面/形态已达标，仅 ATR 超限被拦），
     单独成区块并显式标注风险等级与风险提示，避免被误读为推荐标的。
-    strategy 决定卡片标题前缀与单票描述格式（抄底=低位企稳候选 / 突破=放量突破候选），
-    两策略通知的卡片标题以【抄底策略】/【突破策略】前缀区分，避免混淆。
+    strategy 决定卡片标题前缀与单票描述格式（优质低估低位口径=优质低估低位候选 /
+    突破入口=放量突破候选 / technical 对照口径=低位企稳候选），
+    两策略通知的卡片标题以「实际生效口径名」前缀区分：【优质低估低位】（quality_value，
+    生产默认）/【放量突破】（technical 的突破入口）；technical 的抄底对照口径显示为
+    【低位企稳】。用口径名而非 strategy 值，是为了让标题说出真实的选股逻辑（见 _STRATEGY_ROLE_ZH）。
+
+    data_degraded：主源 Baostock 熔断、全程走 AkShare。此时逐 bar 估值字段与成长数据
+    都拿不到，quality_value 的估值闸门与前瞻确认会双双记缺项 → formal 常为 0。
+    **这种零推荐是数据问题而非市场问题**，故降级日的卡片标题直接写明，避免误读。
+
+    valuation_mode：本次实际生效的估值口径（"industry" / "absolute" / "mixed"），
+    由 strategy 层写入 output_df 的 valuation_mode 列后透传。为 "absolute"/"mixed" 时
+    卡片会显式声明「已回退绝对阈值」——绝对口径会系统性偏向低 PE/PB 的传统板块。
+
+    recommendation_mode：本次实际生效的资格判定模式（quality_value / technical），
+    决定标题里的口径名。必须由调用方显式给出：零推荐时没有任何行可供推断口径，
+    只凭 df 会把 production 的 quality_value 误标为【低位企稳】（technical 对照口径）。
 
     注：pending（待核验候选）参数保留以兼容旧调用签名，但**不再在飞书卡片中渲染**——
     待核验意味着数据不全、既不构成推荐也不该被误读为备选，仅在 CI 日志中打印计数即可。
@@ -158,15 +196,23 @@ def notify_screening_result(
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     is_breakout = strategy == "volume_breakout"
     candidate_label = "放量突破候选" if is_breakout else "低位企稳候选"
-    card_title = "放量突破选股结果" if is_breakout else "选股结果"
+    # quality_mode：本次跑的是 quality_value 资格（周线确认 not_required 是其标志），
+    # 与 technical（真正的技术抄底）区分开——两者的入选逻辑完全不同，标题不应混用。
+    # 注意：**零推荐时从数据里推不出口径**（没有任何行可供判断），所以标题不能只依赖它，
+    # 必须由调用方显式传 recommendation_mode（run.py 传 config.RECOMMENDATION_MODE）。
     quality_mode = any(frame is not None and not frame.empty and "weekly_status" in frame
                        and frame["weekly_status"].eq("not_required").any()
                        for frame in (df, pending))
     if quality_mode:
         candidate_label = "优质低估低位候选"
-        card_title = "优质低估低位荐股"
-    # 统一按策略加前缀，两个策略的卡片标题一眼可辨。
-    card_title = _STRATEGY_TITLE_PREFIX.get(strategy, "") + card_title
+    # 标题即「实际口径名 + 选股结果」，不再出现【抄底策略】优质低估低位荐股 这类自相矛盾的组合。
+    if is_breakout:
+        _role = _STRATEGY_ROLE_ZH["volume_breakout"]
+    elif str(recommendation_mode or "").strip().lower() == "technical":
+        _role = _LOW_POSITION_ROLE
+    else:
+        _role = _STRATEGY_ROLE_ZH["bottom_fishing"]
+    card_title = f"【{_role}】选股结果"
 
     # 异常通知
     if error_msg:
@@ -195,22 +241,26 @@ def notify_screening_result(
 
     # 无信号
     if df is None or df.empty:
-        no_signal_text = "今日无正式推荐（未发现数据完整且通过全部条件的标的），宁可少荐。"
         if data_degraded:
-            # P6：数据源降级导致的零推荐，必须与"今天没有好票"区分开，避免误读。
-            no_signal_text += (
-                "\n\n⚠️ **本次运行数据源已降级**（Baostock 不可用，已回退 AkShare）："
-                "AkShare 逐 bar 不提供估值字段（peTTM/pbMRQ），优质低估低位策略的估值闸门"
-                "缺列会把候选降级为待核验，从而 formal 正式推荐为 0。"
-                "**这通常是数据问题，而非今天没有合格标的**，请复核数据源后重跑。"
+            # 降级日的零推荐首先是**数据问题**，标题就要讲明白，不能指望用户去读正文——
+            # 否则「今天没有好票」与「今天没有数据」在第一时间无法区分。
+            no_signal_text = (
+                "**本次不足以产生正式推荐：原因是数据源，不是市场。**\n\n"
+                "Baostock 不可用，已回退 AkShare：AkShare 逐 bar 不提供估值字段（peTTM/pbMRQ），"
+                "也没有成长数据通道，优质低估低位的**估值闸门与前瞻确认会双双记缺项**，"
+                "候选整体降级为待核验，formal 正式推荐因此为 0。"
+                "**这不等于「今天没有合格标的」**，请先复核数据源（是否被限流/熔断）后重跑。"
             )
+        else:
+            no_signal_text = "今日无正式推荐（未发现数据完整且通过全部条件的标的），宁可少荐。"
         if volatile is not None and not volatile.empty:
             no_signal_text += (f"\n本轮有 {len(volatile)} 只仅因**波动率超限**被拦下"
                                f"（技术面已达标），详见下方高风险观察池。")
+        no_signal_text += _VALUATION_MODE_NOTE.get(str(valuation_mode), "")
         card = {
             "header": _build_header(
-                f"{card_title} - 今日无信号"
-                + ("（数据源降级）" if data_degraded else "")
+                (f"{card_title} - 数据源不足，本次无正式推荐" if data_degraded
+                 else f"{card_title} - 今日无信号")
                 + (f"（波动率观察池 {len(volatile)} 只）" if volatile is not None and not volatile.empty else ""),
                 color="orange" if data_degraded else "grey"),
             "elements": [
@@ -232,8 +282,10 @@ def notify_screening_result(
             f"**推荐数量:** {shown_n} 只（{candidate_label}"
             + (f"，策略命中 {len(df)} 只，展示 Top-{top_n}" if len(df) > shown_n else "")
             + "）"
-            + ("\n⚠️ **数据源已降级（AkShare 兜底）**：估值字段可能缺失，正式推荐数或被压低，请留意核验状态。"
+            + ("\n⚠️ **数据源已降级（AkShare 兜底）**：估值字段与成长数据可能缺失，"
+               "名单可能不完整（部分标的已被降级为待核验），请留意每只的核验状态。"
                if data_degraded else "")
+            + _VALUATION_MODE_NOTE.get(str(valuation_mode), "")
         ),
         _divider(),
     ]
@@ -269,8 +321,8 @@ def notify_tracking_result(report: Optional[pd.DataFrame]) -> None:
     参数匹配 run_weekly_tracking.py 中的调用:
         notify_tracking_result(report)
 
-    report 含 strategy 列时按策略来源分列统计（抄底/突破各自的数量/胜率/平均收益），
-    逐只明细行也带 [抄底]/[突破] 前缀标签。
+    report 含 strategy 列时按策略来源分列统计（优质低估低位/放量突破各自的数量/胜率/平均收益），
+    逐只明细行也带 [优质低估低位]/[放量突破] 前缀标签。
     """
     if report is None or report.empty:
         return

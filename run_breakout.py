@@ -15,7 +15,7 @@
 - 导入 volume_breakout_strategy 而非 bottom_fishing_strategy
 - 熊市直接跳过（main_breakout 内部已处理，本脚本仅记录日志）
 - 落库复用 save_recommendations；同日同股重复推荐由现有唯一键忽略
-- 通知标题为「放量突破选股结果」，与抄底策略通知区分
+- 通知标题为「放量突破选股结果」，与优质低估低位策略通知区分
 """
 
 import argparse
@@ -85,12 +85,12 @@ def run(argv: list[str] | None = None):
 
     config = VolumeBreakoutConfig()
     # ===== 突破策略＝独立的第二信号源（#1）=====
-    # 抄底入口（run.py）跑 quality_value（优质低估低位）。若突破入口也用 quality_value，
+    # 优质低估低位入口（run.py）跑 quality_value（优质低估低位）。若突破入口也用 quality_value，
     # evaluate_breakout 会委派同一个 evaluate_quality_value 资格判定，两套策略产出完全相同，
     # 再经下方组合层去重后突破卡片恒为空——等于花双份成本拿一份结果。
     # 这里强制 technical 模式，让突破走自己独立的「七层漏斗」（突破/量能/形态/平台/趋势/
     # 假突破/RSI/动能/波动率/评分 + 决赛圈周线确认 + 熊市空仓），成为真正独立的信号源；
-    # 与抄底的重叠由下方 fetch_rec_codes_for_date 去重、合计上限由 DAILY_TOTAL_MAX_PICKS 约束。
+    # 与优质低估低位的重叠由下方 fetch_rec_codes_for_date 去重、合计上限由 DAILY_TOTAL_MAX_PICKS 约束。
     config.RECOMMENDATION_MODE = "technical"
     if args.no_cache:
         config.USE_CACHE = False
@@ -111,7 +111,7 @@ def run(argv: list[str] | None = None):
                 logger.info("市场环境为 bear，放量突破策略直接空仓（BEAR_MAX_PICKS_BREAKOUT=0），本次运行终止")
                 if not args.no_notify:
                     # 必须显式传 strategy：notify_screening_result 的默认值是 bottom_fishing，
-                    # 漏传会让熊市空仓通知套用抄底模板（标题/措辞串味）。该分支在 bear 时必然命中。
+                    # 漏传会让熊市空仓通知套用优质低估低位模板（标题/措辞串味）。该分支在 bear 时必然命中。
                     notify_screening_result(None, market_env=market_env_desc, strategy="volume_breakout")
                 return
         except Exception:
@@ -156,16 +156,16 @@ def run(argv: list[str] | None = None):
                 logger.warning("组合层去重/上限检查失败（按原结果继续）: %s", e)
 
         # ===== P1：组合层市场暴露提示 =====
-        # 抄底（250日低位·左侧价值）与突破（60日新高·右侧动量）同日互斥，去重近乎空操作，
+        # 优质低估低位（250日低位·左侧价值）与突破（60日新高·右侧动量）同日互斥，去重近乎空操作，
         # 合计名单实为两个独立 sleeve 的拼接。熊市里突破已空仓（BEAR_MAX_PICKS_BREAKOUT=0），
-        # 组合会退化为"纯抄底左侧暴露"——此处显式打印两 sleeve 构成与市场环境，供人工裁量。
+        # 组合会退化为"纯优质低估低位左侧暴露"——此处显式打印两 sleeve 构成与市场环境，供人工裁量。
         n_breakout = 0 if output_df is None else len(output_df)
         n_existing = len(existing)
-        logger.info("组合暴露：市场环境=%s | 抄底侧(先落库) %d 只 + 突破侧 %d 只 = 合计 %d 只（上限 %d）",
+        logger.info("组合暴露：市场环境=%s | 优质低估低位侧(先落库) %d 只 + 突破侧 %d 只 = 合计 %d 只（上限 %d）",
                     market_env_desc, n_existing, n_breakout, n_existing + n_breakout,
                     int(getattr(config, "DAILY_TOTAL_MAX_PICKS", 7)))
         if any(k in str(market_env_desc) for k in ("偏空", "bear")):
-            logger.warning("组合暴露提示：当前偏空/熊市，突破侧已空仓，合计暴露全部来自抄底左侧价值 sleeve，"
+            logger.warning("组合暴露提示：当前偏空/熊市，突破侧已空仓，合计暴露全部来自优质低估低位左侧价值 sleeve，"
                            "系统性下跌中相关度高、易同涨同跌，请据此下调整体仓位")
 
         n_picks = 0 if output_df is None else len(output_df)
@@ -205,7 +205,8 @@ def run(argv: list[str] | None = None):
             volatile_df = pd.DataFrame(volatile_rows) if volatile_rows else None
             notify_screening_result(output_df, market_env=market_env_desc,
                                     strategy="volume_breakout", volatile=volatile_df,
-                                    data_degraded=degraded)
+                                    data_degraded=degraded,
+                                    recommendation_mode=config.RECOMMENDATION_MODE)
             logger.info("Step 4/4 完成 (%.1f 秒)", time.time() - t)
         else:
             logger.info("Step 4/4 已跳过（--no-notify）")
@@ -215,7 +216,7 @@ def run(argv: list[str] | None = None):
     except Exception as e:
         logger.exception("放量突破策略执行失败: %s", e)
         if not args.no_notify:
-            # 同熊市分支：异常通知也要带 strategy，否则卡片标题回落为抄底口径
+            # 同熊市分支：异常通知也要带 strategy，否则卡片标题回落为优质低估低位口径
             notify_screening_result(None, market_env=market_env_desc, error_msg=str(e),
                                     strategy="volume_breakout")
         sys.exit(1)

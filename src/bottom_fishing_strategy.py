@@ -217,6 +217,26 @@ class StrategyConfig:
     # 此前只用于排序、无下限：只要有票通过硬闸门就凑满 MAX_PICKS。开启后综合分 <
     # MIN_QV_SCORE 的候选直接否决（FAIL_QV_SCORE），弱市自然收敛到少推/不推。
     # 设 0 关闭该闸门（恢复改动前行为）。
+    #
+    # ⚠️ 该下限的实际严厉程度远高于"兜底"，它**严格强于三道硬闸门之和**，务必知悉：
+    #   评分口径决定了「恰好压线达标」的公司拿不到 60 分——
+    #     · 质量分：_dimension_score 在阈值处恰好给 50 分。三档同时压线的最小可达
+    #       质量分就是 50（如 3 年 ROE=(5,10,10)：中位 10=阈值、最低 5=阈值、
+    #       现金转换 0.8=阈值，实测 status=verified 而 quality_score=50）。
+    #     · 估值分：行业口径在分位 0.60（=闸门上限）处给 40 分；
+    #               绝对口径在 PE=25 / PB=3（=闸门上限）处给 0 分（100×(1−值/上限)）
+    #   于是三道闸门全部恰好达标的公司：
+    #     · 行业口径：0.5×50 + 0.35×40 + 0.15×技术分 = 39.0 + 0.15×技术分 ≤ 54.0
+    #     · 绝对口径：0.5×50 + 0.35×0  + 0.15×技术分 = 25.0 + 0.15×技术分 ≤ 40.0
+    #   两者都不足 60 —— 即「压线合格」100% 被本下限淘汰，硬闸门的阈值形同虚设。
+    #   反解过线所需（0.5q+0.35v+0.15t ≥ 60）：
+    #     · 行业口径（v=40）：q=50 需 t≥140（不可达）；q=70 需 ≥73；q=90 需 ≥7
+    #     · 绝对口径（v=0） ：q=70 需 t≥167（不可达）；q=90 需 =100（必须满分）
+    #   副作用：PE/PB 逐 bar 缺失（AkShare 兜底日）→ 估值分=0 → formal 几乎必然归零，
+    #   与 FORWARD_MISSING_AS_PENDING=True 是两个独立叠加的零推荐机制。
+    #   运行时可读：qv_floor_equivalence() / describe_qv_floor() 会随配置实时算出门槛并
+    #   打进漏斗日志；其算术已固化为 test_recommendation_upgrades.TestScoreFloorEquivalence。
+    # 调低该值时务必先跑 `python backtest.py ab --mode quality_value`。
     MIN_QV_SCORE: float = 60.0
 
     # ===== P0：入场时机判读（左侧/右侧 + 止跌确认；仅加标签展示，绝不改推荐口径）=====
@@ -233,8 +253,12 @@ class StrategyConfig:
     # 收手的 regime 里加满最危险的暴露。开启后：**熊市（含 unknown 折叠）** 的 formal 推荐
     # 必须额外满足最低止跌证据「现价站上 MA20」或「MACD 柱连续 MACD_MOMENTUM_DAYS 日改善」，
     # 否则否决（FAIL_BEAR_TIMING）。牛市/中性不受影响（不改变既有口径）。
-    # 默认 False 保持库级口径与既有单测不变；生产入口 run.py 显式置 True 启用。
-    QV_BEAR_TIMING_GATE: bool = False
+    #
+    # 默认 True = 与生产入口一致。此前库级为 False、仅 run.py 显式覆盖为 True，导致
+    # 「库级口径 ≠ 生产口径」：任何用 StrategyConfig() 默认值跑的实验（backtest.py ab、
+    # 单元测试、临时脚本）都跑在一个生产并不存在的策略上，A/B 结论无法直接采信。
+    # 现把生产口径收进库级默认，覆盖点消除；显式设 False 可关闭该闸门。
+    QV_BEAR_TIMING_GATE: bool = True
 
     DAILY_MA5: int = 5
     DAILY_MA10: int = 10
@@ -322,7 +346,7 @@ class StrategyConfig:
     # 这是组合层风控，也是本次改动中唯一新增的门槛（其余均为排序/数量层）。
     MARKET_CRASH_HALT_PCT: float = -4.0
     MARKET_CRASH_LOOKBACK: int = 5
-    # 组合层：两套策略（抄底 + 放量突破）同一交易日合计推荐数上限，
+    # 组合层：两套策略（优质低估低位 + 放量突破）同一交易日合计推荐数上限，
     # 由后运行的策略在落库前去重并截取（见 run_breakout.py）
     DAILY_TOTAL_MAX_PICKS: int = 7
     # 正式信号为空时，允许生成一只低置信度观察候选。
@@ -1460,7 +1484,7 @@ def _apply_regime_hysteresis(result: dict, config: StrategyConfig) -> dict:
       无已确认状态时保持 unknown（由 _effective_regime 保守视同 bear）；
     - **每个自然日最多推进一次确认计数**：状态文件 updated 已是今天就只读取、
       不再累加，确保「连续 N 个交易日」不因一天内多次运行（如一个 workflow 里
-      顺序跑抄底 + 突破两套策略）而退化为「同日确认」。
+      顺序跑优质低估低位 + 放量突破两套策略）而退化为「同日确认」。
     """
     if not getattr(config, "MARKET_REGIME_HYSTERESIS", True):
         return result
@@ -1478,7 +1502,7 @@ def _apply_regime_hysteresis(result: dict, config: StrategyConfig) -> dict:
     confirmed = state.get("confirmed")
     pending, count = state.get("pending"), int(state.get("count", 0) or 0)
     # 每自然日最多推进一次确认计数：同一交易日内重复运行（如一个 workflow 内顺序跑
-    # 抄底 + 突破两套策略，共用同一个 cache/ 目录）读到的是同一份收盘数据，raw 必然
+    # 优质低估低位 + 放量突破两套策略，共用同一个 cache/ 目录）读到的是同一份收盘数据，raw 必然
     # 完全相同；若允许重复计数，「连续 N 个交易日确认」会被悄悄缩短为「同日确认」，
     # 恰好抵消滞回机制防抖动的目的。判定依据是状态文件自身的 updated 日期，
     # 不依赖调用方传参，因此对「一天跑几次」完全鲁棒。
@@ -2616,6 +2640,122 @@ def _industry_valuation_context(snapshot: Optional[dict], industry: str,
     return {"mode": "industry", "pe_pct": pe_pct, "pb_pct": pb_pct, "peers": peers}
 
 
+def _tag_valuation_mode(frame: pd.DataFrame, snapshot: Optional[dict],
+                        industry_map: dict, config: StrategyConfig) -> pd.DataFrame:
+    """给名单逐行标注实际生效的估值口径（industry / absolute），并汇总回退原因。
+
+    行业相对估值依赖单一 Baostock 接口 `query_stock_industry`：它不可用时快照为空，
+    全市场**静默**回退绝对阈值（PE≤25 / PB≤3）——而绝对阈值恰是本项目刻意避开的
+    「名单压向银行/地产/周期」口径。叠加综合分下限后回退日 formal 极易归零。
+    因此把口径落到数据里（`valuation_mode` 列），由日志与飞书卡片显式声明，
+    不再让「今天没有好票」与「口径悄悄换了」混在一起。
+    """
+    modes: list[str] = []
+    reasons: dict[str, int] = {}
+    for _, row in frame.iterrows():
+        code = str(row.get("code"))
+        industry = (industry_map or {}).get(code, "") or ""
+        ctx = _industry_valuation_context(snapshot, industry,
+                                          _num_or_none(row.get("pe_ttm")),
+                                          _num_or_none(row.get("pb_mrq")), config)
+        if ctx is not None:
+            modes.append("industry")
+            continue
+        modes.append("absolute")
+        if not snapshot:
+            key = "行业数据不可用（快照为空）"
+        elif not industry:
+            key = "无行业归属"
+        elif not snapshot.get(industry):
+            key = "行业不在快照内"
+        else:
+            key = f"行业内可比样本 <{int(getattr(config, 'VALUATION_INDUSTRY_MIN_PEERS', 5))}"
+        reasons[key] = reasons.get(key, 0) + 1
+    out = frame.copy()
+    out["valuation_mode"] = modes
+    if reasons:
+        detail = "，".join(f"{k} {v} 只" for k, v in sorted(reasons.items(), key=lambda kv: -kv[1]))
+        logger.warning("行业相对估值未生效的正式推荐 %d/%d 只（已回退绝对阈值 PE≤%g/PB≤%g）：%s",
+                       sum(reasons.values()), len(out), config.MAX_PE_TTM, config.MAX_PB_MRQ, detail)
+    return out
+
+
+def qv_floor_equivalence(config: StrategyConfig) -> dict:
+    """量化 MIN_QV_SCORE 相对三道硬闸门的等效门槛（纯计算，不取数、不联网）。
+
+    评分口径决定了「恰好压线通过硬闸门」的公司拿不到下限分，因此该下限**严格强于**
+    三档硬闸门之和。这个结论此前只写在配置注释里，实盘日志完全看不到，容易把
+    「被下限卡掉」误读为「市场没机会」；此函数把它算成数字供漏斗日志与审计使用。
+
+    · 最小可达质量分：构造「中位 ROE = QUALITY_MEDIAN_ROE_MIN、最低 ROE = QUALITY_MIN_ROE、
+      现金转换 = QUALITY_CASH_CONVERSION_MIN」三档同时压线的样本（如 3 年 ROE=(5,10,10)），
+      三项在各自阈值处各得 50 分，故质量分下限为 50。这里直接调 evaluate_annual_quality
+      实测，避免与实现漂移；异常时退回理论值 50。
+    · 压线估值分：行业口径在分位上限处 100×(1−0.60)=40；绝对口径在上限处 100×(1−1)=0。
+    """
+    qw, vw, tw = (float(config.QUALITY_SCORE_WEIGHT), float(config.VALUATION_SCORE_WEIGHT),
+                  float(config.TECHNICAL_SCORE_WEIGHT))
+    min_quality = 50.0
+    try:
+        from src.fundamental_quality import evaluate_annual_quality
+        years = int(config.QUALITY_YEARS)
+        med, low = float(config.QUALITY_MEDIAN_ROE_MIN), float(config.QUALITY_MIN_ROE)
+        if years >= 1 and low <= med:
+            roes = [low] + [med] * (years - 1)
+            cash = float(config.QUALITY_CASH_CONVERSION_MIN)
+            rows = [{"year": 2020 + i, "report_date": f"{2020 + i}-12-31",
+                     "available_date": f"{2021 + i}-04-20", "roe": r,
+                     "deducted_profit": 90.0, "net_profit": 100.0,
+                     "operating_cashflow": 100.0 * cash} for i, r in enumerate(roes)]
+            probe = evaluate_annual_quality(rows, f"{2020 + years}-06-30", years=years,
+                                            median_roe_min=med, min_roe=low,
+                                            cash_conversion_min=cash)
+            if probe.get("status") == "verified" and probe.get("quality_score") is not None:
+                min_quality = float(probe["quality_score"])
+    except Exception:  # noqa: BLE001  纯审计信息，任何失败都不影响选股
+        min_quality = 50.0
+    v_industry = 100.0 * (1.0 - float(getattr(config, "VALUATION_INDUSTRY_PERCENTILE_MAX", 0.60)))
+    v_absolute = 0.0
+    floor = float(getattr(config, "MIN_QV_SCORE", 0.0) or 0.0)
+
+    def _ceiling(valuation_score: float) -> float:
+        return qw * min_quality + vw * valuation_score + tw * 100.0
+
+    def _req_tech(quality_score: float, valuation_score: float) -> Optional[float]:
+        if tw <= 0:
+            return None
+        return (floor - qw * quality_score - vw * valuation_score) / tw
+
+    return {
+        "floor": floor,
+        "min_verified_quality": round(min_quality, 2),
+        "valuation_industry_at_cap": round(v_industry, 2),
+        "valuation_absolute_at_cap": round(v_absolute, 2),
+        "ceiling_industry": round(_ceiling(v_industry), 2),
+        "ceiling_absolute": round(_ceiling(v_absolute), 2),
+        "req_tech_industry": _req_tech(min_quality, v_industry),
+        "req_tech_absolute": _req_tech(min_quality, v_absolute),
+    }
+
+
+def describe_qv_floor(config: StrategyConfig) -> str:
+    """把 MIN_QV_SCORE 的真实严厉度写成一行日志（数值随配置实时计算，不写死）。"""
+    e = qv_floor_equivalence(config)
+
+    def _fmt(v: Optional[float]) -> str:
+        if v is None:
+            return "技术分权重为 0"
+        return "不可达（需 >100）" if v > 100.0 else f"≥{v:.0f}"
+
+    return (
+        f"综合分下限 {e['floor']:.0f}｜压线合格样本质量分仅 {e['min_verified_quality']:.1f}，"
+        f"其综合分上限为 行业口径 {e['ceiling_industry']:.1f} / 绝对口径 {e['ceiling_absolute']:.1f}"
+        f"（均低于下限 → 该下限严格强于三道硬闸门，压线合格者 100% 被淘汰）；"
+        f"要过线所需技术分：行业口径 {_fmt(e['req_tech_industry'])}，"
+        f"绝对口径 {_fmt(e['req_tech_absolute'])}"
+    )
+
+
 def assess_entry_timing(technical: pd.DataFrame, config: StrategyConfig) -> dict:
     """入场时机判读（P0）：为 quality_value 推荐补上「左侧/右侧 + 是否仍在下跌」的择时读数。
 
@@ -2987,9 +3127,10 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
     # ===== P0：入场时机判读（左侧/右侧 + 是否仍在下跌）=====
     # 始终计算（P1 熊市闸门与 P5 简报都要用）；SURFACE_TIMING_READ 只控制是否加标签/出简报。
     timing = assess_entry_timing(technical, config)
-    # ===== P1：熊市抄底侧止跌闸门（默认关，生产入口 run.py 开启）=====
+    # ===== P1：熊市止跌闸门（QV_BEAR_TIMING_GATE，库级默认开启＝生产口径）=====
     # 仅在熊市（含 unknown 折叠为 bear）生效：formal 必须有最低止跌证据，否则否决，
     # 避免突破策略空仓时组合变成"纯左侧接飞刀"。牛市/中性口径完全不变。
+    # 该开关此前库级为 False、仅 run.py 覆盖为 True（库级口径 ≠ 生产口径），现收进默认值。
     if getattr(config, "QV_BEAR_TIMING_GATE", False):
         _eff_regime = _effective_regime((market_env or {}).get("regime", "unknown"), config)
         if _eff_regime == "bear":
@@ -3039,6 +3180,23 @@ def _screen_quality_pool(config: StrategyConfig, cache: CacheManager, market_env
     # 行业估值横截面快照（#4a）：行业数据不可用 → 空 dict → 全市场回退绝对阈值
     industry_map = get_stock_industry(config, cache) if getattr(config, "USE_INDUSTRY_RELATIVE_VALUATION", False) else {}
     snapshot = build_industry_valuation_snapshot(config, cache, stocks) if industry_map else {}
+    # ===== 估值口径显式声明 =====
+    # 回退到绝对阈值是合法降级，但**不能静默**：绝对口径（PE≤25/PB≤3）正是本项目刻意避开的
+    # 「名单压向银行/地产/周期」口径，且叠加综合分下限后回退日 formal 极易归零。
+    # 此前只有快照构建抛异常时才有 warning，行业接口空返回/无行业归属都是无声的。
+    if not getattr(config, "USE_INDUSTRY_RELATIVE_VALUATION", False):
+        logger.info("估值口径：**绝对阈值**（USE_INDUSTRY_RELATIVE_VALUATION=False，配置显式关闭）")
+    elif not industry_map:
+        logger.warning("估值口径：**绝对阈值**（行业分类不可用——query_stock_industry 无返回，"
+                       "行业相对估值整体未生效；名单可能偏向低 PE/PB 的银行/地产/周期）")
+    elif not snapshot:
+        logger.warning("估值口径：**绝对阈值**（行业估值快照为空，行业相对估值整体未生效）")
+    else:
+        logger.info("估值口径：行业相对分位（快照覆盖 %d 个行业）", len(snapshot))
+    # 综合分下限的真实严厉度：与三道硬闸门等效门槛一起打到日志，避免把「被下限卡掉」
+    # 误读为「市场没机会」（等效门槛的算术已固化为 test_recommendation_upgrades 的断言）。
+    if float(getattr(config, "MIN_QV_SCORE", 0.0) or 0.0) > 0:
+        logger.info("综合分下限等效门槛：%s", describe_qv_floor(config))
 
     def screen(stock):
         code, name = stock["code"], stock["name"]
@@ -3083,9 +3241,12 @@ def _screen_quality_pool(config: StrategyConfig, cache: CacheManager, market_env
     pending = frame[frame["tier"] != "formal"]
     if pending_out is not None:
         pending_out.extend(pending.to_dict("records"))
-    formal = frame[frame["tier"] == "formal"]
+    formal = frame[frame["tier"] == "formal"].copy()
     if config.USE_INDUSTRY_DEDUP and not formal.empty:
         formal = _dedup_by_industry(formal, config, cache)
+    # 估值口径逐行标注：写入 valuation_mode 列，供日志汇总与飞书卡片声明本次实际口径
+    if getattr(config, "USE_INDUSTRY_RELATIVE_VALUATION", False) and not formal.empty:
+        formal = _tag_valuation_mode(formal, snapshot, industry_map, config)
     if len(formal) > cap:
         logger.info("通过 formal %d 只，按综合分截取前 %d 只（市场环境上限）", len(formal), cap)
     return formal.head(cap).reset_index(drop=True)
@@ -3126,7 +3287,7 @@ def run_concurrent_screen(
     config: StrategyConfig,
     log: logging.Logger,
 ) -> tuple[list[tuple], int, bool]:
-    """并发筛选骨架（抄底/突破两策略共用的漏斗模板）：线程池 + 心跳看门狗 + 时间预算。
+    """并发筛选骨架（优质低估低位/放量突破两策略共用的漏斗模板）：线程池 + 心跳看门狗 + 时间预算。
 
     - 看门狗：筛选期每 3 分钟心跳；连续 4 分钟无任务完成则打印在途股票代码定位卡点
       （数据源假死排查手段，bs_lock 持有期间卡死曾致全池阻塞）。
