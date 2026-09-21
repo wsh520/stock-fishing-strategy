@@ -8,7 +8,9 @@
    且关掉开关即恢复 PASS（证明拦截确实来自新闸门而非数据抖动）
 4. 突破策略的重要事实：FAIL_MACD_WEAK 在「首次站上阻力位」口径下结构性不可达
    —— 本文件把该结论固化为扫描断言，一旦突破口径被放宽就会失败并提示复核
-5. quality_value 接线：默认关闭时口径逐字节不变；开启后深度弱势被否决
+5. quality_value 接线：默认关闭时技术面不新增否决（健康形态照常 PASS）；开启后深度弱势被否决。
+   注：本节的合成 fixture 不含成长数据，在 FORWARD_MISSING_AS_PENDING=True（当前默认）下
+   tier 为 pending —— 断言按此默认锁定，并用 missing_tags=="forward" 证明无其它缺项
 
 关键设计依据（本文件即证据）：
   - MACD 柱度量「加速度」而非趋势，匀速上行的柱值必然向 0 收敛递减。
@@ -259,8 +261,15 @@ check("QV 事实: 该形态 K/D 在 70 附近交替领先（死叉阈值不能�
       abs(float(_healthy_tech["kdj_k"].iloc[-1]) - float(_healthy_tech["kdj_d"].iloc[-1])) < 2.0)
 
 _sig_off, _r_off = qv_evaluate(_healthy, veto=False)
-check(f"QV: 默认关闭时标准形态仍 PASS 且为正式推荐: {_r_off}",
-      _r_off == "PASS" and _sig_off is not None and _sig_off.tier == "formal")
+# 该 fixture 的财务字段不含 forward_ni_yoy（成长数据），而当前默认
+# FORWARD_MISSING_AS_PENDING=True —— 缺失会记「forward」缺项并降级为待核验，
+# 因此 tier 是 pending 而非 formal。用 missing_tags 精确等于 "forward" 反向锁住
+# 「除此之外没有别的缺项」，证明该形态在财务/估值/行情日期上都是齐的。
+_off_tier = getattr(_sig_off, "tier", None)
+_off_missing = getattr(_sig_off, "missing_tags", None)
+check(f"QV: 默认关闭时标准形态仍 PASS（技术面不否决）；成长数据缺失按当前默认降级为待核验: "
+      f"{_r_off} / tier={_off_tier} / 缺项=[{_off_missing}]",
+      _r_off == "PASS" and _off_tier == "pending" and _off_missing == "forward")
 _sig_on, _r_on = qv_evaluate(_healthy, veto=True)
 check(f"QV: 开启否决后该健康形态仍 PASS（未误杀匀速上行）: {_r_on}", _r_on == "PASS")
 

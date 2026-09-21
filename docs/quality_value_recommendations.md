@@ -7,7 +7,7 @@
 1. 非金融企业最近连续3个可用完整年度：ROE中位数至少10%、各年至少5%、扣非净利各年为正；累计经营现金流/累计合并净利润至少0.8，累计净利润须为正。季度年化ROE不再代替年度质量。年度缺失、非有限数不能进入正式推荐。
 2. 估值（#4a 行业相对）：默认 USE_INDUSTRY_RELATIVE_VALUATION=True，个股 PE/PB 在其所属行业当日横截面的分位 ≤ VALUATION_INDUSTRY_PERCENTILE_MAX(0.60) 才算便宜；行业数据缺失或行业内可比样本 < VALUATION_INDUSTRY_MIN_PEERS(5) 时自动回退绝对阈值（0<PE TTM≤25、0<PB MRQ≤3）。两种口径下 PE/PB 必须齐全、有限、为正，≤0 直接否决，缺项为 pending。横截面快照由 build_industry_valuation_snapshot 在筛选前用全池日线构建一次（复用缓存、不额外取数）。
 3. 价格处于最近250根有效成交日线最高/最低区间的下40%。至少250根；最新零量/零成交额、日期滞后、不合法OHLC否决。取数窗口从120增为600自然日。中期低位不代表低估，必须同时通过前两条。
-4. 前瞻确认（#4b）：REQUIRE_FORWARD_CONFIRMATION=True 时，用 Baostock query_growth_data 最新报告期净利润同比(YOYNI)做刹车，同比 < FORWARD_NI_YOY_MIN(-30%) → FAIL_FORWARD 否决（对治「trailing 年报漂亮、当年正在崩」的价值陷阱）。成长数据缺失默认不否决也不降级（FORWARD_MISSING_AS_PENDING=False，刹车仅在数据可得时生效）；置 True 则缺失记「forward」缺项 → pending。仅主源 Baostock 提供，AkShare 兜底日按缺失处理。
+4. 前瞻确认（#4b）：REQUIRE_FORWARD_CONFIRMATION=True 时，用 Baostock query_growth_data 最新报告期净利润同比(YOYNI)做刹车，同比 < FORWARD_NI_YOY_MIN(-30%) → FAIL_FORWARD 否决（对治「trailing 年报漂亮、当年正在崩」的价值陷阱）；同比落在 [FORWARD_NI_YOY_MIN, FORWARD_NI_YOY_WARN)（即 [-30%, -10%)）不否决，只在决策简报打「业绩下滑预警」黄标。成长数据缺失、季度无效、过旧或在决策日之后 → 记「forward」缺项 → pending（FORWARD_MISSING_AS_PENDING=True，**当前默认**，与《最小修复说明》一致）；显式置 False 可恢复「缺失放行」（刹车仅在数据可得时生效）。报告期门槛：1–4 月可使用上一年三季报或已披露年报，5–8 月至少当年 Q1，9–10 月至少 Q2，11–12 月至少 Q3。仅主源 Baostock 提供，AkShare 兜底日按缺失处理。
 5. 综合分下限（#3）：MIN_QV_SCORE=60，综合分 < 60 的 formal 候选否决（FAIL_QV_SCORE）。仅对「将要成为正式推荐」（missing 为空）的候选生效——pending 的估值分因数据缺失被记为 0、综合分被人为压低，对其套下限无意义。设 0 关闭。
 6. 保留已知商誉超限排雷及负债率<=70%核验。金融企业依旧按现有名称/代码识别，输出financial_review并留待行业专项核验，不套普通企业现金转换率与前瞻确认。行业识别仍需后续完善，不能据此声称覆盖全部金融子行业。
 
