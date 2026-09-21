@@ -64,6 +64,7 @@ from src.bottom_fishing_strategy import (
     _build_volatile_row,
     _fetch_weekly_dual,
     _fmt_cell,
+    _num_or_none,
     _GRADE_ORDER,
     _grade_from_score,
     check_fundamentals,
@@ -824,7 +825,56 @@ def describe_breakout(row: dict) -> str:
         f" | 日均额: {_fmt_cell(row.get('avg_amount'))}万"
         f" | 市场: {row.get('market_env') or '-'}",
     ]
+    lines.extend(_breakout_brief_lines(row, lvl))
     return "\n".join(lines)
+
+
+def _breakout_brief_lines(row: dict, lvl: str) -> list[str]:
+    """P5 决策简报（突破版）：由已有的突破/量能/形态字段就地组装，纯展示不落库。
+
+    突破策略走 technical 模式，不经过 evaluate_quality_value 的简报组装；这里用 row 里
+    已有的 breakout_level/margin/vol_ratio/platform_range/stop_loss 拼一份等价简报，
+    让两套策略的卡片都具备「看多/风险/失效/信心/今日触发」五段结构。
+    """
+    margin = _num_or_none(row.get("breakout_margin"))
+    vol_ratio = _num_or_none(row.get("vol_ratio"))
+    platform = _num_or_none(row.get("platform_range"))
+    stop = _num_or_none(row.get("stop_loss"))
+    close = _num_or_none(row.get("close"))
+    rsi = _num_or_none(row.get("rsi"))
+    grade = str(row.get("grade") or "")
+
+    bull = [f"放量突破 {lvl}" + (f" +{margin:.2f}%" if margin is not None else "")]
+    if vol_ratio is not None:
+        bull.append(f"量比 {vol_ratio:.2f}×（资金介入）")
+    if platform is not None:
+        bull.append(f"突破前平台振幅 {platform:.1f}%（整理充分）")
+    bull.append("MA20 上行、站上均线（趋势背景多头）")
+
+    bear: list[str] = []
+    if rsi is not None and rsi >= 75:
+        bear.append(f"RSI14 {rsi:.0f} 偏高，突破日追高、次日回踩风险大")
+    if margin is not None and margin >= 5:
+        bear.append("单日突破幅度偏大，注意消息驱动/一日游")
+    bear.append("突破次日若跌回关键位即为假突破，需按失效价果断离场")
+    if str(row.get("market_env") or "") == "bear":
+        bear.append("市场偏空，突破胜率下降（熊市本策略默认空仓）")
+
+    if stop is not None and close is not None and close > 0:
+        invalidation = f"止损 {stop:.2f}（约 {(stop / close - 1) * 100:.1f}%）；跌回突破位下方视为假突破离场"
+    else:
+        invalidation = "跌回突破关键位下方视为假突破离场"
+
+    conviction = {"A": "高", "B": "中", "C": "中低", "D": "低（观察）"}.get(grade, "中")
+    why_today = f"今日放量突破 {lvl}" + (f"，涨幅 {margin:.2f}%" if margin is not None else "")
+
+    return [
+        f"**信心:** {conviction}",
+        f"**今日触发:** {why_today}",
+        f"**看多:** {'；'.join(bull)}",
+        f"**风险:** {'；'.join(bear)}",
+        f"**失效:** {invalidation}",
+    ]
 
 
 def main_breakout(

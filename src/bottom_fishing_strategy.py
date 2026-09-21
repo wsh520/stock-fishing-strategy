@@ -190,6 +190,11 @@ class StrategyConfig:
     # 默认 True；显式 False 可恢复缺失放行，标签仍显示未核验。
     # 主源不可用时可能没有正式推荐，应按数据覆盖不足处理。
     FORWARD_MISSING_AS_PENDING: bool = True
+    # 业绩下滑黄标（P0）：forward 净利同比落在 [FORWARD_NI_YOY_MIN, FORWARD_NI_YOY_WARN)
+    # 之间时**不否决**（硬闸门口径完全不变），只在决策简报的风险项显式预警「业绩下滑」。
+    # -30% 的硬否决线过宽，-29% 的公司照样通过；黄标把「没崩但明显在走弱」这一档暴露给人工。
+    # 设为 ≤ FORWARD_NI_YOY_MIN 可关闭黄标（此时只有触发硬否决才提示）。
+    FORWARD_NI_YOY_WARN: float = -10.0
 
     # ===== 综合分下限（#3：宁缺毋滥）=====
     # quality_value 综合分 = 0.50×质量 + 0.35×估值 + 0.15×技术（0~100）。
@@ -197,6 +202,15 @@ class StrategyConfig:
     # MIN_QV_SCORE 的候选直接否决（FAIL_QV_SCORE），弱市自然收敛到少推/不推。
     # 设 0 关闭该闸门（恢复改动前行为）。
     MIN_QV_SCORE: float = 60.0
+
+    # ===== P0：入场时机判读（左侧/右侧 + 止跌确认；仅加标签展示，绝不改推荐口径）=====
+    # quality_value（生产默认）旁路了全部技术择时闸门（weekly=not_required、技术仅 15%
+    # 权重不否决、QV_ENFORCE_KDJ_MACD_VETO 默认 False），唯一位置约束是 250 日 position≤0.40。
+    # 后果：一只利润下滑、股价处于低位、MACD 仍在加速下跌的深度价值股能顺利通过全部闸门
+    # 被正式推荐——典型价值陷阱/接飞刀。开启后为每条推荐计算「左侧/右侧 + 是否仍在下跌」
+    # 的时机读数并写入决策简报，把择时判断显式交回人工（不改「哪些股票通过」）。
+    SURFACE_TIMING_READ: bool = True
+    TIMING_MA_LONG: int = 60   # 时机判读用的长期均线周期（现价站上/跌破 MA60 区分右侧/左侧）
 
     DAILY_MA5: int = 5
     DAILY_MA10: int = 10
@@ -1670,15 +1684,35 @@ def _missing_tags_zh(tags: str) -> str:
         return ""
     return "、".join(_MISSING_TAG_ZH.get(t, t) for t in str(tags).split(",") if t)
 
+def _brief_lines(row: dict) -> list[str]:
+    """P5 决策简报渲染：把 bull/bear/invalidation/conviction/why_today 拼成卡片行。
+
+    仅当对应字段非空时才输出该行——technical 模式与旧数据没有这些字段时整块不渲染，
+    保证 describe 输出对既有测试与旧调用完全向后兼容。
+    """
+    lines: list[str] = []
+    if row.get("conviction"):
+        lines.append(f"**信心:** {row.get('conviction')}")
+    if row.get("why_today"):
+        lines.append(f"**今日触发:** {row.get('why_today')}")
+    if row.get("bull_case"):
+        lines.append(f"**看多:** {row.get('bull_case')}")
+    if row.get("bear_case"):
+        lines.append(f"**风险:** {row.get('bear_case')}")
+    if row.get("invalidation"):
+        lines.append(f"**失效:** {row.get('invalidation')}")
+    return lines
+
 def describe(row: dict) -> str:
     """把一条推荐格式化为飞书卡片文本（notify/feishu.py 调用），按三维展示：
 
     1. 基础评分/等级：分数与等级同源（均按原始技术分定级，熊市只抬门槛不扣展示分）；
     2. 入选依据：实际触发的技术条件（放量企稳/放量上涨/放量冲高回落措辞区分）；
     3. 核验状态：财务/周线是否已核验、缺项明细（可选指标缺失只标注不降级）。
+    quality_value 模式额外附 P5 决策简报（信心/今日触发/看多/风险/失效价）。
     """
     if row.get("weekly_status") == "not_required":
-        return "\n".join([
+        lines = [
             f"**{row.get('name', '')} {row.get('code', '')}**（优质低估低位候选）",
             f"综合分: {_fmt_cell(row.get('score'))} | 质量分: {_fmt_cell(row.get('quality_score'))}"
             f" | 估值分: {_fmt_cell(row.get('valuation_score'))} | 技术分: {_fmt_cell(row.get('daily_score'))}",
@@ -1687,7 +1721,9 @@ def describe(row: dict) -> str:
             f"入选依据: {row.get('signals_hit', '')}",
             f"核验: {_FUND_STATUS_ZH.get(str(row.get('fund_status')), '待核验')}"
             + (f" | 缺项: {_missing_tags_zh(str(row.get('missing_tags')))}" if row.get('missing_tags') else ""),
-        ])
+        ]
+        lines.extend(_brief_lines(row))
+        return "\n".join(lines)
     verify_bits = [
         _FUND_STATUS_ZH.get(str(row.get("fund_status", "")), "财务未核验"),
         _WEEKLY_STATUS_ZH.get(str(row.get("weekly_status", "")), "周线待核验"),
@@ -1711,6 +1747,7 @@ def describe(row: dict) -> str:
         f" | 市场: {row.get('market_env') or '-'}"
         + (" | 底背离" if row.get("has_divergence") else "")
     )
+    lines.extend(_brief_lines(row))
     return "\n".join(lines)
 
 def describe_pending(row: dict) -> str:
@@ -1867,6 +1904,14 @@ class Signal:
     pe_ttm: Optional[float] = None
     pb_mrq: Optional[float] = None
     quality_status: str = "missing"
+    # ===== P5：决策简报（纯展示，供人工裁量；不落库、不参与排序/否决/追踪）=====
+    # 交易按实际情况人工判断，故把「看多理由 / 主要风险 / 失效价 / 信心分档 / 今日为何触发」
+    # 结构化成简报，让推荐从「一个代码」升级为「一份可复核的研究摘要」。
+    bull_case: str = ""       # 看多理由：决定性正面因子（分号分隔）
+    bear_case: str = ""       # 主要风险：为什么可能是陷阱/接飞刀（分号分隔）
+    invalidation: str = ""    # 失效价：跌破即认错离场的价位与逻辑
+    conviction: str = ""      # 信心分档：高/中高/中/中低/低（观察）
+    why_today: str = ""       # 今日为何触发：技术变化点，或「无明显触发·左侧布局」
 
     def to_dict(self) -> dict: return asdict(self)
 
@@ -2501,6 +2546,174 @@ def _industry_valuation_context(snapshot: Optional[dict], industry: str,
     return {"mode": "industry", "pe_pct": pe_pct, "pb_pct": pb_pct, "peers": peers}
 
 
+def assess_entry_timing(technical: pd.DataFrame, config: StrategyConfig) -> dict:
+    """入场时机判读（P0）：为 quality_value 推荐补上「左侧/右侧 + 是否仍在下跌」的择时读数。
+
+    生产模式旁路了全部技术择时闸门，深价值股可能在下跌途中被推荐（价值陷阱）。本函数
+    **只产出展示标签与决策简报素材，绝不参与任何否决**，"哪些股票通过"与改动前完全一致。
+
+    判读维度（全部取自 compute_daily_signals 已算出的列 + 本地 MA60，零额外取数）：
+      - 现价 vs MA20 / MA60：站上与否区分右侧（趋势转强）/ 左侧（待企稳）；
+      - MACD 是否「深度走弱且仍在恶化」（复用 macd_not_deeply_weak）：识别未止跌的接飞刀；
+      - 距 250 日低点天数与幅度：区分「刚见底」与「已横盘筑底一段」。
+    数据不足/异常一律回退中性读数（side="unknown"），不影响主流程。
+    """
+    result = {"side": "unknown", "label": "时机未知", "below_ma20": None, "below_ma60": None,
+              "macd_weak": False, "days_since_low": None, "pct_from_low": None,
+              "ma20": None, "ma60": None, "recent_low": None}
+    try:
+        if technical is None or technical.empty or "close" not in technical.columns:
+            return result
+        d = technical.iloc[-1]
+        close = float(d["close"])
+        if not close > 0:
+            return result
+        ma20 = float(d["ma20"]) if "ma20" in technical.columns and not pd.isna(d.get("ma20")) else None
+        ma_long = max(1, int(getattr(config, "TIMING_MA_LONG", 60)))
+        ma60_ser = technical["close"].rolling(ma_long).mean()
+        ma60 = float(ma60_ser.iloc[-1]) if not pd.isna(ma60_ser.iloc[-1]) else None
+        # 「仍在下跌」= MACD 柱深度走弱且连续恶化（与荐股控制共用同一实现与阈值）
+        macd_weak = not macd_not_deeply_weak(
+            technical, config.MACD_WEAK_DAYS, config.MACD_WEAK_HIST_PCT)
+        # 距 250 日低点：幅度与天数
+        lookback = max(1, int(getattr(config, "LOW_POSITION_LOOKBACK", 250)))
+        days_since_low = pct_from_low = recent_low = None
+        if "low" in technical.columns:
+            win = technical["low"].tail(lookback)
+            if len(win) > 0 and not win.isna().all():
+                lo = float(win.min())
+                if lo > 0:
+                    recent_low = lo
+                    pct_from_low = (close / lo - 1) * 100
+                    try:
+                        days_since_low = len(technical) - 1 - int(win.idxmin())
+                    except (ValueError, TypeError):
+                        days_since_low = None
+        below_ma20 = (close < ma20) if ma20 else None
+        below_ma60 = (close < ma60) if ma60 else None
+        if macd_weak:
+            side, label = "falling", "⚠左侧·仍在下跌（MACD深度走弱，止跌未确认）"
+        elif below_ma20 is False and below_ma60 is False:
+            side, label = "right", "右侧·站上MA20/MA60（趋势转强）"
+        elif below_ma20 is False:
+            side, label = "right_early", "右侧雏形·站上MA20（仍在MA60下方）"
+        elif below_ma20 is True:
+            side, label = "left", "左侧·MA20下方待企稳"
+        else:
+            side, label = "unknown", "时机未知"
+        result.update(side=side, label=label, below_ma20=below_ma20, below_ma60=below_ma60,
+                      macd_weak=macd_weak, days_since_low=days_since_low,
+                      pct_from_low=pct_from_low, ma20=ma20, ma60=ma60, recent_low=recent_low)
+    except Exception:  # noqa: BLE001  时机判读是展示增强项，任何失败都不得影响选股主流程
+        return result
+    return result
+
+
+def build_decision_brief(*, timing: dict, quality: dict, pe: Optional[float], pb: Optional[float],
+                         val_context: Optional[dict], industry_mode: bool, position: float,
+                         close: float, stop_loss: Optional[float], forward_ni_yoy: Optional[float],
+                         forward_verified: bool, forward_stat_date: Optional[str], missing: list,
+                         hits: list, quality_status: str, config: StrategyConfig) -> dict:
+    """组装 P5 决策简报：看多理由 / 主要风险 / 失效价 / 信心分档 / 今日为何触发。
+
+    纯展示、纯字符串，只依赖已算出的量（timing/quality/估值/成长/缺项/技术触发），
+    不取数、不否决、不改排序。任一素材缺失即省略对应条目，绝不伪造。
+    返回 {"bull_case","bear_case","invalidation","conviction","why_today"}。
+    """
+    metrics = (quality or {}).get("metrics", {}) if isinstance(quality, dict) else {}
+
+    def _pct(v):
+        n = _num_or_none(v)
+        return None if n is None else round(n * 100, 1)
+
+    # ---- 看多理由（只列有据可查的正面因子）----
+    bull: list[str] = []
+    med_roe = _num_or_none(metrics.get("median_roe"))
+    cash_conv = _num_or_none(metrics.get("cash_conversion"))
+    if med_roe is not None:
+        cc = f"、现金转换率 {cash_conv:.2f}" if cash_conv is not None else ""
+        bull.append(f"近{config.QUALITY_YEARS}年中位ROE {med_roe:.1f}%{cc}")
+    if pe is not None and pe > 0:
+        if industry_mode and val_context and val_context.get("pe_pct") is not None:
+            bull.append(f"PE {pe:.1f}（行业{val_context['pe_pct']:.0%}分位，相对便宜）")
+        else:
+            bull.append(f"PE {pe:.1f}" + (f"、PB {pb:.2f}" if pb is not None and pb > 0 else ""))
+    elif pb is not None and pb > 0:
+        bull.append(f"PB {pb:.2f}")
+    pos_pct = _pct(position)
+    if pos_pct is not None:
+        low_txt = f"处250日区间 {pos_pct:.0f}% 低位"
+        if timing.get("days_since_low") is not None:
+            low_txt += f"（距阶段低点约 {int(timing['days_since_low'])} 个交易日）"
+        bull.append(low_txt)
+    if forward_verified and forward_ni_yoy is not None and forward_ni_yoy >= 0:
+        bull.append(f"{forward_stat_date or '最新报告期'} 净利同比 {forward_ni_yoy:+.0f}%（当年成长未恶化）")
+    if timing.get("side") in ("right", "right_early"):
+        bull.append(timing.get("label", ""))
+
+    # ---- 主要风险（为什么可能是陷阱/接飞刀）----
+    bear: list[str] = []
+    if timing.get("side") == "falling":
+        bear.append("MACD深度走弱、止跌未确认，属左侧接飞刀（择时风险高，需等右侧信号）")
+    elif timing.get("below_ma20"):
+        bear.append("现价仍在MA20下方，趋势未转强，左侧布局需自行择时")
+    warn_lo = float(getattr(config, "FORWARD_NI_YOY_MIN", -30.0))
+    warn_hi = float(getattr(config, "FORWARD_NI_YOY_WARN", -10.0))
+    if forward_verified and forward_ni_yoy is not None and warn_lo <= forward_ni_yoy < warn_hi:
+        bear.append(f"{forward_stat_date or '最新报告期'} 净利同比 {forward_ni_yoy:+.0f}%，业绩下滑预警")
+    if quality_status == "financial_review":
+        bear.append("金融企业，不适用非财务财报规则，待行业专项核验")
+    elif quality_status not in ("verified",):
+        bear.append("多年质量未完全核验（证据不足）")
+    miss_zh = _missing_tags_zh(",".join(dict.fromkeys(t for t in missing if t)))
+    if miss_zh:
+        bear.append(f"数据缺项：{miss_zh}")
+    if not bear:
+        bear.append("暂无显著风险标记，仍需人工复核行业景气度与个股基本面")
+
+    # ---- 失效价（跌破即认错离场）----
+    inv_parts: list[str] = []
+    sl = _num_or_none(stop_loss)
+    if sl is not None and close > 0:
+        inv_parts.append(f"止损位 {sl:.2f}（约 {(sl / close - 1) * 100:.1f}%）跌破认错离场")
+    rl = _num_or_none(timing.get("recent_low"))
+    if rl is not None:
+        inv_parts.append(f"有效跌破近{config.LOW_POSITION_LOOKBACK}日低 {rl:.2f} 视为低位逻辑失效")
+    invalidation = "；".join(inv_parts) if inv_parts else "（无止损参考，需人工设定）"
+
+    # ---- 信心分档（可解释的加分制，纯展示）----
+    pts = 0
+    if quality_status == "verified":
+        pts += 1
+    if not missing:
+        pts += 1
+    if timing.get("side") in ("right", "right_early"):
+        pts += 1
+    if forward_verified and forward_ni_yoy is not None and forward_ni_yoy >= warn_hi:
+        pts += 1
+    conviction = {4: "高", 3: "中高", 2: "中", 1: "中低", 0: "低（观察）"}[pts]
+    if timing.get("side") == "falling":
+        conviction += "·左侧未止跌"
+
+    # ---- 今日为何触发（变化点）----
+    if hits:
+        why_today = "技术触发：" + "、".join(hits)
+    elif timing.get("side") in ("right", "right_early"):
+        why_today = "凭基本面+低估值+低位入选，且已现右侧企稳（站上均线），非纯左侧接飞刀"
+    elif timing.get("side") == "falling":
+        why_today = "凭基本面+低估值+低位入选，但MACD仍走弱、未见止跌，属左侧接飞刀（建议等右侧确认）"
+    else:
+        why_today = "无明显技术触发，凭基本面+低估值+低位入选（左侧布局，需自行择时）"
+
+    return {
+        "bull_case": "；".join(x for x in bull if x),
+        "bear_case": "；".join(x for x in bear if x),
+        "invalidation": invalidation,
+        "conviction": conviction,
+        "why_today": why_today,
+    }
+
+
 def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: str,
                            config: StrategyConfig, market_env: Optional[dict] = None,
                            fund_data: Optional[dict] = None,
@@ -2692,10 +2905,28 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
     if _ni is not None:
         label = "净利同比" if forward_verified else "历史净利同比（未确认）"
         tags.append(f"{fund.get('forward_stat_date') or '报告期未知'} {label}{_ni:+.0f}%")
+        # P0 业绩下滑黄标：未触发硬否决（≥FORWARD_NI_YOY_MIN）但已明显走弱（<WARN）时显式预警。
+        _warn_lo = float(getattr(config, "FORWARD_NI_YOY_MIN", -30.0))
+        _warn_hi = float(getattr(config, "FORWARD_NI_YOY_WARN", -10.0))
+        if forward_verified and _warn_hi > _warn_lo and _warn_lo <= _ni < _warn_hi:
+            tags.append("业绩下滑预警")
     elif getattr(config, "REQUIRE_FORWARD_CONFIRMATION", False):
         tags.append("近期业绩待核验")
     atr = finite(d.get("atr"))
     rr = compute_risk_reward(close, config, atr)
+    # ===== P0：入场时机判读（左侧/右侧 + 是否仍在下跌）；仅加标签与简报，不改推荐口径 =====
+    timing = (assess_entry_timing(technical, config)
+              if getattr(config, "SURFACE_TIMING_READ", True)
+              else {"side": "unknown", "label": "时机未知", "macd_weak": False, "recent_low": None,
+                    "days_since_low": None, "below_ma20": None, "below_ma60": None})
+    tags.append(timing["label"])
+    # ===== P5：决策简报（看多/风险/失效价/信心/今日触发）；纯展示，不落库、不参与否决 =====
+    brief = build_decision_brief(
+        timing=timing, quality=quality, pe=pe, pb=pb, val_context=val_context,
+        industry_mode=industry_mode, position=position, close=close, stop_loss=rr["stop_loss"],
+        forward_ni_yoy=_ni, forward_verified=forward_verified,
+        forward_stat_date=fund.get("forward_stat_date"), missing=missing, hits=hits,
+        quality_status=quality["status"], config=config)
     return Signal(
         code=code, name=name, date=day, close=round(close, 2), score=score,
         grade=_grade_from_score(score, config), daily_score=tech_score,
@@ -2709,7 +2940,7 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
         tier="pending" if missing else "formal", rank_score=score,
         quality_score=quality_score, valuation_score=round(valuation_score, 2),
         position_250=round(position, 4), pe_ttm=pe, pb_mrq=pb,
-        quality_status=quality["status"]), "PASS"
+        quality_status=quality["status"], **brief), "PASS"
 
 
 def _screen_quality_pool(config: StrategyConfig, cache: CacheManager, market_env: dict,
