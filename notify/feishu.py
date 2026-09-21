@@ -130,6 +130,7 @@ def notify_screening_result(
     pending: Optional[pd.DataFrame] = None,
     strategy: str = "bottom_fishing",
     volatile: Optional[pd.DataFrame] = None,
+    data_degraded: bool = False,
 ) -> None:
     """发送选股结果通知。
 
@@ -195,14 +196,23 @@ def notify_screening_result(
     # 无信号
     if df is None or df.empty:
         no_signal_text = "今日无正式推荐（未发现数据完整且通过全部条件的标的），宁可少荐。"
+        if data_degraded:
+            # P6：数据源降级导致的零推荐，必须与"今天没有好票"区分开，避免误读。
+            no_signal_text += (
+                "\n\n⚠️ **本次运行数据源已降级**（Baostock 不可用，已回退 AkShare）："
+                "AkShare 逐 bar 不提供估值字段（peTTM/pbMRQ），优质低估低位策略的估值闸门"
+                "缺列会把候选降级为待核验，从而 formal 正式推荐为 0。"
+                "**这通常是数据问题，而非今天没有合格标的**，请复核数据源后重跑。"
+            )
         if volatile is not None and not volatile.empty:
             no_signal_text += (f"\n本轮有 {len(volatile)} 只仅因**波动率超限**被拦下"
                                f"（技术面已达标），详见下方高风险观察池。")
         card = {
             "header": _build_header(
                 f"{card_title} - 今日无信号"
+                + ("（数据源降级）" if data_degraded else "")
                 + (f"（波动率观察池 {len(volatile)} 只）" if volatile is not None and not volatile.empty else ""),
-                color="grey"),
+                color="orange" if data_degraded else "grey"),
             "elements": [
                 _md_element(f"**时间:** {now}\n**市场环境:** {market_env}\n\n{no_signal_text}"),
                 *_volatile_elements(volatile, strategy),
@@ -222,6 +232,8 @@ def notify_screening_result(
             f"**推荐数量:** {shown_n} 只（{candidate_label}"
             + (f"，策略命中 {len(df)} 只，展示 Top-{top_n}" if len(df) > shown_n else "")
             + "）"
+            + ("\n⚠️ **数据源已降级（AkShare 兜底）**：估值字段可能缺失，正式推荐数或被压低，请留意核验状态。"
+               if data_degraded else "")
         ),
         _divider(),
     ]

@@ -84,6 +84,7 @@ def run(argv: list[str] | None = None):
         StrategyConfig,
         CacheManager,
         get_market_environment,
+        is_data_degraded,
         main,
     )
 
@@ -96,6 +97,11 @@ def run(argv: list[str] | None = None):
         logger.info("已启用 --no-notify：本次不推送飞书通知")
 
     config = StrategyConfig()
+    # ===== P1：生产启用「熊市抄底侧止跌闸门」=====
+    # 库级默认关闭（保持既有口径与单测不变），仅在生产入口开启：熊市（含 unknown 折叠）
+    # 的正式推荐必须满足最低止跌证据（站上 MA20 或 MACD 柱连续改善），否则否决。
+    # 修复"突破策略熊市空仓、抄底侧却仍在纯左侧接飞刀"的组合暴露失衡。
+    config.QV_BEAR_TIMING_GATE = True
     if args.no_cache:
         config.USE_CACHE = False
         logger.info("已启用 --no-cache：跳过 cache/ 磁盘缓存读写，本次全部从数据源拉取")
@@ -153,13 +159,21 @@ def run(argv: list[str] | None = None):
 
         # Step 4: 发送选股结果通知
         t = time.time()
+        # P6：数据源降级可观测——Baostock 熔断/全程零命中时，AkShare 不提供逐 bar 估值，
+        # quality_value 估值闸门缺列会把候选压成 pending，formal 可能为 0。显式标记，
+        # 避免"数据降级导致的零推荐"被误读为"今天没有好票"。
+        degraded = is_data_degraded()
+        if degraded:
+            logger.warning("本次运行数据源已降级（Baostock 不可用，回退 AkShare）："
+                           "估值字段(peTTM/pbMRQ)可能缺失，正式推荐数或被压低，通知将标注数据状态")
         if notify_enabled:
             logger.info("Step 4/4 发送飞书通知...")
             # 待核验候选（pending）仅在上方 CI 日志中打印计数，不再进入飞书卡片：
             # 数据不全的标的既不构成推荐也不该被误读为备选，飞书只展示正式推荐 Top-3。
             volatile_df = pd.DataFrame(volatile_rows) if volatile_rows else None
             notify_screening_result(output_df, market_env=market_env_desc,
-                                    strategy="bottom_fishing", volatile=volatile_df)
+                                    strategy="bottom_fishing", volatile=volatile_df,
+                                    data_degraded=degraded)
             logger.info("Step 4/4 完成 (%.1f 秒)", time.time() - t)
         else:
             logger.info("Step 4/4 已跳过（--no-notify）：不推送飞书")

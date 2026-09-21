@@ -112,6 +112,14 @@ PREFIX = "bf"
 SORT_BY = ["rank_score"]
 SORT_ASC = [False]
 
+# P6b：quality_value 路径全部否决归因码（用于「完整闸门归因」日志，含 0 计数）。
+# 长期为 0 的闸门＝对区分候选无贡献，是数据驱动瘦身的审计对象。新增否决码时同步登记。
+_QV_REASON_CODES = (
+    "FAIL_DATA", "FAIL_STALE", "FAIL_LIQUIDITY", "FAIL_POSITION", "FAIL_VALUATION",
+    "FAIL_FUND", "FAIL_FORWARD", "FAIL_QV_SCORE", "FAIL_BEAR_TIMING",
+    "FAIL_MACD_WEAK", "FAIL_KDJ_HIGH", "ERROR",
+)
+
 # ===========================================================================
 # StrategyConfig
 # ===========================================================================
@@ -141,6 +149,14 @@ class StrategyConfig:
     # cache/market_regime_state.json（超 10 天未更新自动重置）。unknown 不改变已确认状态。
     MARKET_REGIME_HYSTERESIS: bool = True
     MARKET_REGIME_CONFIRM_DAYS: int = 2
+    # ===== P2：regime 双指标确认（第二指标 = 长期均线 MA60 趋势）=====
+    # 单一沪深300 MA20 斜率在 ±0.01 阈值附近逐日抖动，滞回只是打补丁。叠加 MA60 慢速
+    # 趋势过滤：只有「斜率看多 且 现价/MA20 均在 MA60 上方」才 bull，「斜率看空 且均在
+    # MA60 下方」才 bear，两者不同向降级为 neutral——从源头减少翻转、让 regime 更可信。
+    # MA60 数据不足（指数样本 < MARKET_MA_LONG）时自动退回单指标，口径与改动前一致。
+    # 置 False 恢复纯 MA20 斜率单指标判据。
+    MARKET_REGIME_DUAL_INDICATOR: bool = True
+    MARKET_MA_LONG: int = 60
 
     MIN_ROE: float = 5.0
     MAX_DEBT_RATIO: float = 70.0
@@ -211,6 +227,14 @@ class StrategyConfig:
     # 的时机读数并写入决策简报，把择时判断显式交回人工（不改「哪些股票通过」）。
     SURFACE_TIMING_READ: bool = True
     TIMING_MA_LONG: int = 60   # 时机判读用的长期均线周期（现价站上/跌破 MA60 区分右侧/左侧）
+    # ===== P1：熊市抄底侧的止跌闸门（组合层暴露预算，修复"越熊越纯接飞刀"）=====
+    # 背景：突破策略熊市直接空仓（BEAR_MAX_PICKS_BREAKOUT=0），而抄底侧仍出 BEAR_MAX_PICKS
+    # 只、且 quality_value 无任何择时闸门——市场越差，组合越纯粹地只剩左侧接飞刀，恰好在最该
+    # 收手的 regime 里加满最危险的暴露。开启后：**熊市（含 unknown 折叠）** 的 formal 推荐
+    # 必须额外满足最低止跌证据「现价站上 MA20」或「MACD 柱连续 MACD_MOMENTUM_DAYS 日改善」，
+    # 否则否决（FAIL_BEAR_TIMING）。牛市/中性不受影响（不改变既有口径）。
+    # 默认 False 保持库级口径与既有单测不变；生产入口 run.py 显式置 True 启用。
+    QV_BEAR_TIMING_GATE: bool = False
 
     DAILY_MA5: int = 5
     DAILY_MA10: int = 10
@@ -535,6 +559,19 @@ def _bs_mark_failure() -> None:
 
 def _bs_available() -> bool:
     return not _bs_state["circuit_open"]
+
+def is_data_degraded() -> bool:
+    """P6：本次运行是否已降级到 AkShare 备用数据源（Baostock 熔断，或主源全程零命中）。
+
+    降级日的直接后果：AkShare 逐 bar 不提供 peTTM/pbMRQ，quality_value 的估值闸门只能记
+    缺项 → 候选被降级为 pending（待核验）→ formal 正式推荐恒为 0。若不显式标记，这种
+    "数据降级导致的零推荐"会被误读为"今天没有好票"。run.py / run_breakout.py 据此在
+    日志与飞书无信号卡片上明示数据状态。仅读全局状态，无副作用、可在任意时刻调用。
+    """
+    if _bs_state.get("circuit_open"):
+        return True
+    # 主源全程未命中、却有 AkShare 兜底命中 → 等价于降级（即使未触发熔断阈值）
+    return fetch_stats.get("bs_ok", 0) == 0 and fetch_stats.get("ak_ok", 0) > 0
 
 def _bs_guard(label: str) -> None:
     """查询前置守卫：熔断检查 + 断线自动重连。不可用时抛异常由重试层捕获。"""
@@ -1324,16 +1361,49 @@ def get_stock_industry(config: StrategyConfig, cache: Optional[CacheManager] = N
 
 def compute_market_environment(df_index: pd.DataFrame, config: StrategyConfig) -> dict:
     if df_index is None or df_index.empty or len(df_index) < config.MARKET_MA_PERIOD + config.MARKET_SLOPE_LOOKBACK:
-        return {"regime": "unknown", "description": "未知（沪深300数据不足）", "ma20": 0, "slope": 0, "close": 0}
+        return {"regime": "unknown", "description": "未知（沪深300数据不足）", "ma20": 0, "slope": 0, "close": 0,
+                "ma60": 0, "trend": "unknown"}
     df = df_index.copy().reset_index(drop=True)
     df["ma"] = df["close"].rolling(config.MARKET_MA_PERIOD).mean()
     cur, prev = df.iloc[-1], df.iloc[-(1 + config.MARKET_SLOPE_LOOKBACK)]
     ma_now, ma_prev, close_now = float(cur["ma"]), float(prev["ma"]), float(cur["close"])
     slope = (ma_now - ma_prev) / ma_prev if ma_prev > 0 else 0.0
-    if slope > config.MARKET_BULL_SLOPE: regime, desc = "bull", f"偏多（MA20斜率 {slope:.4f}，沪深300收于 {close_now:.0f}）"
-    elif slope < config.MARKET_BEAR_SLOPE: regime, desc = "bear", f"偏空（MA20斜率 {slope:.4f}，沪深300收于 {close_now:.0f}）"
-    else: regime, desc = "neutral", f"中性（MA20斜率 {slope:.4f}，沪深300收于 {close_now:.0f}）"
-    return {"regime": regime, "description": desc, "ma20": round(ma_now, 2), "slope": round(slope, 6), "close": round(close_now, 2)}
+    # 第一指标：MA20 斜率（原始判据，与改动前一致）
+    if slope > config.MARKET_BULL_SLOPE: slope_regime = "bull"
+    elif slope < config.MARKET_BEAR_SLOPE: slope_regime = "bear"
+    else: slope_regime = "neutral"
+    # ===== P2：第二指标 = 长期均线 MA60 趋势（现价与 MA20 相对 MA60 的位置）=====
+    # 单一 MA20 斜率在 ±0.01 阈值附近会逐日抖动，靠滞回打补丁治标不治本。叠加一个
+    # 慢速趋势过滤：只有「斜率看多 且 现价/MA20 均在 MA60 上方」才判 bull，
+    # 「斜率看空 且 均在 MA60 下方」才判 bear，两者不同向一律降级为 neutral。
+    # 双指标同向确认从源头减少 regime 翻转；MA60 数据不足时自动退回单指标（口径不变）。
+    ma_long_period = max(1, int(getattr(config, "MARKET_MA_LONG", 60)))
+    ma_long_ser = df["close"].rolling(ma_long_period).mean()
+    ma_long_now = float(ma_long_ser.iloc[-1]) if not pd.isna(ma_long_ser.iloc[-1]) else None
+    dual = bool(getattr(config, "MARKET_REGIME_DUAL_INDICATOR", True))
+    if ma_long_now is not None:
+        trend_up = close_now > ma_long_now and ma_now > ma_long_now
+        trend_down = close_now < ma_long_now and ma_now < ma_long_now
+        trend = "up" if trend_up else ("down" if trend_down else "mixed")
+    else:
+        trend_up = trend_down = False
+        trend = "unknown"
+    if dual and ma_long_now is not None:
+        if slope_regime == "bull" and trend_up: regime = "bull"
+        elif slope_regime == "bear" and trend_down: regime = "bear"
+        else: regime = "neutral"
+    else:
+        # MA60 数据不足或未启用双指标：退回单指标判据，与改动前逐字节一致
+        regime = slope_regime
+    _zh = {"bull": "偏多", "bear": "偏空", "neutral": "中性"}[regime]
+    _trend_zh = {"up": "上行", "down": "下行", "mixed": "纠缠", "unknown": "数据不足"}[trend]
+    desc = (f"{_zh}（MA20斜率 {slope:.4f}，MA{ma_long_period}趋势 {_trend_zh}，"
+            f"沪深300收于 {close_now:.0f}）")
+    if dual and ma_long_now is not None and regime != slope_regime:
+        desc += f"［双指标：斜率判 {slope_regime}，MA{ma_long_period}未同向确认，降级中性］"
+    return {"regime": regime, "description": desc, "ma20": round(ma_now, 2), "slope": round(slope, 6),
+            "close": round(close_now, 2), "ma60": round(ma_long_now, 2) if ma_long_now is not None else 0,
+            "trend": trend, "slope_regime": slope_regime}
 
 def _effective_regime(regime: str, config: StrategyConfig) -> str:
     """Map unavailable market state to the configured conservative regime."""
@@ -2914,19 +2984,29 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
         tags.append("近期业绩待核验")
     atr = finite(d.get("atr"))
     rr = compute_risk_reward(close, config, atr)
-    # ===== P0：入场时机判读（左侧/右侧 + 是否仍在下跌）；仅加标签与简报，不改推荐口径 =====
-    timing = (assess_entry_timing(technical, config)
-              if getattr(config, "SURFACE_TIMING_READ", True)
-              else {"side": "unknown", "label": "时机未知", "macd_weak": False, "recent_low": None,
-                    "days_since_low": None, "below_ma20": None, "below_ma60": None})
-    tags.append(timing["label"])
+    # ===== P0：入场时机判读（左侧/右侧 + 是否仍在下跌）=====
+    # 始终计算（P1 熊市闸门与 P5 简报都要用）；SURFACE_TIMING_READ 只控制是否加标签/出简报。
+    timing = assess_entry_timing(technical, config)
+    # ===== P1：熊市抄底侧止跌闸门（默认关，生产入口 run.py 开启）=====
+    # 仅在熊市（含 unknown 折叠为 bear）生效：formal 必须有最低止跌证据，否则否决，
+    # 避免突破策略空仓时组合变成"纯左侧接飞刀"。牛市/中性口径完全不变。
+    if getattr(config, "QV_BEAR_TIMING_GATE", False):
+        _eff_regime = _effective_regime((market_env or {}).get("regime", "unknown"), config)
+        if _eff_regime == "bear":
+            _stabilized = (timing.get("below_ma20") is False) or _macd_momentum_ok(technical, config)
+            if not _stabilized:
+                return None, "FAIL_BEAR_TIMING"
+    surface = bool(getattr(config, "SURFACE_TIMING_READ", True))
+    if surface:
+        tags.append(timing["label"])
     # ===== P5：决策简报（看多/风险/失效价/信心/今日触发）；纯展示，不落库、不参与否决 =====
-    brief = build_decision_brief(
+    brief = (build_decision_brief(
         timing=timing, quality=quality, pe=pe, pb=pb, val_context=val_context,
         industry_mode=industry_mode, position=position, close=close, stop_loss=rr["stop_loss"],
         forward_ni_yoy=_ni, forward_verified=forward_verified,
         forward_stat_date=fund.get("forward_stat_date"), missing=missing, hits=hits,
         quality_status=quality["status"], config=config)
+        if surface else {})
     return Signal(
         code=code, name=name, date=day, close=round(close, 2), score=score,
         grade=_grade_from_score(score, config), daily_score=tech_score,
@@ -2987,6 +3067,15 @@ def _screen_quality_pool(config: StrategyConfig, cache: CacheManager, market_env
     if reasons:
         top = "，".join(f"{k} {v}" for k, v in reasons.most_common(6))
         logger.info("优质低估低位否决归因（前6）：%s", top)
+    # ===== P6b：完整闸门归因（含 0 计数），把"从不触发的死闸门"暴露在每次运行日志里 =====
+    # 目的：闸门瘦身应由数据驱动（哪些闸门长期 0 命中＝对区分候选无贡献），而非凭直觉删。
+    # 长期为 0 的闸门即审计对象——要么阈值被前置闸门架空（死权重），要么本就极少生效。
+    full = "，".join(f"{c}={reasons.get(c, 0)}" for c in _QV_REASON_CODES)
+    logger.info("优质低估低位闸门归因（全量）：%s", full)
+    never = [c for c in _QV_REASON_CODES if reasons.get(c, 0) == 0]
+    if never and processed:
+        logger.info("本次从未触发的闸门（瘦身审计对象，长期为 0 需复核是否被前置条件架空）：%s",
+                    "，".join(never))
     logger.info("优质低估低位筛选：已处理 %d/%d，候选 %d，时间预算耗尽=%s", processed, len(stocks), len(rows), timed_out)
     if not rows:
         return None

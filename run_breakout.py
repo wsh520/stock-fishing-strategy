@@ -133,6 +133,7 @@ def run(argv: list[str] | None = None):
 
         # 组合层：同一交易日已被其他策略推荐的个股不再重复推荐（同股去重），
         # 且两策略合计推荐数不超过 DAILY_TOTAL_MAX_PICKS（依赖运行顺序：后运行者去重）。
+        existing: set = set()
         if output_df is not None and not output_df.empty:
             try:
                 from store.mysql_store import fetch_rec_codes_for_date, is_configured as _ms_configured
@@ -153,6 +154,19 @@ def run(argv: list[str] | None = None):
                         output_df = output_df.head(room).reset_index(drop=True)
             except Exception as e:
                 logger.warning("组合层去重/上限检查失败（按原结果继续）: %s", e)
+
+        # ===== P1：组合层市场暴露提示 =====
+        # 抄底（250日低位·左侧价值）与突破（60日新高·右侧动量）同日互斥，去重近乎空操作，
+        # 合计名单实为两个独立 sleeve 的拼接。熊市里突破已空仓（BEAR_MAX_PICKS_BREAKOUT=0），
+        # 组合会退化为"纯抄底左侧暴露"——此处显式打印两 sleeve 构成与市场环境，供人工裁量。
+        n_breakout = 0 if output_df is None else len(output_df)
+        n_existing = len(existing)
+        logger.info("组合暴露：市场环境=%s | 抄底侧(先落库) %d 只 + 突破侧 %d 只 = 合计 %d 只（上限 %d）",
+                    market_env_desc, n_existing, n_breakout, n_existing + n_breakout,
+                    int(getattr(config, "DAILY_TOTAL_MAX_PICKS", 7)))
+        if any(k in str(market_env_desc) for k in ("偏空", "bear")):
+            logger.warning("组合暴露提示：当前偏空/熊市，突破侧已空仓，合计暴露全部来自抄底左侧价值 sleeve，"
+                           "系统性下跌中相关度高、易同涨同跌，请据此下调整体仓位")
 
         n_picks = 0 if output_df is None else len(output_df)
         if output_df is not None and not output_df.empty:
@@ -178,11 +192,20 @@ def run(argv: list[str] | None = None):
         if not args.no_notify:
             t = time.time()
             logger.info("Step 4/4 发送飞书通知...")
+            # P6：数据源降级可观测（与 run.py 同口径），避免"降级导致的零推荐"被误读为"没有好票"。
+            try:
+                from src.bottom_fishing_strategy import is_data_degraded
+                degraded = is_data_degraded()
+            except Exception:
+                degraded = False
+            if degraded:
+                logger.warning("本次运行数据源已降级（Baostock 不可用，回退 AkShare），通知将标注数据状态")
             # 待核验候选（pending）仅在上方 CI 日志中打印计数，不再进入飞书卡片：
             # 数据不全的标的既不构成推荐也不该被误读为备选，飞书只展示正式推荐 Top-3。
             volatile_df = pd.DataFrame(volatile_rows) if volatile_rows else None
             notify_screening_result(output_df, market_env=market_env_desc,
-                                    strategy="volume_breakout", volatile=volatile_df)
+                                    strategy="volume_breakout", volatile=volatile_df,
+                                    data_degraded=degraded)
             logger.info("Step 4/4 完成 (%.1f 秒)", time.time() - t)
         else:
             logger.info("Step 4/4 已跳过（--no-notify）")
