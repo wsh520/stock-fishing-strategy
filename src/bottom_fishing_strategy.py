@@ -295,6 +295,19 @@ class StrategyConfig:
     # 止损/止盈/盈亏比（rr_ratio）仅作展示与落库，不参与否决。
     MAX_ATR_PCT: float = 3.33
 
+    # ===== 交易计划（建仓区间 / 止损 / 止盈 / 建议持有周期）=====
+    # 纯展示与落库，不参与任何准入、排序与否决（与 stop_loss/take_profit 同一定位）。
+    # 建仓区间带宽：通知给出的建仓区间 = 信号日收盘价 × (1 ± ENTRY_BAND_PCT%)。
+    # 两套策略的真实执行口径都是「信号日次日开盘买入」（见 backtest.py 的 T+1 开盘成交
+    # 与 docs/minimal_repairs.md），故以收盘价为锚：次日开盘落在区间内即按计划建仓；
+    # 高于上沿视为追高、放弃本轮（不为一个信号抬高成本）；低于下沿说明隔夜出现不利变动，
+    # 按失效重估而不是「越低越买」。
+    ENTRY_BAND_PCT: float = 1.5
+    # 建议持有周期（市场交易日）：与追踪口径对齐——run_weekly_tracking.py 在推荐后
+    # 第 5/10/15/20 个交易日观测表现，20 日既是观测终点，也是「到期离场」的判定日。
+    HOLD_DAYS_HINT_MIN: int = 10
+    HOLD_DAYS_HINT_MAX: int = 20
+
     MIN_AMOUNT: float = 30_000_000.0  # 近 20 日日均成交额下限（元）；原 500 万对主板几乎无筛选力，上调至 3000 万过滤低流动性标的
     MIN_DAYS: int = 60
     # 数据时效：个股最新K线日期须与市场（沪深300）最新交易日一致，
@@ -1760,6 +1773,53 @@ def _fmt_cell(v: Any, default: str = "-") -> Any:
     return v
 
 
+def describe_trade_plan(row: dict, config: Optional[StrategyConfig] = None) -> list[str]:
+    """渲染「可执行交易计划」：建仓区间 / 止损 / 止盈 / 建议持有周期。
+
+    定位与 stop_loss/take_profit 一致——**纯展示，不参与准入、排序与否决**。两套策略
+    共用本函数，保证同一只票无论在哪个入口的卡片里，看到的操作口径完全一致。
+
+    价位来源：
+      - 建仓区间：信号日收盘价 × (1 ± ENTRY_BAND_PCT%)，次日开盘执行（见 config 注释）；
+      - 止损/止盈：直接取 row，口径由各自策略决定——优质低估低位=2×ATR 或固定 -5%
+        搭配固定 +10%；放量突破=突破位−1×ATR 与固定 -6% 取更紧者、固定 +15% 与
+        ATR 目标取更近者；
+      - 建议持有周期：HOLD_DAYS_HINT_MIN ~ MAX，与周度追踪窗口（推荐后第 5/10/15/20
+        个交易日）对齐，第 20 个交易日是到期离场判定日。
+
+    任一必需字段缺失（旧数据/异常输入）时整段不渲染，对既有调用与测试向后兼容。
+    """
+    close = _num_or_none(row.get("close"))
+    if close is None or close <= 0:
+        return []
+    cfg = config or StrategyConfig()
+    band = max(0.0, float(getattr(cfg, "ENTRY_BAND_PCT", 1.5) or 0.0)) / 100.0
+    if band > 0:
+        lo, hi = close * (1 - band), close * (1 + band)
+        entry = f"建仓 {lo:.2f} ~ {hi:.2f}｜高于上沿不追，低于下沿按失效重估"
+    else:
+        entry = f"建仓 {close:.2f}（信号日收盘价）"
+    lines = ["**操作计划**（次日开盘按区间建仓）", entry]
+    price_bits = []
+    stop = _num_or_none(row.get("stop_loss"))
+    take = _num_or_none(row.get("take_profit"))
+    if stop is not None and stop > 0:
+        price_bits.append(f"止损 {stop:.2f}（{(stop / close - 1) * 100:+.1f}%）")
+    if take is not None and take > 0:
+        price_bits.append(f"止盈 {take:.2f}（{(take / close - 1) * 100:+.1f}%）")
+    rr = _num_or_none(row.get("rr_ratio"))
+    if rr is not None:
+        price_bits.append(f"盈亏比 {rr:.2f}")
+    if price_bits:
+        lines.append(" | ".join(price_bits))
+    hold_lo = int(getattr(cfg, "HOLD_DAYS_HINT_MIN", 10) or 0)
+    hold_hi = int(getattr(cfg, "HOLD_DAYS_HINT_MAX", 20) or 0)
+    if hold_lo > 0 and hold_hi >= hold_lo:
+        lines.append(f"建议持有 {hold_lo}~{hold_hi} 个交易日"
+                     f"（第 {hold_hi} 个交易日仍未触及止损/止盈，按收盘价平仓离场）")
+    return lines
+
+
 _FUND_STATUS_ZH = {"verified": "财务已核验", "partial": "财务部分核验", "missing": "财务未核验"}
 _WEEKLY_STATUS_ZH = {"confirmed": "周线已确认", "unverified": "周线待核验", "disabled": "周线未启用", "not_required": "技术仅供排序"}
 _MISSING_TAG_ZH = {
@@ -1798,24 +1858,32 @@ def _brief_lines(row: dict) -> list[str]:
     return lines
 
 def describe(row: dict) -> str:
-    """把一条推荐格式化为飞书卡片文本（notify/feishu.py 调用），按三维展示：
+    """把一条推荐格式化为飞书卡片文本（notify/feishu.py 调用），按四维展示：
 
     1. 基础评分/等级：分数与等级同源（均按原始技术分定级，熊市只抬门槛不扣展示分）；
     2. 入选依据：实际触发的技术条件（放量企稳/放量上涨/放量冲高回落措辞区分）；
-    3. 核验状态：财务/周线是否已核验、缺项明细（可选指标缺失只标注不降级）。
+    3. 操作计划：建仓区间 / 止损 / 止盈 / 建议持有周期（见 describe_trade_plan）；
+    4. 核验状态：财务/周线是否已核验、缺项明细（可选指标缺失只标注不降级）。
     quality_value 模式额外附 P5 决策简报（信心/今日触发/看多/风险/失效价）。
+
+    标题里的「正式推荐」即 tier=formal——飞书卡片在渲染前已过滤掉全部非 formal 标的，
+    故卡片上每一只都已落库并被周度追踪统计战绩。此处不再使用「候选」措辞：该词在中文里
+    天然偏「备选/仅供参考」，与 formal 的真实含义相反，是明确的误导来源。
     """
     if row.get("weekly_status") == "not_required":
         lines = [
-            f"**{row.get('name', '')} {row.get('code', '')}**（优质低估低位候选）",
+            f"**{row.get('name', '')} {row.get('code', '')}** · 正式推荐 · 优质低估低位",
             f"综合分: {_fmt_cell(row.get('score'))} | 质量分: {_fmt_cell(row.get('quality_score'))}"
             f" | 估值分: {_fmt_cell(row.get('valuation_score'))} | 技术分: {_fmt_cell(row.get('daily_score'))}",
             f"收盘: {_fmt_cell(row.get('close'))} | PE: {_fmt_cell(row.get('pe_ttm'))}"
             f" | PB: {_fmt_cell(row.get('pb_mrq'))} | 250日区间位置: {float(row.get('position_250', 0)):.1%}",
             f"入选依据: {row.get('signals_hit', '')}",
-            f"核验: {_FUND_STATUS_ZH.get(str(row.get('fund_status')), '待核验')}"
-            + (f" | 缺项: {_missing_tags_zh(str(row.get('missing_tags')))}" if row.get('missing_tags') else ""),
         ]
+        lines.extend(describe_trade_plan(row))
+        lines.append(
+            f"核验: {_FUND_STATUS_ZH.get(str(row.get('fund_status')), '待核验')}"
+            + (f" | 缺项: {_missing_tags_zh(str(row.get('missing_tags')))}" if row.get('missing_tags') else "")
+        )
         lines.extend(_brief_lines(row))
         return "\n".join(lines)
     verify_bits = [
@@ -1825,15 +1893,13 @@ def describe(row: dict) -> str:
     missing = _missing_tags_zh(str(row.get("missing_tags", "") or ""))
     verify = " | ".join(verify_bits) + (f" | 缺项: {missing}" if missing else "")
     lines = [
-        f"**{row.get('name', '')} {row.get('code', '')}**（低位企稳候选）",
+        f"**{row.get('name', '')} {row.get('code', '')}** · 正式推荐 · 低位企稳",
         f"评分: {_fmt_cell(row.get('score'))} ({row.get('grade') or '-'}级)"
-        f" | 收盘: {_fmt_cell(row.get('close'))}"
-        f" | 止损: {_fmt_cell(row.get('stop_loss'))}"
-        f" | 止盈: {_fmt_cell(row.get('take_profit'))}"
-        f" | RR: {_fmt_cell(row.get('rr_ratio'))}",
+        f" | 收盘: {_fmt_cell(row.get('close'))}",
     ]
     if row.get("signals_hit"):
         lines.append(f"入选依据: {row.get('signals_hit')}")
+    lines.extend(describe_trade_plan(row))
     lines.append(f"核验: {verify}")
     lines.append(
         f"RSI14: {_fmt_cell(row.get('rsi'))}"

@@ -94,6 +94,17 @@ _VALUATION_MODE_NOTE = {
     ),
 }
 
+# ===== 名单口径与操作说明 =====
+# 「候选」措辞已废弃：本函数在渲染前就过滤掉了全部非 formal 标的（见函数开头的
+# tier 复核），因此卡片上出现的每一只都是**正式推荐**——已落库、并被周度追踪统计战绩。
+# 原先写成「XX候选」会被读成「备选/仅供参考」，与 formal 的真实含义相反。
+# 现统一为「正式推荐 · XX口径」，并在每只票下渲染「操作计划」块（建仓区间 /
+# 止损 / 止盈 / 建议持有周期，见 bottom_fishing_strategy.describe_trade_plan）。
+_RECOMMENDATION_NOTE = (
+    "\n**名单口径:** 下列均为**正式推荐**（已通过全部筛选闸门、已落库并纳入周度追踪）；"
+    "\n每只票下方的**操作计划**为计划价位，按**次日开盘**执行，仓位与资金管理请自行判断。"
+)
+
 
 def _volatile_elements(volatile: Optional[pd.DataFrame], strategy: str = "bottom_fishing",
                        top: int = VOLATILE_CARD_TOP) -> list:
@@ -165,8 +176,9 @@ def notify_screening_result(
     展示口径：df 为正式推荐，每策略最多 NOTIFY_TOP_PER_STRATEGY=3 只（宁缺毋滥）；
     volatile 为「波动率风控否决」的高风险观察池（技术面/形态已达标，仅 ATR 超限被拦），
     单独成区块并显式标注风险等级与风险提示，避免被误读为推荐标的。
-    strategy 决定卡片标题前缀与单票描述格式（优质低估低位口径=优质低估低位候选 /
-    突破入口=放量突破候选 / technical 对照口径=低位企稳候选），
+    strategy 决定卡片标题前缀与单票描述格式（优质低估低位口径=「正式推荐 · 优质低估低位」/
+    突破入口=「正式推荐 · 放量突破」/ technical 对照口径=「正式推荐 · 低位企稳」），
+    每只票另附「操作计划」块（建仓区间 / 止损 / 止盈 / 建议持有周期）。
     两策略通知的卡片标题以「实际生效口径名」前缀区分：【优质低估低位】（quality_value，
     生产默认）/【放量突破】（technical 的突破入口）；technical 的抄底对照口径显示为
     【低位企稳】。用口径名而非 strategy 值，是为了让标题说出真实的选股逻辑（见 _STRATEGY_ROLE_ZH）。
@@ -195,7 +207,7 @@ def notify_screening_result(
         df = df.loc[formal].copy()
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     is_breakout = strategy == "volume_breakout"
-    candidate_label = "放量突破候选" if is_breakout else "低位企稳候选"
+    candidate_label = "放量突破" if is_breakout else "低位企稳"
     # quality_mode：本次跑的是 quality_value 资格（周线确认 not_required 是其标志），
     # 与 technical（真正的技术抄底）区分开——两者的入选逻辑完全不同，标题不应混用。
     # 注意：**零推荐时从数据里推不出口径**（没有任何行可供判断），所以标题不能只依赖它，
@@ -204,7 +216,7 @@ def notify_screening_result(
                        and frame["weekly_status"].eq("not_required").any()
                        for frame in (df, pending))
     if quality_mode:
-        candidate_label = "优质低估低位候选"
+        candidate_label = "优质低估低位"
     # 标题即「实际口径名 + 选股结果」，不再出现【抄底策略】优质低估低位荐股 这类自相矛盾的组合。
     if is_breakout:
         _role = _STRATEGY_ROLE_ZH["volume_breakout"]
@@ -279,9 +291,10 @@ def notify_screening_result(
         _md_element(
             f"**时间:** {now}\n"
             f"**市场环境:** {market_env}\n"
-            f"**推荐数量:** {shown_n} 只（{candidate_label}"
-            + (f"，策略命中 {len(df)} 只，展示 Top-{top_n}" if len(df) > shown_n else "")
+            f"**推荐数量:** {shown_n} 只（均为**正式推荐** · {candidate_label}"
+            + (f"，本策略命中 {len(df)} 只，展示 Top-{top_n}" if len(df) > shown_n else "")
             + "）"
+            + _RECOMMENDATION_NOTE
             + ("\n⚠️ **数据源已降级（AkShare 兜底）**：估值字段与成长数据可能缺失，"
                "名单可能不完整（部分标的已被降级为待核验），请留意每只的核验状态。"
                if data_degraded else "")

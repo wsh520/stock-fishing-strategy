@@ -116,7 +116,7 @@ class QualityRecommendations(unittest.TestCase):
              patch.object(m, "_macd_momentum_ok", side_effect=AssertionError("old gate invoked")):
             self.assertEqual(self.evaluate()[0].tier, "formal")
 
-    def test_notice_shows_quality_not_trade_plan(self):
+    def test_notice_shows_quality_and_trade_plan(self):
         from notify import feishu
         sig, _ = self.evaluate()
         with patch.object(feishu, "_send_feishu") as send:
@@ -124,7 +124,28 @@ class QualityRecommendations(unittest.TestCase):
         text = str(send.call_args.args[0])
         self.assertIn("优质低估低位", text)
         self.assertIn("质量分", text)
-        self.assertNotIn("止损:", text)
+        # 措辞与内容双重锁定：卡片上的都是 formal 正式推荐（不是「候选/仅供参考」），
+        # 且每只必须带可执行操作计划（建仓区间 / 止损 / 止盈 / 建议持有周期）。
+        self.assertNotIn("候选", text)
+        self.assertIn("正式推荐", text)
+        self.assertIn("建仓", text)
+        self.assertIn("止损", text)
+        self.assertIn("止盈", text)
+        self.assertIn("建议持有", text)
+
+    def test_trade_plan_fields_and_band(self):
+        plan = " ".join(m.describe_trade_plan({"close": 10.0, "stop_loss": 9.5,
+                                               "take_profit": 11.0, "rr_ratio": 2.0}))
+        self.assertIn("建仓 9.85 ~ 10.15", plan)          # 10.00 × (1 ± ENTRY_BAND_PCT=1.5%)
+        self.assertIn("止损 9.50（-5.0%）", plan)
+        self.assertIn("止盈 11.00（+10.0%）", plan)
+        self.assertIn("建议持有 10~20 个交易日", plan)
+
+    def test_trade_plan_omitted_without_close(self):
+        # 旧数据/字段不全时整段不渲染，避免卡片出现 nan 或空洞的「操作计划」标题。
+        for row in ({}, {"close": None}, {"close": 0}, {"close": float("nan")}):
+            with self.subTest(row=row):
+                self.assertEqual(m.describe_trade_plan(row), [])
 
     def test_main_default_does_not_invoke_market_or_weekly_gate(self):
         index = pd.DataFrame({"date": [DAY], "close": [100.]})

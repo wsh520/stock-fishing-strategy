@@ -65,6 +65,7 @@ from src.bottom_fishing_strategy import (
     _fetch_weekly_dual,
     _fmt_cell,
     _num_or_none,
+    describe_trade_plan,
     _GRADE_ORDER,
     _grade_from_score,
     check_fundamentals,
@@ -805,26 +806,29 @@ def evaluate_breakout(
 # ===========================================================================
 
 def describe_breakout(row: dict) -> str:
-    """把一条放量突破推荐格式化为飞书卡片文本（notify/feishu.py 按 strategy 选择调用）。"""
+    """把一条放量突破推荐格式化为飞书卡片文本（notify/feishu.py 按 strategy 选择调用）。
+
+    止损/止盈不再挤在指标行里，统一由 describe_trade_plan 渲染成「操作计划」块，
+    与优质低估低位入口共用同一格式（含建仓区间与建议持有周期）。标题用「正式推荐」
+    而非「候选」——能进卡片的必然已是 tier=formal（feishu 渲染前已过滤）。
+    """
     if row.get("weekly_status") == "not_required":
         from src.bottom_fishing_strategy import describe
         return describe(row)
     lvl = {3: "L1·60日新高", 2: "L2·20日新高", 1: "L3·MA60"}.get(
         int(row.get("breakout_level") or 0), "-")
     lines = [
-        f"**{row.get('name', '')} {row.get('code', '')}**（放量突破候选）",
+        f"**{row.get('name', '')} {row.get('code', '')}** · 正式推荐 · 放量突破",
         f"评分: {_fmt_cell(row.get('score'))} ({row.get('grade') or '-'}级)"
         f" | 突破: {lvl} +{_fmt_cell(row.get('breakout_margin'))}%"
-        f" | 收盘: {_fmt_cell(row.get('close'))}"
-        f" | 止损: {_fmt_cell(row.get('stop_loss'))}"
-        f" | 止盈: {_fmt_cell(row.get('take_profit'))}"
-        f" | RR: {_fmt_cell(row.get('rr_ratio'))}",
+        f" | 收盘: {_fmt_cell(row.get('close'))}",
         f"量比: {_fmt_cell(row.get('vol_ratio'))}"
         f" | RSI14: {_fmt_cell(row.get('rsi'))}"
         f" | 平台振幅: {_fmt_cell(row.get('platform_range'))}%"
         f" | 日均额: {_fmt_cell(row.get('avg_amount'))}万"
         f" | 市场: {row.get('market_env') or '-'}",
     ]
+    lines.extend(describe_trade_plan(row))
     lines.extend(_breakout_brief_lines(row, lvl))
     return "\n".join(lines)
 
