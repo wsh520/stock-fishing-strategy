@@ -3387,8 +3387,10 @@ def run_concurrent_screen(
 ) -> tuple[list[tuple], int, bool]:
     """并发筛选骨架（优质低估低位/放量突破两策略共用的漏斗模板）：线程池 + 心跳看门狗 + 时间预算。
 
-    - 看门狗：筛选期每 3 分钟心跳；连续 4 分钟无任务完成则打印在途股票代码定位卡点
-      （数据源假死排查手段，bs_lock 持有期间卡死曾致全池阻塞）。
+    - 看门狗：筛选期每 WATCHDOG_TICK_SEC（默认 60）秒心跳一次；连续 4 分钟无任务完成
+      则升级为 warning 并打印在途股票代码定位卡点（数据源假死排查手段，bs_lock 持有
+      期间卡死曾致全池阻塞）。tick-first：首轮心跳在启动后 60s 即触发，短跑（<60s 完成）
+      仍无心跳——此时"开始并发筛选"与"进度: N/N (100%)"已足够 bracket 整段。
     - 时间预算：超过 SCREEN_TIME_BUDGET_MIN 取消未完成任务，按已完成结果出报告，
       漏斗统计按 processed 计（预算截断时不失真）。
     - 进度日志：每 PROGRESS_LOG_EVERY 只打印一次进度与 ETA。
@@ -3401,6 +3403,8 @@ def run_concurrent_screen(
     screen_start = time.time()
     budget_sec = float(getattr(config, "SCREEN_TIME_BUDGET_MIN", 240.0)) * 60
     progress_every = int(getattr(config, "PROGRESS_LOG_EVERY", 500))
+    watchdog_tick = float(getattr(config, "WATCHDOG_TICK_SEC", 60.0))
+    watchdog_idle_warn = float(getattr(config, "WATCHDOG_IDLE_WARN_SEC", 240.0))
     progress = {"done": 0, "t": screen_start}
     stop_watch = threading.Event()
 
@@ -3408,9 +3412,12 @@ def run_concurrent_screen(
     futures = {pool.submit(screen_one, s): s for s in stock_list}
 
     def _watchdog() -> None:
-        while not stop_watch.wait(180):
+        # tick-first：wait(N) 先睡后判，所以首轮心跳在启动后 N 秒触发。
+        # N 从 180 降到 60 是为了让"短跑无心跳"的窗口从 3min 缩到 1min；
+        # 长跑场景下 60s 一跳的日志密度（60 行/小时）在 CI 里仍可接受。
+        while not stop_watch.wait(watchdog_tick):
             idle = time.time() - progress["t"]
-            if idle >= 240:
+            if idle >= watchdog_idle_warn:
                 hanging = [futures[f]["code"] for f in futures if not f.done()][:8]
                 log.warning("已 %d 秒无任务完成，疑似数据源卡住：%d/%d 完成，在途代码: %s",
                             int(idle), progress["done"], total, ",".join(hanging) or "-")
