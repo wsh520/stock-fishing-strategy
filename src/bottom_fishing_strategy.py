@@ -2639,32 +2639,62 @@ def build_industry_valuation_snapshot(config: StrategyConfig, cache: CacheManage
         return {}
     snapshot_day = str(index.iloc[-1]["date"])[:10]
 
+    # ===== 纯观测层：快照阶段进度日志 =====
+    # 本函数用独立 ThreadPoolExecutor 遍历全 A 拉日线，不走 run_concurrent_screen，
+    # 因此既无心跳看门狗也无 PROGRESS_LOG_EVERY 进度；冷启动 cache 全 miss 时
+    # 是长达 1~2h+ 的静默黑洞（曾被误判为死锁）。这里补开始/周期进度/结束耗时三处
+    # 打点，不改任何口径、返回值或异常语义。
+    total_stocks = len(stock_list)
+    progress_every = int(getattr(config, "SNAPSHOT_PROGRESS_LOG_EVERY", 200))
+    counter = {"done": 0, "hit": 0}
+    snapshot_start = time.time()
+    logger.info("行业估值快照构建开始：%d 只股票，%d 线程，快照日 %s（每 %d 只打印一次进度）",
+                total_stocks, config.MAX_WORKERS, snapshot_day, progress_every)
+
     def collect(stock: dict) -> None:
-        code = str(stock.get("code", ""))
-        ind = industry_map.get(code, "")
-        if not ind:
-            return
-        daily = get_daily_data(code, config, cache)
-        if daily is None or daily.empty:
-            return
-        last = daily.iloc[-1]
-        if str(last.get("date", ""))[:10] != snapshot_day:
-            return
-        pe = _finite_positive_or_none(last.get("peTTM"))
-        pb = _finite_positive_or_none(last.get("pbMRQ"))
-        if pe is None and pb is None:
-            return
-        with lock:
-            if pe is not None:
-                pe_by_ind.setdefault(ind, []).append(pe)
-            if pb is not None:
-                pb_by_ind.setdefault(ind, []).append(pb)
+        hit = False
+        try:
+            code = str(stock.get("code", ""))
+            ind = industry_map.get(code, "")
+            if not ind:
+                return
+            daily = get_daily_data(code, config, cache)
+            if daily is None or daily.empty:
+                return
+            last = daily.iloc[-1]
+            if str(last.get("date", ""))[:10] != snapshot_day:
+                return
+            pe = _finite_positive_or_none(last.get("peTTM"))
+            pb = _finite_positive_or_none(last.get("pbMRQ"))
+            if pe is None and pb is None:
+                return
+            with lock:
+                if pe is not None:
+                    pe_by_ind.setdefault(ind, []).append(pe)
+                if pb is not None:
+                    pb_by_ind.setdefault(ind, []).append(pb)
+            hit = True
+        finally:
+            with lock:
+                counter["done"] += 1
+                if hit:
+                    counter["hit"] += 1
+                done = counter["done"]
+                hits = counter["hit"]
+            if total_stocks and (done % progress_every == 0 or done == total_stocks):
+                elapsed = time.time() - snapshot_start
+                rate = done / elapsed if elapsed > 0 else 0
+                eta_min = (total_stocks - done) / rate / 60 if rate > 0 else 0
+                logger.info("行业估值快照进度: %d/%d (%.0f%%)，命中 %d，已用 %.1f 分钟，预计剩余 %.1f 分钟",
+                            done, total_stocks, done / total_stocks * 100,
+                            hits, elapsed / 60, eta_min)
 
     try:
         with ThreadPoolExecutor(max_workers=config.MAX_WORKERS) as pool:
             list(pool.map(collect, stock_list))
     except Exception as e:  # noqa: BLE001  快照失败不得阻断选股，降级为绝对阈值
-        logger.warning("行业估值快照构建失败，本次回退绝对估值阈值: %s", e)
+        logger.warning("行业估值快照构建失败（已完成 %d/%d，耗时 %.1f 分钟），本次回退绝对估值阈值: %s",
+                       counter["done"], total_stocks, (time.time() - snapshot_start) / 60, e)
         return {}
     snapshot: dict[str, dict] = {}
     for ind in set(pe_by_ind) | set(pb_by_ind):
@@ -2673,7 +2703,9 @@ def build_industry_valuation_snapshot(config: StrategyConfig, cache: CacheManage
             "pb": np.sort(np.asarray(pb_by_ind.get(ind, []), dtype=float)),
         }
     if snapshot:
-        logger.info("行业估值快照：%d 个行业纳入横截面（行业相对估值闸门生效）", len(snapshot))
+        logger.info("行业估值快照：%d 个行业纳入横截面（行业相对估值闸门生效），完成 %d/%d，命中 %d，耗时 %.1f 分钟",
+                    len(snapshot), counter["done"], total_stocks, counter["hit"],
+                    (time.time() - snapshot_start) / 60)
     return snapshot
 
 
