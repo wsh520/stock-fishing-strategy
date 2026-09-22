@@ -262,10 +262,15 @@ try:
         _fs.notify_screening_result(_rec, market_env="中性", strategy="bottom_fishing",
                                     valuation_mode="mixed",
                                     recommendation_mode="quality_value")
-        _blob2 = json.dumps(_cards[-1], ensure_ascii=False)
+        # 有推荐时改为「汇总卡 + 每股独立卡」多张发送：估值口径提示落在汇总卡上，
+        # 标题口径名同时出现在汇总卡与个股卡上，故断言扫全部卡片（而非只看最后一张）。
+        _blob2 = json.dumps(_cards, ensure_ascii=False)
+        check("飞书: 有推荐时按每股一张卡拆分（>=2 张：汇总 + 个股）", len(_cards) >= 2)
         check("飞书: 有推荐时混合口径同样显式声明", "混合口径" in _blob2)
         check("飞书: 标题按实际口径取名（【优质低估低位】），不再出现自相矛盾的【抄底策略】",
               "【优质低估低位】" in _blob2 and "【抄底策略】" not in _blob2)
+        check("飞书: 个股卡自带口径脚注（脱离汇总卡也可独立阅读）",
+              any("口径: 正式推荐" in json.dumps(c, ensure_ascii=False) for c in _cards[1:]))
 
         # 零推荐时不可依赖数据推断口径：同一份"无 df"，technical 必须显示【低位企稳】
         _cards.clear()

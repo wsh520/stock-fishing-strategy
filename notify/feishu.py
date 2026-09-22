@@ -63,6 +63,21 @@ def _divider() -> dict:
     return {"tag": "hr"}
 
 
+def _stock_card(header_title: str, body_md: str, color: str = "green") -> dict:
+    """构建单只个股的独立卡片。
+
+    拆卡目的：飞书群里一张长卡片难以聚焦，多只股票塞在一起时"操作计划"等
+    关键信息被埋在滚动条深处。改为每股一张卡后，用户在群里就能一眼扫过
+    标题（含策略口径 + 序号 + 名称代码），点开即看该股的完整评估与操作计划。
+    body_md 由调用方组装（describe/describe_breakout + 口径脚注），
+    保证单张卡即便脱离上下文也可独立阅读。
+    """
+    return {
+        "header": _build_header(header_title, color=color),
+        "elements": [_md_element(body_md)],
+    }
+
+
 _STRATEGY_ZH = {"bottom_fishing": "优质低估低位", "volume_breakout": "放量突破"}
 # 卡片标题前缀 = 该次运行**实际生效的资格口径名**，而不是落库用的 strategy 值。
 # 原因：DB 的 strategy='bottom_fishing' 是一个覆盖两种口径的 sleeve 标识——
@@ -176,6 +191,14 @@ def notify_screening_result(
     展示口径：df 为正式推荐，每策略最多 NOTIFY_TOP_PER_STRATEGY=3 只（宁缺毋滥）；
     volatile 为「波动率风控否决」的高风险观察池（技术面/形态已达标，仅 ATR 超限被拦），
     单独成区块并显式标注风险等级与风险提示，避免被误读为推荐标的。
+
+    **卡片形态（2026-09 改造）**：由"一张长卡片塞下所有股票"改为"汇总卡 + 每股独立卡"：
+      · 1 张汇总卡：时间 / 市场环境 / 推荐数量 / 名单口径 / 数据源与估值口径提示；
+      · N 张个股卡：每张标题带 [i/N] 序号 + 名称代码，卡内含 describe 全文 + 口径脚注
+        （策略口径 / 市场环境 / 时间 / 序号），保证单张卡在群里脱离汇总也可独立阅读；
+      · 1 张波动率观察池卡（若存在）：仍是单卡多行——每只是一行简述，拆开反而碎片化。
+    拆分带来的额外收益：飞书群里点击通知栏预览即可看到"哪只票"，不用先展开长卡片；
+    单张卡片高度可控，操作计划不再被埋在滚动条深处。
     strategy 决定卡片标题前缀与单票描述格式（优质低估低位口径=「正式推荐 · 优质低估低位」/
     突破入口=「正式推荐 · 放量突破」/ technical 对照口径=「正式推荐 · 低位企稳」），
     每只票另附「操作计划」块（建仓区间 / 止损 / 止盈 / 建议持有周期）。
@@ -284,31 +307,51 @@ def notify_screening_result(
         return
 
     # 有信号：每策略最多展示 NOTIFY_TOP_PER_STRATEGY 只
+    # 展示形态：**汇总卡 1 张 + 每只个股独立卡 N 张 + 波动率观察池 1 张**
+    #   · 汇总卡承载市场环境、名单口径、数据源/估值口径提示——全局只讲一次；
+    #   · 每只个股独立成卡，标题带 [i/N] 序号 + 名称代码便于群内快速扫读；
+    #     卡内自带"口径脚注"（策略口径 + 市场环境 + 时间），保证脱离汇总卡也可独立阅读；
+    #   · 波动率观察池保持单卡（每只是一行简述，拆开反而碎片化）。
     top_n = max(1, int(NOTIFY_TOP_PER_STRATEGY))
     shown_df = df.head(top_n)
     shown_n = len(shown_df)
-    elements = [
-        _md_element(
-            f"**时间:** {now}\n"
-            f"**市场环境:** {market_env}\n"
-            f"**推荐数量:** {shown_n} 只（均为**正式推荐** · {candidate_label}"
-            + (f"，本策略命中 {len(df)} 只，展示 Top-{top_n}" if len(df) > shown_n else "")
-            + "）"
-            + _RECOMMENDATION_NOTE
-            + ("\n⚠️ **数据源已降级（AkShare 兜底）**：估值字段与成长数据可能缺失，"
-               "名单可能不完整（部分标的已被降级为待核验），请留意每只的核验状态。"
-               if data_degraded else "")
-            + _VALUATION_MODE_NOTE.get(str(valuation_mode), "")
-        ),
-        _divider(),
-    ]
+    hit_note = (f"，本策略命中 {len(df)} 只，展示 Top-{top_n}" if len(df) > shown_n else "")
+    degraded_note = (
+        "\n⚠️ **数据源已降级（AkShare 兜底）**：估值字段与成长数据可能缺失，"
+        "名单可能不完整（部分标的已被降级为待核验），请留意每只的核验状态。"
+        if data_degraded else ""
+    )
+    valuation_note = _VALUATION_MODE_NOTE.get(str(valuation_mode), "")
+    volatile_n = int(len(volatile)) if volatile is not None else 0
 
-    for _, row in shown_df.iterrows():
+    # ---------- 1) 汇总卡 ----------
+    summary_text = (
+        f"**时间:** {now}\n"
+        f"**市场环境:** {market_env}\n"
+        f"**推荐数量:** {shown_n} 只（均为**正式推荐** · {candidate_label}{hit_note}）"
+        + _RECOMMENDATION_NOTE
+        + degraded_note
+        + valuation_note
+        + f"\n\n📇 下方将**逐只发送 {shown_n} 张个股卡片**（含操作计划）"
+        + (f"，另附**波动率观察池 {volatile_n} 只**（单独 1 张卡）。" if volatile_n else "。")
+    )
+    _send_feishu({
+        "header": _build_header(f"{card_title} - {shown_n}只信号", color="green"),
+        "elements": [_md_element(summary_text)],
+    })
+
+    # ---------- 2) 每只个股独立成卡 ----------
+    # 卡内脚注复述"策略口径 / 市场环境 / 时间"，让每张卡在群里独立可读——
+    # 用户从通知栏点进某一张时不必回滚找汇总卡。
+    per_stock_footer_tmpl = (
+        "\n\n---\n*口径: 正式推荐 · {label} | 市场环境: {env} | {ts} | [{idx}/{total}]*"
+    )
+    for idx, (_, row) in enumerate(shown_df.iterrows(), start=1):
         r = row.to_dict()
         if describe_fn:
-            text = describe_fn(r)
+            body = describe_fn(r)
         else:
-            text = (
+            body = (
                 f"**{r.get('name', '')} {r.get('code', '')}**\n"
                 f"评分: {r.get('score', 0)} ({r.get('grade', '')}) "
                 f"| 收盘: {r.get('close', 0)} "
@@ -316,16 +359,30 @@ def notify_screening_result(
                 f"| 止盈: {r.get('take_profit', 0)} "
                 f"| RR: {r.get('rr_ratio', 0)}"
             )
-        elements.append(_md_element(text))
-        elements.append(_divider())
+        body += per_stock_footer_tmpl.format(
+            label=candidate_label, env=market_env, ts=now, idx=idx, total=shown_n,
+        )
+        name = r.get('name', '') or '-'
+        code = r.get('code', '') or '-'
+        _send_feishu(_stock_card(
+            f"{card_title} [{idx}/{shown_n}] {name} {code}",
+            body,
+            color="green",
+        ))
 
-    elements.extend(_volatile_elements(volatile, strategy))
-
-    card = {
-        "header": _build_header(f"{card_title} - {shown_n}只信号", color="green"),
-        "elements": elements,
-    }
-    _send_feishu(card)
+    # ---------- 3) 波动率观察池（单卡汇总） ----------
+    if volatile_n:
+        vol_elements = _volatile_elements(volatile, strategy)
+        # _volatile_elements 首个元素是分隔线，独立成卡时无需（卡片头已有视觉分隔）
+        if vol_elements and vol_elements[0].get("tag") == "hr":
+            vol_elements = vol_elements[1:]
+        _send_feishu({
+            "header": _build_header(
+                f"{card_title} - 波动率观察池 {volatile_n}只（不构成买入建议）",
+                color="orange",
+            ),
+            "elements": vol_elements,
+        })
 
 
 def notify_tracking_result(report: Optional[pd.DataFrame]) -> None:
