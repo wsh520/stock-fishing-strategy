@@ -4,7 +4,10 @@
 - 用沪深300行情日期定位推荐后第5/10/15/20个市场交易日，60日内允许补跑；
 - 仅记录目标日有效收盘价，停牌/缺价跳过，不以前后日期代替；
 - 同一推荐同一收盘日及同一期限幂等，历史未知期限不猜测；
-- 收益值 = 目标日收盘价 - 推荐时收盘价，收益率 = 收益值 / 推荐价 × 100%；
+- **收益率 =（目标日收盘价 − 同序列推荐日收盘价）/ 同序列推荐日收盘价 × 100%**：
+  close 取前复权（`ADJUST="qfq"`，以最新交易日为锚点），故分母必须用**同一次拉取**里
+  推荐日的收盘价。用落库的「推荐日当时」价格当分母，会在追踪期内发生除权除息时把
+  10 送 10 的含权收益（本应 0%）算成 −50%；
 - 同一股票在不同日期被重复推荐的，视为不同推荐记录，各自独立追踪。
 
 由 GitHub Actions 每周五收盘后执行（weekly_tracking.yml），也可本地手动：
@@ -57,7 +60,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def select_observations(rec: dict, daily: pd.DataFrame, market: pd.DataFrame) -> list[dict]:
-    """用市场交易日定位固定期限；停牌/缺价不前填，允许补跑多个到期观测。"""
+    """用市场交易日定位固定期限；停牌/缺价不前填，允许补跑多个到期观测。
+
+    每条观测额外带 **base_close**：**同一次拉取**（即同一前复权序列）里推荐日的收盘价。
+    调用方必须用它而不是落库的 `rec_close` 作收益率分母——见下方注释。
+    """
     if daily is None or daily.empty or market is None or market.empty:
         return []
     from store.mysql_store import TRACK_HORIZONS
@@ -77,6 +84,11 @@ def select_observations(rec: dict, daily: pd.DataFrame, market: pd.DataFrame) ->
         if column in quotes:
             quotes = quotes[pd.to_numeric(quotes[column], errors="coerce") > 0]
     quotes = quotes.set_index("date")
+    # 复权基准对齐（否则除权股会算出假暴跌）：close 一律取**前复权**（config.ADJUST="qfq"），
+    # 而前复权以**最新交易日**为锚点——追踪期内一旦除权除息，历史价格会被整体重算。
+    # 若拿落库的「推荐日当时的前复权价」当分母、拿本次拉取的收盘价当分子，两者基准不同：
+    # 10 送 10 的含权收益本应为 0%，会被算成 −50%。故取同一次序列里推荐日的收盘价作基准。
+    base_close = float(quotes.loc[rec_day, "close"]) if rec_day in quotes.index else None
     dates = {str(d).strip()[:10] for d in str(rec.get("tracked_close_dates") or "").split(",") if d}
     last_day = rec.get("last_close_date")
     if last_day is not None and not pd.isna(last_day):
@@ -91,7 +103,8 @@ def select_observations(rec: dict, daily: pd.DataFrame, market: pd.DataFrame) ->
         if day_str in dates or day not in quotes.index:
             continue
         result.append(dict(week_no=horizon // 5, holding_trade_days=horizon,
-                           close_date=day_str, close_price=float(quotes.loc[day, "close"])))
+                           close_date=day_str, close_price=float(quotes.loc[day, "close"]),
+                           base_close=base_close))
     return result
 
 
@@ -179,17 +192,36 @@ def run(argv: list[str] | None = None):
                     continue
 
                 for observation in observations:
+                    # 收益率分母必须与分子同源（同一次前复权序列），见 select_observations
+                    # 里 base_close 的说明：落库的 rec_close 是「推荐日当时」的前复权价，
+                    # 追踪期内一旦除权除息，它与本次拉取的收盘价就不再同基准。
+                    base_close = observation.pop("base_close", None)
+                    if base_close is None:
+                        base_close = float(rec["rec_close"])
+                        logger.warning("%s(%s) 缺少同序列基准价（推荐日无行情），回退落库推荐价 %.3f",
+                                       name, code, base_close)
+                    elif abs(base_close - float(rec["rec_close"])) > 1e-6:
+                        # 除权除息会让「同序列基准价」与落库值分叉，必须留痕——否则用户
+                        # 看到卡片上的「推荐价」与当初通知不一致，会误以为数据出错。
+                        logger.info("%s(%s) 复权基准已变（落库 %.3f → 同序列 %.3f），"
+                                    "本期限收益率按同一前复权序列计算",
+                                    name, code, float(rec["rec_close"]), base_close)
                     ok = save_tracking(rec_id=rec["id"], rec_date=rec["rec_date"], code=code,
-                                       rec_close=float(rec["rec_close"]), **observation)
+                                       rec_close=base_close, **observation)
                     if ok:
                         tracked += 1
                         close_price = observation["close_price"]
-                        ret_pct = (close_price / float(rec["rec_close"]) - 1) * 100
+                        horizon = int(observation["holding_trade_days"])
+                        ret_pct = (close_price / base_close - 1) * 100
                         report_rows.append({
                             "name": name, "code": code,
                             "strategy": str(rec.get("strategy") or "bottom_fishing"),
-                            "status": f"推荐后{observation['holding_trade_days']}交易日",
-                            "rec_price": float(rec["rec_close"]), "current_price": close_price,
+                            # holding_trade_days 供通知层做「按固定期限分列」：混合口径把不同
+                            # 成熟度的收益直接平均，只有同一期限的样本才可比
+                            "holding_trade_days": horizon,
+                            "status": f"推荐后{horizon}交易日",
+                            # 展示价与收益率同为「前复权同序列」口径，用户可自行核算
+                            "rec_price": base_close, "current_price": close_price,
                             "return_pct": round(ret_pct, 2),
                         })
     finally:

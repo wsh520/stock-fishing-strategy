@@ -30,7 +30,11 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      # 复用磁盘缓存：周五选股已拉过当日行情，追踪直接命中缓存，几乎零请求
+      # 复用磁盘缓存：周五选股（UTC 13:00 起跑）已把当日行情写进 cache/，追踪直接命中，
+      # 几乎零请求。key 的构造与 daily_screen 对齐（日期段 + run_id 后缀）：actions/cache
+      # 的 key 不可变，若只用「当天日期」做 key，当天任何一次运行写下的缓存都会锁死该 key，
+      # 之后新拉取的行情再也存不进去。restore-keys 先按日期段匹配（命中当天最新一份，
+      # 即当日选股写下的那份），再退到全局最近一份。
       - name: Resolve cache date
         id: cachedate
         run: echo "ymd=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
@@ -39,8 +43,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: cache
-          key: baostock-cache-${{ steps.cachedate.outputs.ymd }}
+          key: baostock-cache-${{ steps.cachedate.outputs.ymd }}-${{ github.run_id }}
           restore-keys: |
+            baostock-cache-${{ steps.cachedate.outputs.ymd }}-
             baostock-cache-
 
       - name: Run weekly tracking

@@ -319,8 +319,14 @@ def notify_tracking_result(report: Optional[pd.DataFrame]) -> None:
     参数匹配 run_weekly_tracking.py 中的调用:
         notify_tracking_result(report)
 
-    report 含 strategy 列时按策略来源分列统计（优质低估低位/放量突破各自的数量/胜率/平均收益），
-    逐只明细行也带 [优质低估低位]/[放量突破] 前缀标签。
+    **统计口径（一张卡里混了三层口径，必须逐层标明，否则数字会被读错）**：
+      · 报告的一行 = 一次「推荐 × 固定期限」观测，**不是一只股票**——同一只股票会因
+        5/10/15/20 交易日各到期一次而出现多行，所以计数单位是「条观测」而不是「只」；
+      · 头部的胜率/平均收益是**跨全部期限的混合口径**（把不同成熟度的观测直接平均，
+        会掩盖「收益随持有期衰减/放大」的规律），故额外给出**按期限分列**作为可比口径；
+      · 按策略分列同样混合了各期限，逐只明细行自带期限与策略标签。
+    report 含 strategy 列时按策略来源分列（优质低估低位/放量突破各自的数量/胜率/平均收益）；
+    含 holding_trade_days 列时按固定期限分列（二者都缺的旧调用退回单段混合汇总）。
     """
     if report is None or report.empty:
         return
@@ -331,52 +337,76 @@ def notify_tracking_result(report: Optional[pd.DataFrame]) -> None:
     win_rate = win / total * 100 if total > 0 else 0
     avg_return = report["return_pct"].mean()
 
-    # 状态分布
-    status_counts = report["status"].value_counts().to_dict()
-    status_text = " | ".join([f"{k}: {v}只" for k, v in status_counts.items()])
+    # 状态分布（status = 「推荐后N交易日」，即该观测所在的固定期限）
+    status_counts = report["status"].value_counts().to_dict() if "status" in report.columns else {}
+
+    # 按固定期限分列：唯一能排除「成熟度混淆」的可比口径
+    horizon_lines = ""
+    if "holding_trade_days" in report.columns:
+        parts = []
+        for horizon, grp in report.groupby("holding_trade_days", observed=True):
+            g_total = len(grp)
+            g_win = int((grp["return_pct"] > 0).sum())
+            g_wr = g_win / g_total * 100 if g_total else 0
+            g_avg = grp["return_pct"].mean()
+            parts.append(f"**推荐后{int(horizon)}交易日**: {g_total} 条 | 胜率 {g_wr:.1f}% "
+                         f"| 平均收益 {'+' if g_avg >= 0 else ''}{g_avg:.2f}%")
+        if parts:
+            horizon_lines = "\n" + "\n".join(parts)
+
+    # 状态分布与「按期限分列」信息完全重复（两者都是按期限计数），故仅在分列不可用时兜底
+    status_text = ""
+    if not horizon_lines and status_counts:
+        status_text = "\n**状态分布:** " + " | ".join(f"{k}: {v}条" for k, v in status_counts.items())
 
     # 按策略来源分列（无 strategy 列的旧调用保持单段汇总）
     strategy_lines = ""
     if "strategy" in report.columns:
         parts = []
-        for strat, grp in report.groupby(report["strategy"].fillna("bottom_fishing")):
+        for strat, grp in report.groupby(report["strategy"].fillna("bottom_fishing"), observed=True):
             g_total = len(grp)
             g_win = len(grp[grp["return_pct"] > 0])
             g_wr = g_win / g_total * 100 if g_total > 0 else 0
             g_avg = grp["return_pct"].mean()
             label = _STRATEGY_ZH.get(str(strat), str(strat))
-            parts.append(f"**{label}**: {g_total} 只 | 胜率 {g_wr:.1f}% | 平均收益 {'+' if g_avg >= 0 else ''}{g_avg:.2f}%")
+            parts.append(f"**{label}**: {g_total} 条 | 胜率 {g_wr:.1f}% | 平均收益 {'+' if g_avg >= 0 else ''}{g_avg:.2f}%")
         if parts:
             strategy_lines = "\n" + "\n".join(parts)
 
     elements = [
         _md_element(
             f"**时间:** {now}\n"
-            f"**追踪数量:** {total} 只\n"
-            f"**胜率:** {win_rate:.1f}% ({win}/{total})\n"
-            f"**平均收益:** {avg_return:.2f}%\n"
-            f"**状态分布:** {status_text}"
+            f"**追踪观测:** {total} 条（跨 5/10/15/20 交易日；同一只股票可贡献多条）\n"
+            f"**胜率（混合口径）:** {win_rate:.1f}% ({win}/{total})\n"
+            f"**平均收益（混合口径）:** {'+' if avg_return >= 0 else ''}{avg_return:.2f}%"
+            f"{status_text}"
+            f"{horizon_lines}"
             f"{strategy_lines}"
+            f"\n\n口径说明：混合口径把不同成熟度直接平均，仅作概览；"
+            f"判断信号质量请以**按期限分列**为准（同一期限才可比）。"
         ),
         _divider(),
     ]
 
-    # 每只股票的追踪详情
+    # 每只股票的追踪详情（status 缺失时用 holding_trade_days 兜底，保证每行都写明期限）
     for _, row in report.iterrows():
         r = row.to_dict()
         ret = r.get("return_pct", 0)
         emoji = "+" if ret >= 0 else ""
         strat_tag = f"[{_STRATEGY_ZH.get(str(r.get('strategy') or 'bottom_fishing'), '?')}] " \
             if "strategy" in r else ""
+        horizon_tag = r.get("status") or (
+            f"推荐后{int(r['holding_trade_days'])}交易日" if r.get("holding_trade_days") else ""
+        )
         elements.append(_md_element(
             f"{strat_tag}**{r.get('name', '')} {r.get('code', '')}** "
-            f"| {r.get('status', '')} "
+            f"| {horizon_tag} "
             f"| 推荐价 {r.get('rec_price', 0)} → 现价 {r.get('current_price', 0)} "
             f"| 收益 {emoji}{ret:.2f}%"
         ))
 
     card = {
-        "header": _build_header(f"周度追踪 - 胜率{win_rate:.0f}%", color="blue"),
+        "header": _build_header(f"周度追踪 - 混合胜率{win_rate:.0f}%", color="blue"),
         "elements": elements,
     }
     _send_feishu(card)
@@ -390,10 +420,14 @@ def notify_attribution_report(stats: Optional[dict]) -> None:
 
     stats 格式:
         {"period": str, "tracked_recs": int, "win_rate": float, "avg_return": float,
-         "avg_peak": float, "by_grade": [...], "by_divergence": [...],
-         "by_market": [...], "by_week": [...]}
+         "avg_peak": float, "excluded_immature": int, "by_grade": [...],
+         "by_divergence": [...], "by_market": [...], "by_week": [...], "by_score": [...]}
         其中各分组列表元素: {"label": str, "n": int, "win_rate": float,
-                             "avg_return": float, "avg_peak": float}
+                             "avg_return": float, "avg_peak": float,
+                             "peak_label"?: str, "n_unit"?: str}
+        · peak_label：第二列的展示名（默认「平均峰值」；逐条观测类分组传「最高收益」，
+          因为那里是组内极值而不是均值）；
+        · n_unit：样本数单位（默认「只」= 每条推荐一只股票；逐条观测类分组传「条观测」）。
     """
     if not stats or stats.get("tracked_recs", 0) == 0:
         return
@@ -406,23 +440,31 @@ def notify_attribution_report(stats: Optional[dict]) -> None:
         for g in rows:
             ret = g.get("avg_return", 0)
             peak = g.get("avg_peak", 0)
+            # 逐条观测类分组（by_week）的第二列是组内极值、样本单位是「条观测」，
+            # 由其自带标签渲染——一律写「平均峰值 / 只」会把极值当均值、把观测当股票。
+            peak_label = g.get("peak_label") or "平均峰值"
+            unit = g.get("n_unit") or "只"
             lines.append(
-                f"**{g.get('label', '')}**: {g.get('n', 0)} 只 | "
+                f"**{g.get('label', '')}**: {g.get('n', 0)} {unit} | "
                 f"胜率 {g.get('win_rate', 0):.1f}% | "
                 f"平均收益 {'+' if ret >= 0 else ''}{ret:.2f}% | "
-                f"平均峰值 {'+' if peak >= 0 else ''}{peak:.2f}%"
+                f"{peak_label} {'+' if peak >= 0 else ''}{peak:.2f}%"
             )
         return lines
 
+    immature = int(stats.get("excluded_immature", 0) or 0)
     elements = [
         _md_element(
             f"**时间:** {now}\n"
             f"**统计周期:** {stats.get('period', '')}\n"
-            f"**已追踪推荐:** {stats.get('tracked_recs', 0)} 条\n"
-            f"**整体胜率:** {win_rate:.1f}%\n"
+            f"**已统计推荐:** {stats.get('tracked_recs', 0)} 只（仅含已满 20 交易日的推荐）\n"
+            + (f"**未满 20 交易日未计入:** {immature} 只\n" if immature else "")
+            + f"**整体胜率:** {win_rate:.1f}%\n"
             f"**平均收益:** {stats.get('avg_return', 0):.2f}%\n"
             f"**平均峰值收益:** {stats.get('avg_peak', 0):.2f}%\n"
-            f"\n收益口径：每条推荐取最新一次周度追踪的收益率（31 天窗口）；峰值为追踪期内最高周度收益率。"
+            f"\n收益口径：每条推荐只取**推荐后 20 交易日**的实际收益率（不与未满 20 交易日的"
+            f"观测混算，避免成熟度混淆）；**峰值**=该推荐在 5/10/15/20 交易日固定期限观测中"
+            f"的**最高收益率**（不是每日最大浮盈，也不是区间最高价）。"
         ),
     ]
 
@@ -431,7 +473,7 @@ def notify_attribution_report(stats: Optional[dict]) -> None:
         ("按评分分档", stats.get("by_score")),
         ("按底背离", stats.get("by_divergence")),
         ("按市场环境", stats.get("by_market")),
-        ("按持有周次", stats.get("by_week")),
+        ("按策略与持有期限", stats.get("by_week")),
     ]
     for title, rows in sections:
         if not rows:
