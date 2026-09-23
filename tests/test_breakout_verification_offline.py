@@ -60,6 +60,48 @@ class BreakoutVerificationTests(unittest.TestCase):
             frame.loc[frame.index[-1], field] = value
             self.assertEqual(self.evaluate(frame, latest_trade_date=DAY)[1], "FAIL_DATA")
 
+    def test_missing_adaptive_volume_metrics_fail_closed(self):
+        # The adaptive volume filters require a complete lookback window.  A
+        # missing value must not be treated as "no additional filter".
+        for field in ("volume_percentile", "amount_ratio"):
+            frame = daily()
+            frame.loc[frame.index[-1], field] = np.nan
+            self.assertEqual(self.evaluate(frame, latest_trade_date=DAY)[1],
+                             "FAIL_VOL_INSUFFICIENT")
+
+    def test_short_history_is_rejected_before_indicator_evaluation(self):
+        # Default adaptive percentile lookback is 60; a 61-row window cannot
+        # provide the full lagged history required by the evaluator.
+        self.assertIsNone(vb.compute_breakout_signals(daily().iloc[:61], self.config()))
+
+    def test_l2_failed_breakout_enters_cooldown(self):
+        # Keep an older resistance inside the 60-day window but outside the
+        # 20-day window, then break L2 and fall back below its anchored level.
+        n = 90
+        close = np.full(n, 10.0)
+        high = np.full(n, 10.1)
+        low = np.full(n, 9.9)
+        open_ = np.full(n, 10.0)
+        high[10:30] = 11.0
+        close[10:30] = 10.5
+        low[10:30] = 10.0
+        open_[10:30] = 10.2
+        event = 69
+        close[event], high[event], low[event], open_[event] = 10.8, 10.9, 9.95, 10.1
+        close[event + 1], high[event + 1], low[event + 1], open_[event + 1] = 9.9, 10.0, 9.8, 9.95
+        pct_chg = np.r_[0.0, np.diff(close) / close[:-1] * 100]
+        frame = pd.DataFrame({
+            "date": pd.bdate_range(end="2026-06-12", periods=n).strftime("%Y-%m-%d"),
+            "open": open_, "high": high, "low": low, "close": close,
+            "volume": np.full(n, 1e7), "amount": np.full(n, 2e8),
+            "pct_chg": pct_chg,
+        })
+        config = self.config()
+        out = vb.compute_breakout_signals(frame, config)
+        self.assertIsNotNone(out)
+        self.assertEqual(int(out.loc[event, "breakout_level"]), 2)
+        self.assertTrue(bool(out.loc[event + 1, "recent_failed_breakout"]))
+
     def run_pipeline(self, funds=None, weeks=None, config=None, latest=DAY, crash=None, industries=None, filled=None):
         funds = funds or {"000001": GOOD_FUND}
         config = config or self.config(MAX_PICKS=2, USE_INDUSTRY_DEDUP=False)

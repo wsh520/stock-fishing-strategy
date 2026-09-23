@@ -258,7 +258,16 @@ def compute_breakout_signals(df: pd.DataFrame, config: VolumeBreakoutConfig) -> 
     """
     if df is None or df.empty or not _BREAKOUT_NEED_COLS.issubset(df.columns):
         return None
-    if len(df) < config.MIN_DAYS:
+    # The adaptive volume percentile and the L1 resistance both need more
+    # history than the generic MIN_DAYS floor.  Reject short windows here so
+    # callers cannot reach the evaluator with silently unavailable volume
+    # history (or with partially formed resistance levels).
+    _min_history = max(
+        config.MIN_DAYS,
+        config.ADAPTIVE_VOLUME_LOOKBACK + 2,
+        config.BREAKOUT_LOOKBACK_HIGH + 1,
+    )
+    if len(df) < _min_history:
         return None
 
     out = df.copy().reset_index(drop=True)
@@ -275,7 +284,7 @@ def compute_breakout_signals(df: pd.DataFrame, config: VolumeBreakoutConfig) -> 
         if (_now.hour < 15 and pd.notna(_dates.iloc[-1])
                 and _dates.iloc[-1].date() == _now.date()):
             out = out.iloc[:-1].reset_index(drop=True)
-    if len(out) < config.MIN_DAYS:
+    if len(out) < _min_history:
         return None
 
     # ----- 均线 -----
@@ -385,22 +394,26 @@ def compute_breakout_signals(df: pd.DataFrame, config: VolumeBreakoutConfig) -> 
         0.0,
     )
 
-    # ----- 近期假突破过滤：近 N 日是否曾「突破 L1 后 3 日内收盘跌回 L1 下方」-----
-    # 事件锚定在突破日的 L1（而非后续交易日的动态 L1）：突破日 j 之后 1~CONFIRM_DAYS
-    # 个交易日内收盘价跌回 anchor 下方 → 记一次失败事件（发生于 k）；
+    # ----- 近期假突破过滤：近 N 日是否曾「突破 L1/L2 后 3 日内收盘跌回关键位下方」-----
+    # 事件锚定在突破日对应级别的关键位（而非后续交易日的动态关键位）：突破日 j
+    # 之后 1~CONFIRM_DAYS 个交易日内收盘价跌回 anchor 下方 → 记一次失败事件（发生于 k）；
     # 该事件在区间 [k, j+LOOKBACK] 内抑制新信号（含两端，与原三重循环逐日口径等价：
     # 原条件 j∈[i-LOOKBACK, i) 且 k≤i 且 i-k<LOOKBACK ⟺ i∈[k, j+LOOKBACK]）。
+    # L2 失败也必须纳入冷却窗口：否则平台突破失败后仍可能在短期内重复发出信号。
     # 向量化实现：突破日逐一定位失败日（通常 <10 个），用差分数组标记抑制区间，
     # 替代原 O(n×LOOKBACK×CONFIRM_DAYS) 三重 Python 循环（全市场扫描的主要 CPU 热点）。
-    _broke = brk_l1.to_numpy(dtype=bool)
-    _anchor = out["level_l1"].to_numpy(dtype=float)
+    _broke_l1 = brk_l1.to_numpy(dtype=bool)
+    _broke_l2 = (brk_l2 & ~brk_l1).to_numpy(dtype=bool)
+    _broke = _broke_l1 | _broke_l2
+    _anchor_l1 = out["level_l1"].to_numpy(dtype=float)
+    _anchor_l2 = out["level_l2"].to_numpy(dtype=float)
     _close_arr = out["close"].to_numpy(dtype=float)
     _n = len(out)
     _lookback = config.FAILED_BREAKOUT_LOOKBACK
     _confirm = config.FAILED_BREAKOUT_CONFIRM_DAYS
     _diff = np.zeros(_n + 1, dtype=float)
     for _j in np.flatnonzero(_broke):
-        _a = _anchor[_j]
+        _a = _anchor_l1[_j] if _broke_l1[_j] else _anchor_l2[_j]
         if np.isnan(_a):
             continue
         _end = min(_n, _j + _confirm + 1)
@@ -587,7 +600,7 @@ def evaluate_breakout(
     if config.RECOMMENDATION_MODE == "quality_value":
         base, reason = evaluate_quality_value(daily_df, code, name, config, market_env,
                                               fund_data, latest_trade_date, val_context=val_context,
-                                              index_df=index_df)
+                                              index_df=index_df, volatile_out=volatile_out)
         if base is None:
             return None, reason
         # 突破仅作为统一候选池内的标签，不另设荐股资格或排序权重。
@@ -669,9 +682,21 @@ def evaluate_breakout(
     amount_today = d_last.get("amount")
     if amount_today is None or pd.isna(amount_today) or float(amount_today) < config.MIN_BREAKOUT_AMOUNT:
         return None, "FAIL_AMOUNT_INSUFFICIENT"
-    if pd.notna(d_last.get("volume_percentile")) and float(d_last["volume_percentile"]) < config.MIN_VOLUME_PERCENTILE:
+    # 自适应量能指标依赖完整的历史窗口。历史不足或指标缺失时必须失败关闭，
+    # 不能因为 NaN 绕过过滤并把不可复核的突破升级为正式信号。
+    volume_percentile = d_last.get("volume_percentile")
+    amount_ratio = d_last.get("amount_ratio")
+    if volume_percentile is None or pd.isna(volume_percentile):
         return None, "FAIL_VOL_INSUFFICIENT"
-    if pd.notna(d_last.get("amount_ratio")) and float(d_last["amount_ratio"]) < config.MIN_AMOUNT_RATIO:
+    if amount_ratio is None or pd.isna(amount_ratio):
+        return None, "FAIL_VOL_INSUFFICIENT"
+    volume_percentile = _num_or_none(volume_percentile)
+    amount_ratio = _num_or_none(amount_ratio)
+    if volume_percentile is None or amount_ratio is None:
+        return None, "FAIL_DATA"
+    if volume_percentile < config.MIN_VOLUME_PERCENTILE:
+        return None, "FAIL_VOL_INSUFFICIENT"
+    if amount_ratio < config.MIN_AMOUNT_RATIO:
         return None, "FAIL_VOL_INSUFFICIENT"
 
     # 层 3.3：K 线形态
@@ -929,7 +954,7 @@ def main_breakout(
         if config.RECOMMENDATION_MODE == "quality_value":
             return _screen_quality_pool(config, cache, market_env, latest,
                                          pending_out, evaluator=evaluate_breakout,
-                                         index_df=index)
+                                         index_df=index, volatile_out=volatile_out)
 
         regime_raw = market_env.get("regime", "unknown")
         regime_eff = _effective_regime(regime_raw, config)

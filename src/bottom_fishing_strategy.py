@@ -7,9 +7,9 @@
 3. 日线技术指标筛选（底背离 + MA5拐头 + EMA金叉 + RSI超卖反弹 + 量价质量分）
 4. 波动率风控（ATR% 超上限否决，止损/止盈/盈亏比仅作展示与落库）+ 决赛圈周线确认 + 行业分散
 
-⚠️ 口径边界：上面第 3~4 层的技术入场质量/波动率/周线约束**只作用于 technical 路径**
-（对外称「低位企稳」，也是 run_breakout.py 独立跑的口径）。**默认 quality_value
-（优质低估低位）不套用 ATR 上限与周线确认**——它另有一套「多年质量 + PE 行业/绝对估值 +
+⚠️ 口径边界：上面第 3~4 层的技术入场质量/周线约束**只作用于 technical 路径**
+（对外称「低位企稳」，也是 run_breakout.py 独立跑的口径）。quality_value
+（优质低估低位）不套用 technical 的完整技术漏斗与周线确认，但默认启用独立的 ATR 波动率上限——它另有一套「多年质量 + PE 行业/绝对估值 +
 250 日低位 + 近期业绩未恶化 + 止跌确认」闸门，见 evaluate_quality_value。不要把本文档
 顶部的技术层描述读成默认口径已执行它们。
 
@@ -124,6 +124,7 @@ SORT_ASC = [False]
 _QV_REASON_CODES = (
     "FAIL_DATA", "FAIL_STALE", "FAIL_LIQUIDITY", "FAIL_POSITION", "FAIL_VALUATION",
     "FAIL_FUND", "FAIL_FORWARD", "FAIL_QV_SCORE", "FAIL_STABILIZATION",
+    "FAIL_VOLATILE",
     "FAIL_HALT_GAP", "FAIL_MACD_WEAK", "FAIL_KDJ_HIGH", "ERROR",
 )
 
@@ -139,6 +140,10 @@ class StrategyConfig:
     QUALITY_MEDIAN_ROE_MIN: float = 10.0
     QUALITY_MIN_ROE: float = 5.0
     QUALITY_CASH_CONVERSION_MIN: float = 0.8
+    # 年度现金流/盈利持续性硬门：质量路径默认要求每个已核验年度的
+    # 合并净利润与经营现金流均为正；关闭后退回仅看三年合计现金转换率。
+    QUALITY_REQUIRE_ANNUAL_NET_PROFIT_POSITIVE: bool = True
+    QUALITY_REQUIRE_ANNUAL_CASHFLOW_POSITIVE: bool = True
     LOW_POSITION_LOOKBACK: int = 250
     LOW_POSITION_MAX: float = 0.40
     QUALITY_SCORE_WEIGHT: float = 0.50
@@ -189,6 +194,10 @@ class StrategyConfig:
     # 偏高单独否决（仅作异常识别与风险说明、不进入估值评分），两条路径共用该阈值作为「偏贵」基准。
     # 两路径共同保留：PB ≤ 0（净资产为负/数据异常）一律否决。
     MAX_PB_MRQ: float = 3.0
+    # quality_value 可选 PE+PB 双护栏。默认关闭以兼容既有 quality_value 口径；开启后
+    # PB 缺失会保留为 pending，高 PB（行业分位或绝对上限）直接否决。technical
+    # 路径始终沿用原有 PB 硬门，不受此开关影响。
+    QV_VALUATION_DUAL_GUARD: bool = False
 
     # ===== 行业相对估值（#4a）=====
     # 绝对 PE 上限（PE≤25）全市场一刀切，会系统性误杀「高估值但优质」的成长/科技/医药，
@@ -429,6 +438,11 @@ class StrategyConfig:
     # 置 True 后由 evaluate_quality_value 生效。切换前须先用
     # `python backtest.py ab --mode quality_value` 取得样本内证据。
     QV_ENFORCE_KDJ_MACD_VETO: bool = False
+
+    # quality_value ATR% 风控：默认开启，ATR 缺失视为不可核验并拒绝正式推荐；
+    # technical 路径继续无条件沿用 MAX_ATR_PCT 的原有风控。
+    QV_ATR_GUARD: bool = True
+    QV_MAX_ATR_PCT: Optional[float] = None  # None 时复用 MAX_ATR_PCT
 
     # 周线趋势确认：仅对通过全部日线筛选的决赛圈股票拉取周线；
     # WEEKLY_MA_BOTH_REQUIRED=True 时须同时满足「收盘站上周线 MA10（容忍 2%）」和「MA10 在上行」，
@@ -2452,7 +2466,7 @@ def evaluate(daily_df: Optional[pd.DataFrame], code: str = "", name: str = "", c
     if config.RECOMMENDATION_MODE == "quality_value":
         return evaluate_quality_value(daily_df, code, name, config, market_env,
                                       fund_data, latest_trade_date, val_context=val_context,
-                                      index_df=index_df)
+                                      index_df=index_df, volatile_out=volatile_out)
     regime = (market_env or {}).get("regime", "unknown")
 
     if not check_fundamentals(fund_data, config, code=code, name=name): return None, "FAIL_FUND"
@@ -3168,7 +3182,8 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
                            fund_data: Optional[dict] = None,
                            latest_trade_date: Optional[str] = None,
                            val_context: Optional[dict] = None,
-                           index_df: Optional[pd.DataFrame] = None) -> tuple[Optional[Signal], str]:
+                           index_df: Optional[pd.DataFrame] = None,
+                           volatile_out: Optional[list] = None) -> tuple[Optional[Signal], str]:
     """统一荐股资格：多年质量 + 低估值(PE) + 250日低位 + 当年成长未恶化 + 止跌确认。
 
     val_context：行业相对估值上下文（见 _industry_valuation_context）。None 时估值闸门
@@ -3236,18 +3251,16 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
         except (ValueError, TypeError):
             return None
     pe, pb = finite(last.get("peTTM")), finite(last.get("pbMRQ"))
-    # ===== 规则3：估值闸门（PE 为主要准入条件，PB 仅用于异常识别和风险说明）=====
+    # ===== 规则3：估值闸门（PE 主准入；可选 PE+PB 双护栏）=====
     # PE 准入：
     #   - 行业相对（val_context 非空且 pe_pct 可得）：个股 PE 在行业内分位 ≤ VALUATION_INDUSTRY_PERCENTILE_MAX
     #   - 绝对回退（val_context 为空，或 PE 行业内样本不足）：PE ≤ MAX_PE_TTM
     #   PE 非正（亏损）→ 否决；PE 缺失 → 记缺项降级为待核验。
-    # PB 职责调整：
-    #   - PB ≤ 0（净资产为负/异常）→ 仍按异常否决（FAIL_VALUATION）
-    #   - PB 高于绝对上限或行业分位上限 → 不再单独一票否决，仅用于风险说明
-    #   - PB 缺失 → 明确标注缺项（valuation_pb），不伪装成已核验的 PB，
-    #     也不仅因缺少这个辅助指标就把其他核心证据完整的股票自动降为 pending
+    # PB 默认仅作异常识别/风险说明；QV_VALUATION_DUAL_GUARD=True 时，
+    # PB 高于绝对上限或行业分位上限会否决，PB 缺失保留为 pending。
     industry_mode = bool(val_context and val_context.get("mode") == "industry")
     pct_cap = float(getattr(config, "VALUATION_INDUSTRY_PERCENTILE_MAX", 0.60))
+    dual_valuation_guard = bool(getattr(config, "QV_VALUATION_DUAL_GUARD", False))
     # --- PE 准入（主要估值条件）---
     if pe is None:
         missing.append("valuation_pe")
@@ -3260,14 +3273,13 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
                 return None, "FAIL_VALUATION"
         elif pe > config.MAX_PE_TTM:
             return None, "FAIL_VALUATION"
-    # --- PB 异常识别（不再因偏高单独否决）---
+    # --- PB 异常识别 / 可选双护栏 ---
     if pb is None:
         # PB 缺失：标注缺项，但不自动降为 pending（仅当其他核心证据也缺失时才 pending）
         missing.append("valuation_pb")
     elif pb <= 0:
         # 已取得但非正的 PB 仍按异常处理（净资产为负/数据异常，不是「便宜」）
         return None, "FAIL_VALUATION"
-    # PB 偏高只做风险说明，不参与否决、也不进入估值评分（避免变相重建高 PB 硬否决）
     pb_high = False
     if pb is not None and pb > 0:
         pb_pct = val_context.get("pb_pct") if industry_mode else None
@@ -3275,6 +3287,8 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
             pb_high = pb_pct > pct_cap
         else:
             pb_high = pb > config.MAX_PB_MRQ
+        if dual_valuation_guard and pb_high:
+            return None, "FAIL_VALUATION"
     fund = fund_data or {}
     debt = finite(fund.get("debt_ratio"))
     financial = _is_financial_stock(code, name, config)
@@ -3289,7 +3303,11 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
     quality = evaluate_annual_quality(
         fund.get("annual_rows", []), day, years=config.QUALITY_YEARS,
         median_roe_min=config.QUALITY_MEDIAN_ROE_MIN, min_roe=config.QUALITY_MIN_ROE,
-        cash_conversion_min=config.QUALITY_CASH_CONVERSION_MIN, financial=financial)
+        cash_conversion_min=config.QUALITY_CASH_CONVERSION_MIN, financial=financial,
+        require_annual_net_profit_positive=(
+            getattr(config, "QUALITY_REQUIRE_ANNUAL_NET_PROFIT_POSITIVE", False)),
+        require_annual_cashflow_positive=(
+            getattr(config, "QUALITY_REQUIRE_ANNUAL_CASHFLOW_POSITIVE", False)))
     if quality["status"] == "failed":
         return None, "FAIL_FUND"
     missing.extend(quality.get("missing_tags", []))
@@ -3359,9 +3377,9 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
     # 记为 0、综合分被人为压低，对其套下限没有意义（且 pending 本就不进正式推荐）。
     # 注意：综合分下限判定使用原始 score（不含 rs_adj），相对强度不改变资格判定。
     min_qv = float(getattr(config, "MIN_QV_SCORE", 0.0) or 0.0)
-    # PB 缺失处理（规则3）：不因缺少辅助指标 PB 就把其他核心证据完整的股票自动降为 pending。
-    # 只有 valuation_pb 这一项缺项时，将其从 missing 中移除（核心证据 PE/质量/成长仍须齐全）。
-    effective_missing = [t for t in missing if t != "valuation_pb"] if "valuation_pb" in missing else missing
+    # 默认 PB 是辅助证据，缺失不降级；双护栏开启后 PB 是准入证据，缺失必须 pending。
+    effective_missing = (list(missing) if dual_valuation_guard else
+                         [t for t in missing if t != "valuation_pb"])
     if min_qv > 0 and not effective_missing and score < min_qv:
         return None, "FAIL_QV_SCORE"
     tags = ["优质低估低位" if not effective_missing else "低位候选待核验"]
@@ -3432,6 +3450,27 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
         _stabilized = _ma20_ok or _macd_ok
         if not _stabilized:
             return None, "FAIL_STABILIZATION"
+    # quality_value 波动率风控：放在止跌/KDJ/MACD准入之后，只有已通过其它
+    # 资格层、仅 ATR 超限的标的才进入 volatile_out 观察池。
+    # 技术路径的 ATR 层保持在 evaluate() 原有实现中，两个开关互不影响。
+    if bool(getattr(config, "QV_ATR_GUARD", True)):
+        atr_value = finite(d.get("atr"))
+        atr_limit = finite(getattr(config, "QV_MAX_ATR_PCT", None))
+        if atr_limit is None:
+            atr_limit = finite(getattr(config, "MAX_ATR_PCT", 3.33))
+        if atr_value is None or close <= 0 or atr_limit is None or atr_limit <= 0:
+            return None, "FAIL_DATA"
+        atr_pct = atr_value / close * 100.0
+        # 允许浮点计算在“恰好压线”处产生的微小误差；真实超限仍严格拒绝。
+        if atr_pct - atr_limit > 1e-12:
+            if volatile_out is not None:
+                volatile_out.append(_build_volatile_row(
+                    code=code, name=name, date=day, close=close, atr=atr_value,
+                    atr_pct=atr_pct, limit=atr_limit, score=tech_score,
+                    grade=_grade_from_score(tech_score, config),
+                    hits=",".join(_signal_hits(d)), rsi=d.get("rsi14"),
+                    vol_ratio=d.get("daily_vol_ratio")))
+            return None, "FAIL_VOLATILE"
     surface = bool(getattr(config, "SURFACE_TIMING_READ", True))
     if surface:
         tags.append(timing["label"])
@@ -3462,7 +3501,8 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
 def _screen_quality_pool(config: StrategyConfig, cache: CacheManager, market_env: dict,
                          latest_trade_date: Optional[str], pending_out: Optional[list] = None,
                          evaluator=None, max_picks: Optional[int] = None,
-                         index_df: Optional[pd.DataFrame] = None) -> Optional[pd.DataFrame]:
+                         index_df: Optional[pd.DataFrame] = None,
+                         volatile_out: Optional[list] = None) -> Optional[pd.DataFrame]:
     """先廉价行情筛选、后年度财务核验；核验完所有候选才排序和行业限额。
 
     max_picks：本次推荐数量上限（由 main 按市场环境 resolve_max_picks 解析后传入）；
@@ -3505,9 +3545,15 @@ def _screen_quality_pool(config: StrategyConfig, cache: CacheManager, market_env
             _pe = _finite_positive_or_none(daily.iloc[-1].get("peTTM")) if daily is not None and not daily.empty else None
             _pb = _finite_positive_or_none(daily.iloc[-1].get("pbMRQ")) if daily is not None and not daily.empty else None
             val_ctx = _industry_valuation_context(snapshot, industry_map.get(str(code), ""), _pe, _pb, config)
+        eval_kwargs = dict(latest_trade_date=latest_trade_date,
+                           val_context=val_ctx, index_df=index_df)
+        # 仅内置 quality evaluator 接收 volatile_out；自定义 evaluator 仍保持旧签名，
+        # 避免因新增关键字破坏外部回测/扩展调用。
+        _evaluator_name = getattr(evaluator, "__name__", "")
+        if evaluator is evaluate or _evaluator_name == "evaluate_breakout":
+            eval_kwargs["volatile_out"] = volatile_out
         pre, reason = evaluator(daily, code, name, config, market_env, None,
-                                latest_trade_date=latest_trade_date, val_context=val_ctx,
-                                index_df=index_df)
+                                **eval_kwargs)
         if pre is None:
             return None, reason
         fund = get_fundamentals(code, cache, config)
@@ -3515,9 +3561,11 @@ def _screen_quality_pool(config: StrategyConfig, cache: CacheManager, market_env
             fund = enrich_annual_fundamentals(code, fund, config, as_of=pre.date)
             fund = enrich_forward_growth(code, fund, config, cache)  # 前瞻确认（#4b）
         return evaluator(daily, code, name, config, market_env, fund,
-                         latest_trade_date=latest_trade_date, val_context=val_ctx,
-                         index_df=index_df)
+                         **eval_kwargs)
     results, processed, timed_out = run_concurrent_screen(stocks, screen, config, logger)
+    if volatile_out:
+        volatile_out[:] = sort_volatile(volatile_out)
+        log_volatile_rejects(volatile_out, logger)
     rows = [sig.to_dict() for sig, reason in results if sig is not None and reason == "PASS"]
     # 否决归因计数：让「今天为什么没推荐」在 quality_value 路径也可观测（此前只印候选数）
     from collections import Counter
@@ -3719,7 +3767,8 @@ def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] 
 
         if config.RECOMMENDATION_MODE == "quality_value":
             return _screen_quality_pool(config, cache, market_env, latest_trade_date, pending_out,
-                                        max_picks=max_picks, index_df=index_df)
+                                        max_picks=max_picks, index_df=index_df,
+                                        volatile_out=volatile_out)
 
         stock_list = get_stock_list(config, cache)
         if not stock_list:

@@ -73,7 +73,9 @@ def _dimension_score(value, threshold, saturation):
 
 
 def evaluate_annual_quality(annual_rows, as_of, years=3, median_roe_min=10,
-                            min_roe=5, cash_conversion_min=.8, financial=False):
+                            min_roe=5, cash_conversion_min=.8, financial=False,
+                            require_annual_net_profit_positive=False,
+                            require_annual_cashflow_positive=False):
     """Evaluate latest disclosed complete fiscal years (December year-end).
 
     Rows: year, roe (percentage points), deducted_profit, net_profit,
@@ -88,6 +90,12 @@ def evaluate_annual_quality(annual_rows, as_of, years=3, median_roe_min=10,
     partial=some relevant data but incomplete; missing=no relevant data;
     financial_review=financial company, pending specialist review.
     Continuous score weights median ROE/min ROE/cash conversion 50%/25%/25%.
+    ``require_annual_net_profit_positive`` and
+    ``require_annual_cashflow_positive`` optionally make each known year's
+    consolidated net profit / operating cash flow positive hard checks.  They
+    default to False for compatibility with callers that only used the
+    aggregate cash-conversion gate.  Missing values remain evidence gaps
+    (partial), while a known non-positive value is a failed quality check.
     Each known dimension scores 50 at its threshold and 100 at saturation
     (25%, 15%, 1.5 respectively), with linear interpolation clamped to 0..100.
     If a custom threshold meets/exceeds saturation, the improvement span is
@@ -162,7 +170,10 @@ def evaluate_annual_quality(annual_rows, as_of, years=3, median_roe_min=10,
     metrics = dict(expected_years=expected, observed_years=[r["year"] for r in selected],
                    median_roe=None, min_roe=None, deducted_profit_positive=None,
                    net_profit_sum=None, operating_cashflow_sum=None,
-                   cash_conversion=None, failed_checks=[])
+                   cash_conversion=None, annual_net_profit_positive=None,
+                   annual_operating_cashflow_positive=None,
+                   net_profit_positive_years=0,
+                   operating_cashflow_positive_years=0, failed_checks=[])
     complete = len(selected) == years
     checks = {}
     roes = [r["roe"] for r in selected if r["roe"] is not None]
@@ -184,8 +195,26 @@ def evaluate_annual_quality(annual_rows, as_of, years=3, median_roe_min=10,
     elif complete and len(profits) == years:
         checks["deducted_profit_positive"] = True
         metrics["deducted_profit_positive"] = True
-    if complete and all(r[k] is not None for r in selected
-                        for k in ("net_profit", "operating_cashflow")):
+    net_values = [r["net_profit"] for r in selected]
+    cash_values = [r["operating_cashflow"] for r in selected]
+    metrics["net_profit_positive_years"] = sum(v is not None and v > 0 for v in net_values)
+    metrics["operating_cashflow_positive_years"] = sum(v is not None and v > 0 for v in cash_values)
+    if require_annual_net_profit_positive:
+        if any(v is not None and v <= 0 for v in net_values):
+            checks["annual_net_profit_positive"] = False
+            metrics["annual_net_profit_positive"] = False
+        elif complete and len(net_values) == years and all(v is not None for v in net_values):
+            checks["annual_net_profit_positive"] = True
+            metrics["annual_net_profit_positive"] = True
+    if require_annual_cashflow_positive:
+        if any(v is not None and v <= 0 for v in cash_values):
+            checks["annual_operating_cashflow_positive"] = False
+            metrics["annual_operating_cashflow_positive"] = False
+        elif complete and len(cash_values) == years and all(v is not None for v in cash_values):
+            checks["annual_operating_cashflow_positive"] = True
+            metrics["annual_operating_cashflow_positive"] = True
+    if complete and all(v is not None for r in selected
+                        for v in (r["net_profit"], r["operating_cashflow"])):
         try:
             net = math.fsum(r["net_profit"] for r in selected)
             cash = math.fsum(r["operating_cashflow"] for r in selected)
@@ -202,12 +231,18 @@ def evaluate_annual_quality(annual_rows, as_of, years=3, median_roe_min=10,
                 metrics["cash_conversion"] = ratio
                 checks["cash_conversion"] = ratio is not None and ratio >= cash_conversion_min
     metrics["failed_checks"] = [key for key, passed in checks.items() if not passed]
+    required_checks = ["median_roe", "min_roe", "deducted_profit_positive",
+                       "cash_conversion"]
+    if require_annual_net_profit_positive:
+        required_checks.append("annual_net_profit_positive")
+    if require_annual_cashflow_positive:
+        required_checks.append("annual_operating_cashflow_positive")
     if metrics["failed_checks"]:
         status, reason = "failed", "年度质量未达标：" + ", ".join(metrics["failed_checks"])
     elif tags:
         status = "partial" if selected else "missing"
         reason = "年度质量待核验：" + ", ".join(dict.fromkeys(tags))
-    elif len(checks) == 4:
+    elif all(checks.get(key) is True for key in required_checks):
         status, reason = "verified", f"最近连续{years}个完整年度的ROE、扣非净利润及现金转换率均达标"
     else:
         status, reason = "partial", "年度质量证据不足"

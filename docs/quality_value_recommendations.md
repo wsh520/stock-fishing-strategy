@@ -4,7 +4,7 @@
 
 默认 RECOMMENDATION_MODE=quality_value（**优质低估低位入口 run.py**）。bottom_fishing 的 quality_value 路径使用 evaluate_quality_value 和 _screen_quality_pool。**放量突破入口 run_breakout.py 已改为独立的 technical 模式**（#1），跑自己的七层突破漏斗，不再委派 quality_value 资格；两入口的重叠由组合层同日去重、合计上限 DAILY_TOTAL_MAX_PICKS 约束。保留 technical 模式供旧规则回归对照（该口径对外称「低位企稳」，才是真正的技术抄底），不更改交易撮合。
 
-1. 非金融企业最近连续3个可用完整年度：ROE中位数至少10%、各年至少5%、扣非净利各年为正；累计经营现金流/累计合并净利润至少0.8，累计净利润须为正。季度年化ROE不再代替年度质量。年度缺失、非有限数不能进入正式推荐。
+1. 非金融企业最近连续3个可用完整年度：ROE中位数至少10%、各年至少5%、扣非净利各年为正；默认还要求每年合并净利润和经营现金流均为正；累计经营现金流/累计合并净利润至少0.8。季度年化ROE不再代替年度质量。年度缺失、非有限数不能进入正式推荐。
 2. 估值（#4a 行业相对 PE）：默认 USE_INDUSTRY_RELATIVE_VALUATION=True，个股 **PE** 在其所属行业当日横截面的分位 ≤ VALUATION_INDUSTRY_PERCENTILE_MAX(0.60) 才算便宜；行业数据缺失或行业内可比样本 < VALUATION_INDUSTRY_MIN_PEERS(5) 时自动回退绝对 PE 上限（0<PE TTM≤25）。PE 必须有限且为正，≤0 直接否决，缺失为 pending。横截面快照由 build_industry_valuation_snapshot 在筛选前用全池日线构建一次（复用缓存、不额外取数）。
    **PB 职责（本轮调整）**：PB 不再单独否决——略高于绝对上限(3.0)或行业分位上限只作**异常识别与风险说明**，并继续展示；`PB≤0`（净资产为负/数据异常）仍按异常否决；PB 缺失只标注缺项 `valuation_pb`，不伪装成已核验，也不因缺少这一**辅助**指标把其他核心证据完整的股票降为 pending。**注意这不是「所有高 PB 无条件通过」**：年度盈利质量、PE、近期业绩、低位、止跌条件仍须各自通过。
 3. 价格处于最近250根有效成交日线最高/最低区间的下40%。至少250根；最新零量/零成交额、日期滞后、不合法OHLC否决。取数窗口从120增为600自然日。中期低位不代表低估，必须同时通过前两条。**停牌缺口**：相邻 K 线自然日间隔 > MAX_BAR_GAP_DAYS(12) 判定期间曾停牌 → FAIL_HALT_GAP 否决（沿用 REQUIRE_NO_HALT_GAP；K 线跨缺口时全部滚动指标失真）。
@@ -21,7 +21,7 @@
 - 急跌熔断：沪深300 近 MARKET_CRASH_LOOKBACK(5) 个交易日累计跌幅 ≤ MARKET_CRASH_HALT_PCT(-4%) → 本次运行不推荐。
 - 推荐数量按 regime 收缩：牛 MAX_PICKS(5) / 中性 NEUTRAL_MAX_PICKS(4) / 熊 BEAR_MAX_PICKS(2)，由 resolve_max_picks 解析后作为 max_picks 传入 _screen_quality_pool 截取；unknown 经 _effective_regime 折叠为熊。
 
-ATR 交易风险门槛、20日位置、短期涨幅、RSI上限、KDJ确认、周线确认仍只作用于 technical 路径，不作为 quality_value 的硬闸门。
+quality_value 现在默认增加 ATR/收盘价波动率硬闸门：`QV_ATR_GUARD=True`，上限复用 `MAX_ATR_PCT=3.33%`；ATR 缺失视为不可核验（`FAIL_DATA`），超限为 `FAIL_VOLATILE`，可用 `QV_ATR_GUARD=False` 回退旧口径。20日位置、短期涨幅、RSI上限、KDJ确认、周线确认仍只作用于 technical 路径。`QV_VALUATION_DUAL_GUARD` 默认关闭；显式开启后 PB 高于绝对/行业上限会否决，PB 缺失会进入 pending。
 
 ## 排序与标签
 
@@ -37,7 +37,7 @@ score=0.50*quality_score+0.35*valuation_score+0.15*daily_score，各项0至100�
 
 公告日存在时优先使用；无公告日按次年5月1日可用，缺最新年度不能以旧三年替代。该保守日期门槛无法解决财报后续重述，免费摘要不是历史版本数据库。年度取数先经行情/估值/位置预筛，缓存按代码/决策日/年数隔离。
 
-formal要求年度、负债率、PE及行情日期均已核验；pending单列通知，不占formal名额、不落库。**PB 不再是 formal 的必备核验项**：PB 缺失只记 `valuation_pb` 缺项并继续展示，不把其他核心证据完整的股票降为 pending（PE 缺失仍为 pending）。已知质量失败即使另有缺项也直接否决。所有候选核验重评后再排序/行业分散/截取，避免缺数据候选挤占前N名。
+formal要求年度、负债率、PE及行情日期均已核验；pending单列通知，不占formal名额、不落库。默认 **PB 不再是 formal 的必备核验项**：PB 缺失只记 `valuation_pb` 缺项并继续展示，不把其他核心证据完整的股票降为 pending（PE 缺失仍为 pending）；显式开启 `QV_VALUATION_DUAL_GUARD` 后，PB 缺失会 pending、高 PB 会否决。已知质量失败即使另有缺项也直接否决。所有候选核验重评后再排序/行业分散/截取，避免缺数据候选挤占前N名。
 
 历史回测在该模式重用同一evaluate；季度缓存按as_of隔离并检查公告日，补年度数据后重新评估与排序。历史禁用无as_of的当前财务补齐。仅普通OHLCV的突破CSV不包含多年财务，默认不能生成正式交易信号；零交易不表示运行成功验证了收益。T+1等交易撮合问题不属于本次修改范围。
 
@@ -67,7 +67,7 @@ formal要求年度、负债率、PE及行情日期均已核验；pending单列�
 - **标题口径名**：`bottom_fishing` 这个落库值覆盖 quality_value 与 technical 两种口径，零推荐时无数据可推断，故由调用方显式传 `recommendation_mode`；标题显示为【优质低估低位】/【低位企稳】/【放量突破】，不再出现【抄底策略】优质低估低位荐股 这类自相矛盾的组合。
 - **单票标签与操作计划**：卡片在渲染前按 `tier` 过滤，非 `formal` 一律不渲染，故卡片上的每一只都是**正式推荐**；标签由「XX候选」改为「**正式推荐 · XX口径**」（「候选」在中文里偏「备选／仅供参考」，与 formal 的真实含义相反），并给每只票新增**操作计划**块：建仓区间＝信号日收盘价 ×(1 ± `ENTRY_BAND_PCT`=1.5%)（次日开盘执行，高于上沿不追）、止损、止盈、盈亏比、建议持有 `HOLD_DAYS_HINT_MIN~MAX`＝10~20 个交易日（与追踪窗口 5/10/15/20 交易日对齐）。全部为展示项，不参与准入、排序与否决；两套策略共用 `describe_trade_plan`。
 
-> 已知未处理项：`evaluate_quality_value` 无 ATR 否决层、也不接收 `volatile_out`，因此**生产默认口径下波动率观察池恒为空**（`run.py` 仍在收集与推送该池）。这是行为缺口而非文档问题，改动会改变推荐结果，按「改产线口径前先 A/B」的约定未擅自修改。
+> 说明：`evaluate_quality_value` 已接入 ATR 波动率闸门，并可把超限标的写入 `volatile_out` 观察池；该闸门会减少正式推荐数，启停应通过 A/B 回测验证。
 
 ## 验证
 

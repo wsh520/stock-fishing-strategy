@@ -102,6 +102,30 @@ class AnnualQualityTests(unittest.TestCase):
             row.update(net_profit=net, operating_cashflow=cash)
         self.assertEqual(self.evaluate(rows)["metrics"]["cash_conversion"], .8)
 
+    def test_optional_annual_profit_and_cashflow_hard_gates(self):
+        rows = annual_rows()
+        rows[1]["net_profit"] = -10.0
+        result = self.evaluate(rows, require_annual_net_profit_positive=True)
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("annual_net_profit_positive", result["metrics"]["failed_checks"])
+        self.assertEqual(result["metrics"]["net_profit_positive_years"], 2)
+
+        rows = annual_rows()
+        rows[0]["operating_cashflow"] = 0.0
+        result = self.evaluate(rows, require_annual_cashflow_positive=True)
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("annual_operating_cashflow_positive", result["metrics"]["failed_checks"])
+        self.assertEqual(result["metrics"]["operating_cashflow_positive_years"], 2)
+
+    def test_annual_hard_gate_missing_value_is_partial(self):
+        rows = annual_rows()
+        rows[1]["operating_cashflow"] = None
+        result = self.evaluate(rows, require_annual_cashflow_positive=True)
+        self.assertEqual(result["status"], "partial")
+        self.assertNotIn("annual_operating_cashflow_positive", result["metrics"]["failed_checks"])
+        self.assertIsNone(result["metrics"]["annual_operating_cashflow_positive"])
+        self.assertIn("operating_cashflow:2023", result["missing_tags"])
+
     def test_zero_negative_denominator_is_failure(self):
         for value in (0, -100):
             rows = annual_rows()

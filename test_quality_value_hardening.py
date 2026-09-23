@@ -70,7 +70,8 @@ def ev(df=None, fund=None, cfg=None, regime="bull", val_context=None, index_df=N
     return m.evaluate(mk_df(HEALTHY) if df is None else df, "600001", "工业企业", cfg,
                       {"regime": regime}, mk_fund() if fund is None else fund,
                       latest_trade_date=kw.get("latest_trade_date", DAY),
-                      val_context=val_context, index_df=index_df)
+                      val_context=val_context, index_df=index_df,
+                      volatile_out=kw.get("volatile_out"))
 
 
 def dates_with_gap(n, gap_at=40, gap_days=40, end=DAY):
@@ -97,7 +98,7 @@ def idx_df(closes, end=DAY):
 # ===========================================================================
 class TestStabilizationGate(unittest.TestCase):
     def test_default_on_and_all_regimes_equivalent(self):
-        cfg = m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0)
+        cfg = m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0, QV_ATR_GUARD=False)
         self.assertTrue(m.StrategyConfig().QV_STABILIZATION_GATE)
         # 未止跌形态在牛/中/熊/未知四种环境下口径一致
         for regime in ("bull", "neutral", "bear", "unknown"):
@@ -107,7 +108,7 @@ class TestStabilizationGate(unittest.TestCase):
                 self.assertEqual(reason, "FAIL_STABILIZATION")
 
     def test_ma20_above_satisfies_gate(self):
-        cfg = m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0)
+        cfg = m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0, QV_ATR_GUARD=False)
         sig, reason = ev(cfg=cfg)
         self.assertEqual(reason, "PASS")
         timing = m.assess_entry_timing(
@@ -116,7 +117,7 @@ class TestStabilizationGate(unittest.TestCase):
 
     def test_macd_improvement_satisfies_gate_without_ma20_or_ma60(self):
         # 不额外要求 MA60 站稳 / RSI 反弹 / KDJ 金叉：仅 MACD 柱连续改善即可确认止跌
-        cfg = m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0)
+        cfg = m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0, QV_ATR_GUARD=False)
         df = mk_df(BELOW_MA20_MACD_UP)
         tech = m.compute_daily_signals(m._recompute_pct_chg(df.copy()), cfg)
         timing = m.assess_entry_timing(tech, cfg)
@@ -129,7 +130,7 @@ class TestStabilizationGate(unittest.TestCase):
 
     def test_insufficient_indicator_data_is_not_confirmation(self):
         # MA20 不可得（below_ma20=None）+ MACD 柱含 NaN → 「无法确认止跌」不得当作已确认
-        cfg = m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0)
+        cfg = m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0, QV_ATR_GUARD=False)
         df = mk_df(BELOW_MA20_MACD_UP)
         tech = m.compute_daily_signals(m._recompute_pct_chg(df.copy()), cfg).copy()
         blank_timing = {"side": "unknown", "label": "时机未知", "below_ma20": None,
@@ -176,6 +177,106 @@ class TestStabilizationGate(unittest.TestCase):
         self.assertIn("FAIL_STABILIZATION", m._QV_REASON_CODES)
         self.assertNotIn("FAIL_BEAR_TIMING", m._QV_REASON_CODES)
         self.assertIn("FAIL_HALT_GAP", m._QV_REASON_CODES)
+
+
+# ===========================================================================
+# 规则1b：quality_value ATR% 风控
+# ===========================================================================
+class TestQVATRGuard(unittest.TestCase):
+    def _high_atr_tech(self):
+        tech = m.compute_daily_signals(m._recompute_pct_chg(mk_df(HEALTHY).copy()),
+                                       m.StrategyConfig(USE_CACHE=False))
+        tech = tech.copy()
+        tech.loc[tech.index[-1], "atr"] = float(tech.iloc[-1]["close"]) * 0.05
+        return tech
+
+    def test_default_guard_rejects_and_records_volatile_row(self):
+        tech = self._high_atr_tech()
+        volatile = []
+        with patch.object(m, "compute_daily_signals", return_value=tech):
+            sig, reason = ev(cfg=m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0),
+                             volatile_out=volatile)
+        self.assertIsNone(sig)
+        self.assertEqual(reason, "FAIL_VOLATILE")
+        self.assertEqual(len(volatile), 1)
+        self.assertGreater(volatile[0]["atr_pct"], volatile[0]["atr_limit"])
+
+    def test_guard_can_be_disabled_for_compatibility(self):
+        tech = self._high_atr_tech()
+        with patch.object(m, "compute_daily_signals", return_value=tech):
+            sig, reason = ev(cfg=m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0,
+                                                  QV_ATR_GUARD=False))
+        self.assertEqual(reason, "PASS")
+        self.assertIsNotNone(sig)
+
+    def test_atr_exactly_at_limit_passes(self):
+        tech = self._high_atr_tech()
+        cfg = m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0)
+        tech.loc[tech.index[-1], "atr"] = (
+            float(tech.iloc[-1]["close"]) * cfg.MAX_ATR_PCT / 100.0)
+        with patch.object(m, "compute_daily_signals", return_value=tech):
+            sig, reason = ev(cfg=cfg)
+        self.assertEqual(reason, "PASS")
+        self.assertIsNotNone(sig)
+
+    def test_missing_atr_is_data_failure_when_guard_enabled(self):
+        tech = self._high_atr_tech()
+        tech.loc[tech.index[-1], "atr"] = np.nan
+        with patch.object(m, "compute_daily_signals", return_value=tech):
+            sig, reason = ev(cfg=m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0))
+        self.assertIsNone(sig)
+        self.assertEqual(reason, "FAIL_DATA")
+
+
+# ===========================================================================
+# 规则3b：quality_value PE+PB 双护栏（显式开关）
+# ===========================================================================
+class TestQVValuationDualGuard(unittest.TestCase):
+    def setUp(self):
+        self.cfg = m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0,
+                                    QV_VALUATION_DUAL_GUARD=True)
+
+    def test_high_pb_is_rejected_when_dual_guard_enabled(self):
+        self.assertEqual(ev(mk_df(HEALTHY, pb=3.1), cfg=self.cfg)[1],
+                         "FAIL_VALUATION")
+
+    def test_missing_pb_is_pending_when_dual_guard_enabled(self):
+        sig, reason = ev(mk_df(HEALTHY, pb=np.nan), cfg=self.cfg)
+        self.assertEqual(reason, "PASS")
+        self.assertIsNotNone(sig)
+        self.assertEqual(sig.tier, "pending")
+        self.assertIn("valuation_pb", sig.missing_tags)
+
+    def test_industry_pb_percentile_is_hard_guard(self):
+        ctx = {"mode": "industry", "pe_pct": 0.20, "pb_pct": 0.61, "peers": 12}
+        self.assertEqual(ev(mk_df(HEALTHY, pb=1.2), cfg=self.cfg,
+                            val_context=ctx)[1], "FAIL_VALUATION")
+
+
+# ===========================================================================
+# 规则质量持续性：StrategyConfig 默认硬门接线
+# ===========================================================================
+class TestQVAnnualContinuity(unittest.TestCase):
+    def test_default_strategy_flags_single_bad_profit_year(self):
+        fund = mk_fund()
+        fund["annual_rows"][1]["net_profit"] = -10.0
+        fund["annual_rows"][2]["operating_cashflow"] = 1000.0
+        cfg = m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0)
+        sig, reason = ev(fund=fund, cfg=cfg)
+        self.assertIsNone(sig)
+        self.assertEqual(reason, "FAIL_FUND")
+
+    def test_annual_continuity_can_be_disabled_for_legacy_replay(self):
+        fund = mk_fund()
+        fund["annual_rows"][1]["net_profit"] = -10.0
+        fund["annual_rows"][2]["operating_cashflow"] = 1000.0
+        cfg = m.StrategyConfig(
+            USE_CACHE=False, MIN_QV_SCORE=0,
+            QUALITY_REQUIRE_ANNUAL_NET_PROFIT_POSITIVE=False,
+            QUALITY_REQUIRE_ANNUAL_CASHFLOW_POSITIVE=False)
+        sig, reason = ev(fund=fund, cfg=cfg)
+        self.assertEqual(reason, "PASS")
+        self.assertIsNotNone(sig)
 
 
 # ===========================================================================
@@ -487,10 +588,11 @@ class TestRelativeStrength(unittest.TestCase):
         # 否则相对强度在正式评估阶段会永远不可计算。
         cfg = m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0, MAX_WORKERS=1, FETCH_DELAY=0)
         index = idx_df(np.linspace(100.0, 105.0, 70))
+        volatile = []
         seen = []
 
         def fake_eval(daily, code, name, conf, env, fund, **kw):
-            seen.append((fund is None, kw.get("index_df")))
+            seen.append((fund is None, kw.get("index_df"), kw.get("volatile_out")))
             return ev(mk_df(HEALTHY), cfg=conf)[0], "PASS"
 
         with patch.object(m, "get_stock_list", return_value=[{"code": "600001", "name": "工业"}]), \
@@ -500,10 +602,70 @@ class TestRelativeStrength(unittest.TestCase):
              patch.object(m, "enrich_annual_fundamentals", side_effect=lambda *a, **kw: a[1]), \
              patch.object(m, "enrich_forward_growth", side_effect=lambda *a, **kw: a[1]):
             m._screen_quality_pool(cfg, m.CacheManager(), {"regime": "bull"}, DAY,
-                                   evaluator=fake_eval, index_df=index)
+                                   evaluator=fake_eval, index_df=index,
+                                   volatile_out=volatile)
         self.assertGreaterEqual(len(seen), 2)                      # 预筛 + 财务重估两次评估
         self.assertTrue(all(x[1] is index for x in seen))
+        self.assertTrue(all(x[2] is None for x in seen))  # 自定义 evaluator 不强行注入新参数
         self.assertIn(True, [x[0] for x in seen])                  # 预筛阶段 fund_data 为 None
+
+    def test_screen_pool_forwards_volatile_to_default_evaluator(self):
+        """生产质量池必须把 ATR 观察池传给默认 evaluate，而不是只在单票调用时生效。"""
+        cfg = m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0,
+                               MAX_WORKERS=1, FETCH_DELAY=0)
+        volatile = []
+        seen = []
+
+        def fake_eval(daily, code, name, conf, env, fund, **kw):
+            seen.append(kw.get("volatile_out"))
+            return None, "FAIL_VOLATILE"
+
+        with patch.object(m, "evaluate", side_effect=fake_eval), \
+             patch.object(m, "get_stock_list", return_value=[{"code": "600001", "name": "工业"}]), \
+             patch.object(m, "get_daily_data", return_value=mk_df(HEALTHY)), \
+             patch.object(m, "get_stock_industry", return_value={}):
+            m._screen_quality_pool(cfg, m.CacheManager(), {"regime": "bull"}, DAY,
+                                   volatile_out=volatile)
+
+        self.assertTrue(seen)
+        self.assertTrue(all(item is volatile for item in seen))
+
+
+# ===========================================================================
+# 新增质量持续性与波动率护栏
+# ===========================================================================
+class TestQualityHardeningGuards(unittest.TestCase):
+    def test_annual_profit_and_cashflow_guards_are_wired(self):
+        cfg = m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0)
+        fund = mk_fund()
+        fund["annual_rows"][1]["net_profit"] = -10.0
+        fund["annual_rows"][1]["operating_cashflow"] = -10.0
+        sig, reason = ev(cfg=cfg, fund=fund)
+        self.assertIsNone(sig)
+        self.assertEqual(reason, "FAIL_FUND")
+
+        relaxed = m.StrategyConfig(
+            USE_CACHE=False, MIN_QV_SCORE=0,
+            QUALITY_REQUIRE_ANNUAL_NET_PROFIT_POSITIVE=False,
+            QUALITY_REQUIRE_ANNUAL_CASHFLOW_POSITIVE=False,
+        )
+        sig, reason = ev(cfg=relaxed, fund=fund)
+        self.assertIsNotNone(sig)
+        self.assertEqual(reason, "PASS")
+
+    def test_qv_atr_guard_can_be_disabled(self):
+        cfg = m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0, QV_ATR_GUARD=True)
+        high_range = mk_df(HEALTHY)
+        high_range.loc[high_range.index[-1], "high"] = high_range.iloc[-1]["close"] * 1.10
+        high_range.loc[high_range.index[-1], "low"] = high_range.iloc[-1]["close"] * .90
+        sig, reason = ev(high_range, cfg=cfg)
+        self.assertIsNone(sig)
+        self.assertEqual(reason, "FAIL_VOLATILE")
+
+        relaxed = m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0, QV_ATR_GUARD=False)
+        sig, reason = ev(high_range, cfg=relaxed)
+        self.assertIsNotNone(sig)
+        self.assertEqual(reason, "PASS")
 
 
 # ===========================================================================
