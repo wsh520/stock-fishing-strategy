@@ -116,12 +116,12 @@ def run(argv: list[str] | None = None):
         logger.info("已启用 --no-notify：本次不推送飞书通知")
 
     config = StrategyConfig()
-    # 注：熊市止跌闸门（QV_BEAR_TIMING_GATE）已收进 StrategyConfig 的库级默认值（True），
-    # 本入口不再单独覆盖——此前库级为 False、仅此处置 True，会让任何用默认 config 跑的实验
-    # （backtest.py ab、单测）跑在一个生产并不存在的策略上，A/B 结论无法采信。
-    # 现生产口径 == 库级口径，无需覆盖；需要关掉时显式 config.QV_BEAR_TIMING_GATE = False。
-    logger.info("生效口径：RECOMMENDATION_MODE=%s | 熊市止跌闸门=%s | 综合分下限=%s",
-                config.RECOMMENDATION_MODE, "启用" if config.QV_BEAR_TIMING_GATE else "关闭",
+    # 注：止跌确认闸门（QV_STABILIZATION_GATE）已收进 StrategyConfig 的库级默认值（True），
+    # 本入口不再单独覆盖。此前旧名 QV_BEAR_TIMING_GATE 仅熊市生效，现扩展到全市场环境，
+    # 配置项已重命名；旧名称通过 __post_init__ 自动迁移，不会静默改变含义。
+    # 需要关掉时显式 config.QV_STABILIZATION_GATE = False。
+    logger.info("生效口径：RECOMMENDATION_MODE=%s | 止跌确认闸门=%s | 综合分下限=%s",
+                config.RECOMMENDATION_MODE, "启用" if config.QV_STABILIZATION_GATE else "关闭",
                 config.MIN_QV_SCORE)
     if args.no_cache:
         config.USE_CACHE = False

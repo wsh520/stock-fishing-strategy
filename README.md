@@ -4,7 +4,7 @@
 
 ## 最小修复后的运行口径
 
-本轮修复说明及验证范围见 [最小修复说明](docs/minimal_repairs.md)。以下旧章节中与该说明冲突的描述以修复说明为准：成长数据默认缺失待核验（`FORWARD_MISSING_AS_PENDING=True`）；行业估值评分使用行业分位；突破须完成财务、行情与周线终审才成为 formal；追踪采用固定 5/10/15/20 交易日。另外，择时读数与决策简报为**纯展示**（不参与否决/排序/落库），熊市止跌闸门只在**生产入口 `run.py`** 开启。
+本轮修复说明及验证范围见 [最小修复说明](docs/minimal_repairs.md)。以下旧章节中与该说明冲突的描述以修复说明为准：成长数据默认缺失待核验（`FORWARD_MISSING_AS_PENDING=True`）；行业估值按行业 PE 分位；突破须完成财务、行情与周线终审才成为 formal；追踪采用固定 5/10/15/20 交易日。另外，择时读数与决策简报为**纯展示**（不参与否决/排序/落库），止跌确认闸门（`QV_STABILIZATION_GATE`）已是**库级默认开启且对全市场环境生效**（见下文「止跌确认闸门」）。
 
 ## 当前默认：优质低估低位荐股
 
@@ -13,11 +13,13 @@
 | 必选维度 | 默认规则 |
 |---|---|
 | 多年质量（非金融） | 最近连续3个可用完整年度：ROE中位数≥10%、每年ROE≥5%、每年扣非净利润>0、三年经营现金流合计/合并净利润合计≥0.8（分母须>0） |
-| 估值（行业相对，#4a） | 默认 `USE_INDUSTRY_RELATIVE_VALUATION=True`：个股 PE/PB 在其**所属行业当日横截面**的分位 ≤60%（`VALUATION_INDUSTRY_PERCENTILE_MAX`）才算便宜；行业数据缺失或行业内可比样本 <5（`VALUATION_INDUSTRY_MIN_PEERS`）时**自动回退**绝对阈值 0<PE TTM≤25、0<PB MRQ≤3。两种口径下 PE/PB≤0 一律否决、缺任一项只列待核验 |
-| 前瞻确认（#4b） | `REQUIRE_FORWARD_CONFIRMATION=True`：Baostock `query_growth_data` 最新报告期净利润同比 < `FORWARD_NI_YOY_MIN`(-30%) → `FAIL_FORWARD` 否决（对治「trailing 年报漂亮、当年正在崩」的价值陷阱）。报告期须有效且不晚于决策日（1–4 月允许上年三季报/已披露年报，5–8 月至少当年 Q1，9–10 月至少 Q2，11–12 月至少 Q3）；缺失、季度无效或过旧 → 记 `forward` 缺项降级为**待核验**（`FORWARD_MISSING_AS_PENDING=True`，与 [最小修复说明](docs/minimal_repairs.md) 一致；显式设 False 可恢复「缺失放行」）。同比落在 `[FORWARD_NI_YOY_MIN, FORWARD_NI_YOY_WARN)` 即 [-30%, -10%) 时**不否决**，仅在决策简报风险项打「业绩下滑预警」黄标 |
+| 估值（行业相对 PE，#4a） | 默认 `USE_INDUSTRY_RELATIVE_VALUATION=True`：**PE** 在其**所属行业当日横截面**的分位 ≤60%（`VALUATION_INDUSTRY_PERCENTILE_MAX`）才算便宜；行业数据缺失或行业内可比样本 <5（`VALUATION_INDUSTRY_MIN_PEERS`）时**自动回退**绝对 PE 上限 `0<PE TTM≤25`。PE≤0 一律否决、PE 缺失只列待核验。**PB 自本轮起不再单独否决**（高于绝对/行业上限只作异常识别与风险说明，且不进入估值评分）；`PB≤0` 仍按净资产异常否决，PB 缺失只标注缺项、不把核心证据完整的股票降为 pending |
+| 前瞻确认（#4b） | `REQUIRE_FORWARD_CONFIRMATION=True`：Baostock `query_growth_data` 最新报告期净利润同比 < `FORWARD_NI_YOY_MIN`(**-10%**) → `FAIL_FORWARD` 否决（对治「trailing 年报漂亮、当年正在崩」的价值陷阱；恰好等于 -10% 不触发）。报告期须有效且不晚于决策日（1–4 月允许上年三季报/已披露年报，5–8 月至少当年 Q1，9–10 月至少 Q2，11–12 月至少 Q3）；缺失、季度无效或过旧 → 记 `forward` 缺项降级为**待核验**（`FORWARD_MISSING_AS_PENDING=True`，与 [最小修复说明](docs/minimal_repairs.md) 一致；显式设 False 可恢复「缺失放行」）。同比落在 `[FORWARD_NI_YOY_MIN, FORWARD_NI_YOY_WARN)` 即 **[-10%, 0%)** 时**不否决**，仅在决策简报风险项打「业绩下滑预警」黄标 |
 | 价格位置 | 至少250根有效日线，(现价−250日最低)/(250日最高−最低)≤40%；取数窗口600自然日 |
 | 综合分下限（#3） | `MIN_QV_SCORE=60`：综合分（0.50×质量+0.35×估值+0.15×技术）<60 的 **formal 候选**否决（`FAIL_QV_SCORE`），弱市自然少推/不推；仅对 formal 生效，pending 不受其累；设 0 关闭 |
-| 熊市止跌闸门（P1） | `QV_BEAR_TIMING_GATE`：**库级默认 `True`，与生产口径一致**（此前库级 `False`、仅 `run.py` 覆盖为 `True`，会让任何用默认 config 跑的实验——`backtest.py ab`、单测——都跑在一个生产并不存在的策略上，A/B 结论无法采信；现覆盖点已消除，`run.py` 不再单独赋值）。熊市（含 unknown 折叠）的正式推荐必须另有最低止跌证据——「现价站上 MA20」或「MACD 柱连续 `MACD_MOMENTUM_DAYS` 日改善」——否则 `FAIL_BEAR_TIMING` 否决。牛/中性完全不受影响。用于修复「突破策略熊市空仓、优质低估低位侧却仍在纯左侧接飞刀」的组合暴露失衡 |
+| 止跌确认闸门 | `QV_STABILIZATION_GATE`：**库级默认 `True`，对全部市场环境生效**（前身为仅熊市生效的 `QV_BEAR_TIMING_GATE`，旧名经 `__setattr__`/`__post_init__` 写穿迁移，构造传入与构造后赋值都继续有效）。正式推荐必须另有最低止跌证据之一——「当日收盘价 ≥ MA20」或「MACD 柱连续 `MACD_MOMENTUM_DAYS`(=2) 日改善」——否则 `FAIL_STABILIZATION` 否决。**不额外要求 RSI 反弹、KDJ 金叉或 MA60 站稳**。用于准入的指标数据不足时**不视为已确认**（MACD 柱含 NaN 或 MA20 不可得 → 视同未止跌） |
+| 相对强度（排序微调 + 风险提示） | `RS_LOOKBACK`(=60)：同一起止日期下「个股区间涨跌幅 − 沪深300区间涨跌幅」（百分点）。指数日线复用主流程已取得的 `get_index_daily` 结果，按**共有交易日**对齐，只使用决策日及之前的数据。**不设硬性准入线**：以 `RS_WEIGHT`(=3.0) 为上限小幅调整 `rank_score`，资格判定仍用不含该调整的综合分；明显跑输（≤`RS_UNDERPERFORM_WARN`=-10pp）时打风险提示标签。指数缺失/对齐数据不足 → `relative_strength=None`、排序中性，不给「强势/弱势」结论 |
+| 停牌缺口 | `REQUIRE_NO_HALT_GAP`：相邻 K 线自然日间隔 > `MAX_BAR_GAP_DAYS`(=12) 判定期间曾停牌 → `FAIL_HALT_GAP` 否决（quality_value 与 technical 共用同一守卫与归因码） |
 | 择时读数 + 决策简报（P0/P5，纯展示） | `SURFACE_TIMING_READ=True`：为每条推荐附「左侧/右侧 + 是否仍在下跌」标签（用 `TIMING_MA_LONG`=60 的均线区分站上/跌破，MACD 深度走弱判「仍在下跌」）与决策简报（信心分档/今日触发/看多理由/主要风险/失效价）。**不参与任何否决、排序与落库**，只把择时判断显式交回人工 |
 | 基础核验 | 最新行情与指数基准日一致、负债率已核验且≤70%、已知商誉超限否决；金融股独立待专项核验 |
 
@@ -28,17 +30,17 @@
 | 评分项 | 在「闸门恰好压线」处的取值 |
 |---|---|
 | 质量分（权重 0.50） | 三档同时压线的**最小可达值 = 50**（`_dimension_score` 在阈值处给 50 分。如 3 年 ROE=(5,10,10)：中位 10=阈值、最低 5=阈值、现金转换 0.8=阈值 → 实测 `status=verified` 而 `quality_score=50`） |
-| 估值分（权重 0.35） | 行业口径在分位上限 0.60 处 = **40**；绝对口径在 PE=25 / PB=3 上限处 = **0** |
+| 估值分（权重 0.35，仅 PE） | 行业口径在分位上限 0.60 处 = **40**；绝对口径在 PE=`MAX_PE_TTM`=25 上限处**同样** = **40**（锚点对齐，见 `_valuation_pe_score`）。PB 不参与估值评分 |
 
-于是「压线合格」候选的综合分上限只有 **54.0（行业口径）/ 40.0（绝对口径）**，两者都低于 60 → **压线合格者 100% 被淘汰，硬闸门的阈值形同虚设**。反解过线所需（`0.5q + 0.35v + 0.15t ≥ 60`）：
+于是「压线合格」候选的综合分上限两种口径都是 **54.0**，低于 60 → **压线合格者 100% 被淘汰，硬闸门的阈值形同虚设**。反解过线所需（`0.5q + 0.35v + 0.15t ≥ 60`，两口径同分，v=40）：
 
-| 质量分 | 行业口径（估值分 40） | 绝对口径（估值分 0） |
-|---|---|---|
-| 50（压线下限） | 技术分 ≥140 → **不可达** | 技术分 ≥233 → **不可达** |
-| 70 | 技术分 ≥73 | 技术分 ≥167 → **不可达** |
-| 90 | 技术分 ≥7 | 技术分 =100（**必须满分**） |
+| 质量分 | 所需技术分（行业/绝对口径一致） |
+|---|---|
+| 50（压线下限） | 技术分 ≥140 → **不可达** |
+| 70 | 技术分 ≥73 |
+| 90 | 技术分 ≥7 |
 
-**直接后果**：PE/PB 逐 bar 缺失的日子（AkShare 兜底）估值分为 0，formal 几乎必然归零——这与 `FORWARD_MISSING_AS_PENDING=True` 是**两个独立叠加**的零推荐机制。运行时可在漏斗日志里核对：`describe_qv_floor()` 会随配置实时算出门槛并打印；该算术已固化为 `test_recommendation_upgrades.TestScoreFloorEquivalence`，改动评分权重或闸门值会立即失败。调低该值前务必先跑 `python backtest.py ab --mode quality_value`。
+**直接后果**：PE 逐 bar 缺失的日子（AkShare 兜底）估值分为 0 且候选降为 pending，formal 会归零——这与 `FORWARD_MISSING_AS_PENDING=True` 是**两个独立叠加**的零推荐机制。运行时可在漏斗日志里核对：`describe_qv_floor()` 会随配置实时算出门槛并打印；该算术已固化为 `test_recommendation_upgrades.TestScoreFloorEquivalence`，改动评分权重或闸门值会立即失败。调低该值前务必先跑 `python backtest.py ab --mode quality_value`。
 
 **市场级刹车（#2，已对 quality_value 生效）**：此前 quality_value 在 `main()` 提前 return，绕过了组合层风控；现已把**急跌熔断**（沪深300 近5日累计 ≤ `MARKET_CRASH_HALT_PCT`(-4%) → 当日不推荐）与**推荐数量按 regime 收缩**（牛 `MAX_PICKS`=5 / 中性 `NEUTRAL_MAX_PICKS`=4 / 熊 `BEAR_MAX_PICKS`=2，由 `resolve_max_picks` 解析）移到分支之前，两种模式共用。ATR 交易风险门槛仍只作用于 technical 路径。
 
@@ -46,7 +48,7 @@
 
 **可选的 KDJ/MACD 下限否决**：默认关闭（`QV_ENFORCE_KDJ_MACD_VETO=False`），保持「技术面不作否决」的现有口径逐字节不变。显式开启后，`FAIL_MACD_WEAK`（MACD 柱深度弱势且仍在恶化）与 `FAIL_KDJ_HIGH`（KDJ 已在区间顶部）会成为资格判定的一道硬闸门，与放量突破策略共用同一套阈值与实现。**切换前必须先用 `python backtest.py ab --mode quality_value` 取得样本内证据**：该闸门修掉过两次已实测的误杀（匀速上行的柱值递减、「K 略低于 D」的交替领先噪声），说明这类「下限」阈值极易误伤健康形态，不能凭直觉设定。
 
-排序为 **50%质量分 + 35%估值分 + 15%技术分**；`_rank_signals` 在 quality_value 路径下实际使用的排序键为 **综合分（`rank_score` 即该综合分）降序 → 质量分降序 → 估值分降序 → 股票代码升序（末级键）**，与并发完成顺序无关、结果可复现。质量分使用ROE稳定性及现金转换率的连续值；估值分是在绝对上限内按PE/PB线性评分（行业相对模式下钳到 0~100），不声称是历史估值分位。技术信号（金叉、背离、量价、放量突破）仅作排序/标签，缺少金叉、短期涨幅高、20日位置高、周线尚未企稳不会否决符合必选维度的公司。取消奖励更深回撤的排序偏好。行业分散（每行业≤2只）继续有效。
+排序为 **50%质量分 + 35%估值分 + 15%技术分**；`_rank_signals` 在 quality_value 路径下实际使用的排序键为 **排序分（`rank_score`）降序 → 质量分降序 → 估值分降序 → 股票代码升序（末级键）**，与并发完成顺序无关、结果可复现。`rank_score` = 综合分 + 近 60 日相对沪深300强度的**有界微调**（±`RS_WEIGHT`=±3，见上表「相对强度」；缺指数数据时为 0），资格判定（`MIN_QV_SCORE`）用的始终是不含该微调的综合分。质量分使用ROE稳定性及现金转换率的连续值；估值分按 PE 线性评分（行业相对模式下钳到 0~100），不声称是历史估值分位。技术信号（金叉、背离、量价、放量突破）仅作排序/标签，缺少金叉、短期涨幅高、20日位置高、周线尚未企稳不会否决符合必选维度的公司。取消奖励更深回撤的排序偏好。行业分散（每行业≤2只）继续有效。
 
 年度数据来自AkShare新浪财务摘要的准确字段（ROE%、扣非净利、合并净利、经营现金流净额，金额元）。有公告日时按公告日可用；摘要不提供公告日时保守按次年5月1日可用。缺最新年度不能用更旧年度顶替；取数失败/NaN/金融专项未核验均为pending。该接口不是历史财报修订版本库，历史报告仍有重述数据局限。
 
@@ -244,7 +246,7 @@ SOURCE schema.sql;
 │   ├── industry_bs.json              # 行业分类（按 INDUSTRY_CACHE_TTL_DAYS=30 天失效）
 │   └── market_regime_state.json      # regime 滞回状态（超 10 天自动重置）
 ├── data/                             # artifact 上传目录（预留，当前不写入文件）
-├── run.py                            # 每日选股入口（优质低估低位 quality_value；熊市止跌闸门已是库级默认）
+├── run.py                            # 每日选股入口（优质低估低位 quality_value；止跌确认闸门已是库级默认且全环境生效）
 ├── run_breakout.py                   # 放量突破入口（强制 technical；含组合层去重/总量上限/暴露提示）
 ├── run_weekly_tracking.py            # 固定期限追踪入口（5/10/15/20 交易日）
 ├── run_monthly_attribution.py        # 信号归因月报入口（总体口径固定 20 交易日）
@@ -398,8 +400,9 @@ python test_entry_filters.py      # 单只判定：15 个入场场景 + 分层/�
 python test_main_layering.py      # main() 编排：周线路径与禁用路径下的正式推荐/待核验候选分层（15 项断言）
 python test_strategy_fixes.py     # 2026-09 修复回归：配置/ROE年化/流动性与波动率归因/波动率观察池采集与渲染/周线已收盘bar/regime滞回（含每自然日最多推进一次）/北京时区/向量化对拍/突破评分校准 + **数据源降级措辞、估值口径声明与 valuation_mode 逐行标注**（76 项断言；飞书相关 14 项在缺 requests 时自动跳过）
 python test_optimizations_p0.py   # P0 优化项：pct_chg 双源口径统一/停牌缺口过滤/排序质量分 rank_score/推荐数量上限与市场级熔断（75 项断言）
-python test_momentum_gates.py     # KDJ/MACD 下限闸门：纯函数边界与缺数据行为/突破接线（既有形态无回归 + KDJ 高位拦截可开关复现）/FAIL_MACD_WEAK 结构性不可达的扫描断言/quality_value 接线（技术面不新增否决 + 深度弱势被拦 + 健康匀速上行不误杀 + 成长数据缺失按默认降级 pending 且无其它缺项）/**熊市止跌闸门（库级默认已开启 · 熊市与 unknown 均拦 · 牛市不生效 · 显式关闭即放行）**/「新闸门在抄底 technical 路径会被既有严格确认层架空」的覆盖关系断言（45 项断言）
-python -B -m unittest test_recommendation_upgrades -v  # 荐股四项升级（#1~#4）：综合分下限(仅formal)/前瞻确认(恶化否决·缺失可配)/行业相对估值(分位·回退·快照)/突破独立(technical不委派)/市场级刹车(急跌熔断·regime收缩·max_picks截取) + **综合分下限等效门槛固化（压线质量分 50、两口径综合分上限 54/40、过线所需技术分表）**（26 项，离线）
+python test_momentum_gates.py     # KDJ/MACD 下限闸门：纯函数边界与缺数据行为/突破接线（既有形态无回归 + KDJ 高位拦截可开关复现）/FAIL_MACD_WEAK 结构性不可达的扫描断言/quality_value 接线（技术面不新增否决 + 深度弱势被拦 + 健康匀速上行不误杀 + 成长数据缺失按默认降级 pending 且无其它缺项）/**止跌确认闸门（库级默认已开启 · 全市场环境均拦 · 显式关闭即放行 · 旧配置名兼容迁移）**/「新闸门在抄底 technical 路径会被既有严格确认层架空」的覆盖关系断言（47 项断言）
+python -B -m unittest test_recommendation_upgrades -v  # 荐股四项升级（#1~#4）：综合分下限(仅formal)/前瞻确认(恶化否决·缺失可配)/行业相对估值(分位·回退·快照)/突破独立(technical不委派)/市场级刹车(急跌熔断·regime收缩·max_picks截取) + **综合分下限等效门槛固化（压线质量分 50、两口径综合分上限均为 54、过线所需技术分表）**（26 项，离线）
+python -B -m unittest test_quality_value_hardening -v  # 本轮口径加固六项：止跌确认闸门(全环境/关闭开关/旧配置名写穿/数据不足不确认)/净利同比 -10% 边界与黄标区间/PE 准入与 PB 降为风险说明/估值评分两口径锚点一致/相对强度(日期对齐·缺失中性·仅影响排序)/停牌缺口接入 quality_value + technical 未受影响（45 项，离线）
 python test_backtest_ab.py        # backtest ab 子命令离线测试：变体定义自检（模式名/重名/字段拼写）--set 类型强转与非法字段报错/报告渲染与警示留痕/CLI 接线（24 项断言，不联网）
 python test_breakout_ab.py        # 突破策略闸门 A/B 与漏斗诊断：GATE_VARIANTS 字段自检/_technical_cfg 不污染默认值/funnel_counts 计数守恒/gate_ab 变体与非法名报错/报告渲染口径/CLI 四开关/空标记文件跳过与坏文件仍报错/「tier 从不提升为 formal → 独立回测恒不成交」的缺陷固化（30 项断言，不联网）
 python -m unittest test_fundamental_quality test_quality_recommendations   # 年度质量与默认荐股口径（26 + 12 = 38 项）
@@ -453,7 +456,8 @@ python -m unittest tests.test_backtest_execution tests.test_breakout_verificatio
 | 60日高点回撤（下限/上限） | 日线 | 底部区域过滤（回撤 <10% 判上涨中继；>70% 判崩盘型/价值陷阱） |
 | 20日区间位置 / MACD柱 / KDJ | 日线 | 严格确认：区间下半部 + MACD柱连续2日改善 + KDJ金叉、K≤55 且 K 上行 |
 | MACD 柱深度弱势 / KDJ 高位 | 日线 | **荐股控制闸门**（`FAIL_MACD_WEAK` / `FAIL_KDJ_HIGH`）：柱值/收盘 ≤−0.5% 且连续 2 日递减（双条件 AND）／K >85 或 K ≥80 且 K<D。突破策略默认开启（`REQUIRE_BR_MACD_NOT_WEAK` / `REQUIRE_BR_KDJ_NOT_HIGH`）；quality_value 模式由 `QV_ENFORCE_KDJ_MACD_VETO` 控制（默认关闭，保持「技术面不作否决」口径） |
-| MACD 柱连续改善 + 站上 MA20 | 日线 | **熊市止跌闸门**（`FAIL_BEAR_TIMING`，`QV_BEAR_TIMING_GATE` **库级默认开启 = 生产口径**）：熊市（含 unknown 折叠）的 formal 推荐须满足其一，否则否决 |
+| MACD 柱连续改善 + 站上 MA20 | 日线 | **止跌确认闸门**（`FAIL_STABILIZATION`，`QV_STABILIZATION_GATE` **库级默认开启**）：**全市场环境**（牛/中/熊/unknown）的 formal 推荐须满足其一，否则否决；MACD/MA20 数据不足不视为已确认。旧名 `QV_BEAR_TIMING_GATE` 自动迁移（含构造后赋值） |
+| 近 60 个交易日个股 vs 沪深300 区间涨跌幅差 | 日线 + 指数 | 相对强度（`relative_strength`，百分点）：仅作正式候选间**有界排序微调**（±`RS_WEIGHT`）与跑输风险提示，无硬性准入线；按共有交易日对齐，指数缺失为 None（排序中性） |
 | 现价 vs MA20/MA60 + 距 250 日低点天数与幅度 | 日线（展示） | P0 择时读数：右侧·站上MA20/MA60 / 右侧雏形 / 左侧·MA20下方 / ⚠左侧·仍在下跌（MACD深度走弱）；**仅标签，不参与否决与排序** |
 | ATR% | 日线 | 波动率风控（technical ≤3.33% / 突破 ≤4.0%，超限否决 FAIL_VOLATILE；quality_value 无此层，故其观察池恒为空） |
 | 周线 MA10 / MACD | 周线 | 决赛圈确认（默认「站上MA10（容忍2%）**或** MA10 上行」满足其一即可，`WEEKLY_MA_BOTH_REQUIRED=False`；另 MACD柱翻红或绿柱连收2周；**只用已收盘周 bar**；数据缺失/滞后 → 待核验候选） |
@@ -463,13 +467,13 @@ python -m unittest tests.test_backtest_execution tests.test_breakout_verificatio
 | 量比/成交额/量能分位/额比 | 日线（突破） | 放量四重确认（1.8–4.0 倍 + ≥1亿 + 60日80%分位 + ≥中位×1.5） |
 | 平台振幅/收盘离散度 | 日线（突破） | 突破前整理充分度（振幅 ≤18%、std/mean ≤4%，shift(3) 避污染） |
 | 最新K线日期 | 日线 | 数据时效（与沪深300最新交易日不一致 → 停牌/滞后，暂不推荐 FAIL_STALE） |
-| 相邻K线自然日间隔 | 日线 | 停牌缺口过滤（>12 天 → FAIL_HALT_GAP，滚动指标跨缺口失真） |
-| ATR% / 回撤深度 / 20日区间位置 | 日线（排序） | 连续质量分 `rank_score`（仅决定同批通过者先后，不改准入；`RANK_QUALITY_WEIGHT`=10 可置 0） |
+| 相邻K线自然日间隔 | 日线 | 停牌缺口过滤（>12 天 → FAIL_HALT_GAP，滚动指标跨缺口失真）；**quality_value 与 technical 均已接入**，同一归因码 |
+| ATR% / 回撤深度 / 20日区间位置 | 日线（排序） | 连续质量分（technical 路径的 `rank_score` 组成；仅决定同批通过者先后，不改准入；`RANK_QUALITY_WEIGHT`=10 可置 0） |
 | 成交额(20日均值) | 日线 | 流动性过滤（<3000万 否决，独立归因 FAIL_LIQUIDITY） |
 | 沪深300 MA20 斜率 + MA60 趋势 | 市场环境 | 牛/熊/中性 regime（`MARKET_REGIME_DUAL_INDICATOR` 默认开启：斜率与 MA60 趋势须同向，否则降级中性；另含连续 2 日确认的滞回机制） |
 | 沪深300 近5日累计涨跌幅 | 市场环境 | 市场级熔断（≤ −4% → 本次运行不推荐，优质低估低位入口） |
 | 行业分类 | 集中度 | 行业分散（同一行业最多 2 只，避免单一板块押注） |
-| PE/PB 行业内分位 / 绝对阈值 | 估值（口径） | 行业相对估值回退绝对阈值时逐行标注 `valuation_mode`，飞书卡片显式声明本次口径 |
+| PE 行业内分位 / 绝对 PE 上限 | 估值（口径） | 行业相对估值回退绝对 PE 上限时逐行标注 `valuation_mode`，飞书卡片显式声明本次口径（PB 只作异常识别与风险说明，不参与准入与评分） |
 
 ## 数据源
 

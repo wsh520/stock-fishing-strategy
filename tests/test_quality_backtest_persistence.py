@@ -61,11 +61,13 @@ class RecommendationTests(unittest.TestCase):
         cfg = types.SimpleNamespace(RECOMMENDATION_MODE="quality_value", LOW_POSITION_LOOKBACK=250,
                                     MAX_PICKS=2, MAX_PICKS_PER_INDUSTRY=1)
         seen = []
-        def evaluate(df, code, name, config, env, fund, latest_trade_date):
-            seen.append((code, len(df), fund, latest_trade_date))
+        def evaluate(df, code, name, config, env, fund, latest_trade_date, **kwargs):
+            # index_df：回测把当日已截断的指数面板复用给个股评估（相对强度，无未来数据）
+            seen.append((code, len(df), fund, latest_trade_date, kwargs.get("index_df")))
             tier = "pending" if fund is None or code == "3" else "formal"
             score = {"1": 1, "2": 99, "3": 80}[code] if fund else 100
             return pd.Series(dict(code=code, tier=tier, rank_score=score)), "PASS"
+        index_upto = pd.DataFrame({"date": [dates[-1]], "close": [100.0]})
         with patch.object(bt, "evaluate", side_effect=evaluate), \
              patch.object(bt, "compute_market_environment", return_value={"regime": "bear"}), \
              patch.object(bt, "fetch_fundamentals_asof", return_value={"debt_ratio": 20}) as fund, \
@@ -73,11 +75,13 @@ class RecommendationTests(unittest.TestCase):
              patch.object(bt, "check_weekly_trend", side_effect=AssertionError("weekly gate")), \
              patch.object(bt, "_fund_verify_state", side_effect=AssertionError("legacy tier override")):
             formal, pending, _ = bt._screen_day(bt.BacktestConfig(DAILY_EVAL_BARS=120), cfg, dates[-1],
-                                               panels, pd.DataFrame(), {"1": "bank", "2": "bank", "3": "bank"})
+                                               panels, index_upto, {"1": "bank", "2": "bank", "3": "bank"})
         self.assertEqual([r["code"] for r in formal], ["2"])
         self.assertEqual([r["code"] for r in pending], ["3"])
         self.assertEqual(len(seen), 6)
-        self.assertTrue(all(n >= 350 and day == dates[-1] for _, n, _, day in seen))
+        self.assertTrue(all(n >= 350 and day == dates[-1] for _, n, _, day, _ in seen))
+        # 回测必须把指数面板透传给评估（否则相对强度恒为 None，A/B 跑的是另一套规则）
+        self.assertTrue(all(idx is index_upto for *_, idx in seen))
         self.assertEqual(enrich.call_args.kwargs["as_of"], dates[-1])
         self.assertEqual(fund.call_count, 3)
 

@@ -757,13 +757,16 @@ def _screen_quality_day(bc: BacktestConfig, config: StrategyConfig, day: str,
             continue
         daily = sp.df.iloc[max(0, i + 1 - bars):i + 1]
         try:
+            # index_df 直接复用本日已截断到当日的指数面板（index_upto，无未来数据、不额外取数），
+            # 与实盘 main() 把 get_index_daily 结果透传进 _screen_quality_pool 的口径一致，
+            # 否则回测里相对强度恒为 None，A/B 实际跑的是与生产不同的规则集。
             sig, reason = evaluate(daily, sp.code, sp.name, config, market_env, None,
-                                   latest_trade_date=day)
+                                   latest_trade_date=day, index_df=index_upto)
             if reason == "PASS" and sig is not None:
                 fund = fetch_fundamentals_asof(bc, sp.code, day)
                 fund = enrich_annual_fundamentals(sp.code, fund, config, as_of=day)
                 sig, reason = evaluate(daily, sp.code, sp.name, config, market_env, fund,
-                                       latest_trade_date=day)
+                                       latest_trade_date=day, index_df=index_upto)
             reasons[reason] += 1
             if reason == "PASS" and sig is not None:
                 signals.append(sig.to_dict())

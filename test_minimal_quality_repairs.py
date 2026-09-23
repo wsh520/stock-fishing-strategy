@@ -16,6 +16,7 @@ class MinimalQualityRepairs(unittest.TestCase):
                 self.assertEqual(ev(df, make_fund())[1], expected)
 
     def test_industry_cheap_is_scored_using_industry(self):
+        # 行业口径：PE 分位 0.2 → 估值分 80；PB=4（高于绝对上限 3.0）自本轮起不再否决
         context = dict(mode='industry', pe_pct=.2, pb_pct=.2, peers=20)
         sig, reason = ev(make_df(pe=30, pb=4), make_fund(), val_context=context)
         self.assertEqual(reason, 'PASS')
@@ -23,10 +24,12 @@ class MinimalQualityRepairs(unittest.TestCase):
         self.assertEqual(sig.valuation_score, 80)
 
     def test_one_metric_can_fall_back(self):
+        # 规则4：估值准入与评分只看 PE。PB 行业内样本不足 → pb_pct 不可得（仅影响展示与
+        # 风险说明），既不否决、也不拉低估值分：估值分仍为 PE 行业分位 0.2 → 80。
         context = dict(mode='industry', pe_pct=.2, pb_pct=None, peers=20)
         sig, reason = ev(make_df(pe=30, pb=.9), make_fund(), val_context=context)
         self.assertEqual(reason, 'PASS')
-        self.assertEqual(sig.valuation_score, 75)
+        self.assertEqual(sig.valuation_score, 80)
 
     def test_growth_missing_old_future_or_invalid_period_is_pending(self):
         for period in (None, '2024Q3', '2025Q3', '2025Q9', 'garbage'):

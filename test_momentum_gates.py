@@ -244,12 +244,11 @@ def qv_fund() -> dict:
 def qv_evaluate(close, veto: bool):
     # 本节只验证 KDJ/MACD 下限闸门，关闭两个与之无关的闸门以隔离被测维度：
     #   · MIN_QV_SCORE=0 —— 样本分数（~53）会触发 FAIL_QV_SCORE 掩盖真正的归因；
-    #   · QV_BEAR_TIMING_GATE=False —— 该闸门现为**库级默认开启**（生产口径已收进
-    #     StrategyConfig，不再由 run.py 覆盖），而本节的 regime 固定为 bear，
-    #     深度回落形态会被它先拦成 FAIL_BEAR_TIMING。它自身的行为在下方有专节断言。
+    #   · QV_STABILIZATION_GATE=False —— 止跌确认闸门现为全环境生效（库级默认开启），
+    #     深度回落形态会被它先拦成 FAIL_STABILIZATION。它自身的行为在下方有专节断言。
     return m.evaluate(qv_df(close), "600001", "工业企业",
                       m.StrategyConfig(USE_CACHE=False, QV_ENFORCE_KDJ_MACD_VETO=veto,
-                                       MIN_QV_SCORE=0, QV_BEAR_TIMING_GATE=False),
+                                       MIN_QV_SCORE=0, QV_STABILIZATION_GATE=False),
                       {"regime": "bear"}, qv_fund(), latest_trade_date=_QV_DAY)
 
 
@@ -306,34 +305,46 @@ check(f"QV: KDJ 顶部死叉分支可被真实触发（K/D={_kd_pair}）: {_r_dc
       _r_dc == "FAIL_KDJ_HIGH")
 
 # ===========================================================================
-# 5b) 熊市止跌闸门（QV_BEAR_TIMING_GATE）—— 已从 run.py 覆盖收进库级默认
+# 5b) 止跌确认闸门（QV_STABILIZATION_GATE）—— 全市场环境生效
 # ===========================================================================
-# 该闸门此前「库级 False、仅 run.py 置 True」，导致库级口径 ≠ 生产口径；现默认值为 True。
-# 本节锁定两件事：默认确实是开启的；且它只作用于熊市（含 unknown 折叠），牛市完全不受影响。
+# 该闸门前身为 QV_BEAR_TIMING_GATE（仅熊市生效），现扩展到所有市场环境。
+# 本节锁定：默认开启；牛/中/熊/unknown 均生效；显式关闭即恢复放行。
 _bear_default = m.StrategyConfig()
-check(f"熊市止跌闸门: 库级默认已开启（不再由 run.py 单独覆盖），实际={_bear_default.QV_BEAR_TIMING_GATE}",
-      _bear_default.QV_BEAR_TIMING_GATE is True)
+check(f"止跌确认闸门: 库级默认已开启，实际={_bear_default.QV_STABILIZATION_GATE}",
+      _bear_default.QV_STABILIZATION_GATE is True)
 
 _gate_cfg = m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0)
 _, _r_bear = m.evaluate(qv_df(_weak), "600001", "工业企业", _gate_cfg,
                         {"regime": "bear"}, qv_fund(), latest_trade_date=_QV_DAY)
-check(f"熊市止跌闸门: 熊市下未止跌形态被拦: {_r_bear}", _r_bear == "FAIL_BEAR_TIMING")
+check(f"止跌确认闸门: 熊市下未止跌形态被拦: {_r_bear}", _r_bear == "FAIL_STABILIZATION")
 
 _, _r_unknown = m.evaluate(qv_df(_weak), "600001", "工业企业", _gate_cfg,
                            {"regime": "unknown"}, qv_fund(), latest_trade_date=_QV_DAY)
-check(f"熊市止跌闸门: unknown 经 _effective_regime 折叠为熊，同样被拦: {_r_unknown}",
-      _r_unknown == "FAIL_BEAR_TIMING")
+check(f"止跌确认闸门: unknown 同样被拦（全环境生效）: {_r_unknown}",
+      _r_unknown == "FAIL_STABILIZATION")
 
 _, _r_bull_gate = m.evaluate(qv_df(_weak), "600001", "工业企业", _gate_cfg,
                              {"regime": "bull"}, qv_fund(), latest_trade_date=_QV_DAY)
-check(f"熊市止跌闸门: 牛市完全不生效（同形态放行）: {_r_bull_gate}", _r_bull_gate == "PASS")
+check(f"止跌确认闸门: 牛市同样生效（全环境）: {_r_bull_gate}", _r_bull_gate == "FAIL_STABILIZATION")
+
+_, _r_neutral_gate = m.evaluate(qv_df(_weak), "600001", "工业企业", _gate_cfg,
+                                {"regime": "neutral"}, qv_fund(), latest_trade_date=_QV_DAY)
+check(f"止跌确认闸门: 中性市同样生效: {_r_neutral_gate}", _r_neutral_gate == "FAIL_STABILIZATION")
 
 _, _r_bear_off = m.evaluate(qv_df(_weak), "600001", "工业企业",
                             m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0,
-                                             QV_BEAR_TIMING_GATE=False),
+                                             QV_STABILIZATION_GATE=False),
                             {"regime": "bear"}, qv_fund(), latest_trade_date=_QV_DAY)
-check(f"熊市止跌闸门: 显式关闭即恢复放行（证明拦截来自该闸门）: {_r_bear_off}",
+check(f"止跌确认闸门: 显式关闭即恢复放行（证明拦截来自该闸门）: {_r_bear_off}",
       _r_bear_off == "PASS")
+
+# 向后兼容：旧配置名 QV_BEAR_TIMING_GATE=False 等价于 QV_STABILIZATION_GATE=False
+_, _r_legacy_off = m.evaluate(qv_df(_weak), "600001", "工业企业",
+                              m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0,
+                                               QV_BEAR_TIMING_GATE=False),
+                              {"regime": "bear"}, qv_fund(), latest_trade_date=_QV_DAY)
+check(f"止跌确认闸门: 旧配置名 QV_BEAR_TIMING_GATE=False 兼容迁移: {_r_legacy_off}",
+      _r_legacy_off == "PASS")
 
 # ===========================================================================
 # 6) 为什么新闸门没有加进抄底策略的 technical 路径

@@ -52,7 +52,8 @@ class QualityRecommendations(unittest.TestCase):
         self.assertEqual(sig.quality_status, "verified")
 
     def test_missing_each_valuation_is_pending(self):
-        for col in ("peTTM", "pbMRQ"):
+        # 规则3：PE 缺失仍降为 pending；PB 缺失不再自动降为 pending（仅标注缺项）
+        for col in ("peTTM",):
             for val in (None, np.nan, np.inf):
                 df = self.df.copy()
                 df.loc[df.index[-1], col] = val
@@ -60,12 +61,28 @@ class QualityRecommendations(unittest.TestCase):
                     sig, reason = self.evaluate(df)
                     self.assertEqual(reason, "PASS")
                     self.assertEqual(sig.tier, "pending")
+        # PB 缺失：其他核心证据完整时仍为 formal（不因辅助指标缺失降级）
+        for val in (None, np.nan, np.inf):
+            df = self.df.copy()
+            df.loc[df.index[-1], "pbMRQ"] = val
+            with self.subTest(col="pbMRQ", val=val):
+                sig, reason = self.evaluate(df)
+                self.assertEqual(reason, "PASS")
+                self.assertEqual(sig.tier, "formal")
+                self.assertIn("valuation_pb", sig.missing_tags)
 
     def test_bad_valuation_cannot_be_rescued_by_technical_score(self):
-        for col, val in (("peTTM", 26), ("peTTM", -1), ("pbMRQ", 3.1), ("pbMRQ", 0)):
+        # 规则3：PE 超限/非正仍否决；PB 偏高不再单独否决（仅风险提示）
+        for col, val in (("peTTM", 26), ("peTTM", -1), ("pbMRQ", 0)):
             df = self.df.copy()
             df.loc[df.index[-1], col] = val
             self.assertEqual(self.evaluate(df)[1], "FAIL_VALUATION")
+        # PB=3.1（高于旧绝对上限 3.0）不再否决，应 PASS
+        df = self.df.copy()
+        df.loc[df.index[-1], "pbMRQ"] = 3.1
+        sig, reason = self.evaluate(df)
+        self.assertEqual(reason, "PASS")
+        self.assertIn("PB偏高", sig.signals_hit)
 
     def test_annual_missing_nonfinite_and_failure(self):
         for field in ("roe", "deducted_profit", "operating_cashflow", "net_profit"):
@@ -112,8 +129,10 @@ class QualityRecommendations(unittest.TestCase):
         self.assertEqual(b.breakout_level, 0)
 
     def test_technical_flags_no_longer_hard_veto(self):
-        with patch.object(m, "_kdj_ok", side_effect=AssertionError("old gate invoked")), \
-             patch.object(m, "_macd_momentum_ok", side_effect=AssertionError("old gate invoked")):
+        # 规则1后：_macd_momentum_ok 被止跌确认闸门（QV_STABILIZATION_GATE）有意使用，
+        # 但 _kdj_ok 仍不参与 quality_value 路径。验证：KDJ 旧闸门不被调用；
+        # 止跌闸门使用 MACD 动能作为「最低止跌证据」之一（非旧式技术否决）。
+        with patch.object(m, "_kdj_ok", side_effect=AssertionError("old gate invoked")):
             self.assertEqual(self.evaluate()[0].tier, "formal")
 
     def test_notice_shows_quality_and_trade_plan(self):

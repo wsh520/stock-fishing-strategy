@@ -68,7 +68,7 @@ class TestScoreFloor(unittest.TestCase):
         self.assertGreaterEqual(sig.score, 60.0)
 
     def test_floor_not_applied_to_pending(self):
-        # 缺 PE/PB → 估值分记 0、综合分被人为压低；但属 pending，下限不应把它直接否决，
+        # 缺 PE → 估值分记 0、综合分被人为压低；但属 pending，下限不应把它直接否决，
         # 否则「数据缺失」与「质量不够」两种语义被混为一谈。
         df = make_df()
         df.loc[df.index[-1], "peTTM"] = np.nan
@@ -83,9 +83,9 @@ class TestScoreFloorEquivalence(unittest.TestCase):
 
     背景：评分口径决定了「恰好压线达标」的公司拿不到 60 分——
       · 质量分：_dimension_score 在阈值处恰好给 50 分；
-      · 估值分：行业口径在分位 0.60（闸门上限）处给 40 分；绝对口径在 PE=25/PB=3
-        （闸门上限）处给 0 分。
-    于是三道硬闸门全部恰好达标的公司，综合分上限分别是 54.0（行业）与 40.0（绝对），
+      · 估值分（仅 PE）：行业口径在分位 0.60（闸门上限）处给 40 分；绝对口径在
+        PE=MAX_PE_TTM（闸门上限）处**同样**给 40 分（锚点对齐，见 _valuation_pe_score）。
+    于是三道硬闸门全部恰好达标的公司，综合分上限两种口径都是 54.0，
     都不足 60 —— 即本下限严格强于三道硬闸门之和，硬闸门的阈值形同虚设。
     该算术此前只存在于口头约定，改动评分权重/闸门值就会静默失真，故在此锁死；
     并直接校验随产品代码发布的 qv_floor_equivalence()，避免文档与实现漂移。
@@ -111,32 +111,31 @@ class TestScoreFloorEquivalence(unittest.TestCase):
         e = m.qv_floor_equivalence(cfg)
         self.assertAlmostEqual(e["min_verified_quality"], 50.0, places=2)
         self.assertAlmostEqual(e["valuation_industry_at_cap"], 40.0, places=6)
-        self.assertAlmostEqual(e["valuation_absolute_at_cap"], 0.0, places=6)
-        # 压线合格者即便技术分满分，综合分上限也低于下限 —— 三种口径都过不了
+        # 规则4：绝对口径压线处与行业口径锚定相同估值分（均为 40）
+        self.assertAlmostEqual(e["valuation_absolute_at_cap"], 40.0, places=6)
+        # 压线合格者即便技术分满分，综合分上限也低于下限 —— 两种口径都过不了
         for key in ("ceiling_industry", "ceiling_absolute"):
             self.assertLess(e[key], cfg.MIN_QV_SCORE, f"{key}={e[key]} 应低于下限")
         self.assertAlmostEqual(e["ceiling_industry"], 54.0, places=2)
-        self.assertAlmostEqual(e["ceiling_absolute"], 40.0, places=2)
+        self.assertAlmostEqual(e["ceiling_absolute"], 54.0, places=2)
         # 日志说明必须点出"严格强于硬闸门"这一结论，且随配置实时计算
         self.assertIn("严格强于三道硬闸门", m.describe_qv_floor(cfg))
 
     def test_implied_technical_requirement_matches_documented_table(self):
         # 反解 0.5q + 0.35v + 0.15t ≥ 60 所需技术分，与配置注释/README 中的表格一致。
+        # 规则4后：行业/绝对口径压线处估值分均为 40（锚点对齐）。
         cfg = m.StrategyConfig()
 
         def required_tech(quality_score, valuation_score):
             return (cfg.MIN_QV_SCORE - cfg.QUALITY_SCORE_WEIGHT * quality_score
                     - cfg.VALUATION_SCORE_WEIGHT * valuation_score) / cfg.TECHNICAL_SCORE_WEIGHT
 
-        # 质量分=压线下限 50：两个口径的技术分要求都不可达
+        # 质量分=压线下限 50，估值分=40（两口径一致）：技术分要求不可达
         self.assertGreater(required_tech(50, 40), 100.0)
-        self.assertGreater(required_tech(50, 0.0), 100.0)
-        # 质量分 70：行业口径需 73 左右；绝对口径仍不可达
+        # 质量分 70：需 73 左右
         self.assertAlmostEqual(required_tech(70, 40), 73.33, places=1)
-        self.assertGreater(required_tech(70, 0.0), 100.0)
-        # 质量分 90：行业口径几乎无约束；绝对口径必须技术分满分
+        # 质量分 90：几乎无约束
         self.assertAlmostEqual(required_tech(90, 40), 6.67, places=1)
-        self.assertAlmostEqual(required_tech(90, 0.0), 100.0, places=1)
 
 
 # ===========================================================================
@@ -144,10 +143,13 @@ class TestScoreFloorEquivalence(unittest.TestCase):
 # ===========================================================================
 class TestForwardConfirmation(unittest.TestCase):
     def test_deteriorating_growth_vetoed(self):
-        fund = make_fund(forward_ni_yoy=-55.0)  # < FORWARD_NI_YOY_MIN(-30)
-        sig, reason = ev(make_df(), fund, m.StrategyConfig(USE_CACHE=False))
-        self.assertIsNone(sig)
-        self.assertEqual(reason, "FAIL_FORWARD")
+        # 硬否决线为 FORWARD_NI_YOY_MIN(-10%)：明显低于阈值一律 FAIL_FORWARD
+        for yoy in (-55.0, -30.0, -10.01):
+            with self.subTest(yoy=yoy):
+                sig, reason = ev(make_df(), make_fund(forward_ni_yoy=yoy),
+                                 m.StrategyConfig(USE_CACHE=False))
+                self.assertIsNone(sig)
+                self.assertEqual(reason, "FAIL_FORWARD")
 
     def test_healthy_growth_passes_and_is_tagged(self):
         fund = make_fund(forward_ni_yoy=12.0)
@@ -173,8 +175,8 @@ class TestForwardConfirmation(unittest.TestCase):
         self.assertEqual(reason, "PASS")
 
     def test_boundary_equal_to_threshold_passes(self):
-        # 恰好等于阈值（-30）不算「低于」，应放行
-        sig, reason = ev(make_df(), make_fund(forward_ni_yoy=-30.0),
+        # 恰好等于阈值（-10）不算「低于」，应放行
+        sig, reason = ev(make_df(), make_fund(forward_ni_yoy=-10.0),
                          m.StrategyConfig(USE_CACHE=False))
         self.assertEqual(reason, "PASS")
 

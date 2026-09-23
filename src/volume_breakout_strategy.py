@@ -565,6 +565,7 @@ def evaluate_breakout(
     volatile_out: Optional[list] = None,
     latest_trade_date: Optional[str] = None,
     val_context: Optional[dict] = None,
+    index_df: Optional[pd.DataFrame] = None,
 ) -> tuple[Optional[BreakoutSignal], str]:
     """评估单只股票是否满足放量突破入场条件。
 
@@ -578,12 +579,15 @@ def evaluate_breakout(
 
     val_context：行业相对估值上下文，仅在 quality_value 委派路径下透传给
     evaluate_quality_value；technical（独立突破）路径忽略。
+    index_df：沪深300日线，仅在 quality_value 委派路径下透传给
+    evaluate_quality_value（用于近60日相对强度）；technical 路径忽略。
     """
     if config is None:
         config = VolumeBreakoutConfig()
     if config.RECOMMENDATION_MODE == "quality_value":
         base, reason = evaluate_quality_value(daily_df, code, name, config, market_env,
-                                              fund_data, latest_trade_date, val_context=val_context)
+                                              fund_data, latest_trade_date, val_context=val_context,
+                                              index_df=index_df)
         if base is None:
             return None, reason
         # 突破仅作为统一候选池内的标签，不另设荐股资格或排序权重。
@@ -924,7 +928,8 @@ def main_breakout(
             return None
         if config.RECOMMENDATION_MODE == "quality_value":
             return _screen_quality_pool(config, cache, market_env, latest,
-                                         pending_out, evaluator=evaluate_breakout)
+                                         pending_out, evaluator=evaluate_breakout,
+                                         index_df=index)
 
         regime_raw = market_env.get("regime", "unknown")
         regime_eff = _effective_regime(regime_raw, config)
