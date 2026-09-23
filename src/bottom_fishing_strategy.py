@@ -1984,15 +1984,16 @@ def describe_pending(row: dict) -> str:
 
 
 # ===========================================================================
-# 波动率风控否决（FAIL_VOLATILE）留档与展示
+# 波动率风控否决（FAIL_VOLATILE）日志留档
 # 这类标的已通过前置筛选层，唯一拦路条件是 ATR 占现价百分比超出风控上限——
 # 既不是数据缺失，也不是形态不合格。单独留档的意义：
 #   1) 让「今天为什么没有推荐」在日志里可逐只复核，而不是只看到一个计数；
-#   2) 作为「高风险观察池」推送飞书（ATR% 收敛后可能重新达标），并显式标注风险，
-#      避免被误读为推荐标的（不落库、不参与周度追踪与归因）。
+#   2) 记下「本可入选、仅波动率超限」的标的，便于后续复核（ATR% 收敛后可能重新达标）。
+# **只在 CI 日志留档，不发送飞书**——飞书通知只发通过全部筛选闸门的正式推荐。
+# 不落库、不参与周度追踪与归因。
 # ===========================================================================
 
-VOLATILE_LOG_LIMIT = 20   # 日志逐只打印上限，超出仅提示条数（飞书另设上限）
+VOLATILE_LOG_LIMIT = 20   # 日志逐只打印上限，超出仅提示剩余条数
 
 
 def _num_or_none(v: Any) -> Optional[float]:
@@ -2026,7 +2027,7 @@ def _build_volatile_row(code: str, name: str, date: Any, close: float, atr: floa
                         atr_pct: float, limit: float, score: float, grade: str,
                         hits: str = "", rsi: Any = None, vol_ratio: Any = None,
                         drawdown: Any = None) -> dict:
-    """构造一条「波动率风控否决」记录（日志与飞书共用同一结构，两策略共用）。"""
+    """构造一条「波动率风控否决」留档记录（日志使用，两策略共用同一结构）。"""
     ratio = (float(atr_pct) / float(limit)) if limit and limit > 0 else 0.0
     # compute_risk_reward 用 1.5×ATR 作止损距离：ATR% 越大，确认止损失败所需的
     # 浮亏越深，日内噪声扫损概率越高——这是该档标的最实质的风险来源。
@@ -2062,25 +2063,6 @@ def sort_volatile(rows: list[dict]) -> list[dict]:
                                        str(r.get("code") or "")))
 
 
-def describe_volatile(row: dict) -> str:
-    """把一只「波动率风控否决」的个股格式化为飞书卡片文本（高风险观察池条目）。"""
-    lines = [
-        f"**{row.get('name', '')} {row.get('code', '')}**（高风险观察 · **{row.get('risk_level') or '-'}**）",
-        f"评分: {_fmt_cell(row.get('score'))} ({row.get('grade') or '-'}级)"
-        f" | 收盘: {_fmt_cell(row.get('close'))}"
-        f" | RSI14: {_fmt_cell(row.get('rsi'))}"
-        f" | 量比: {_fmt_cell(row.get('vol_ratio'))}",
-        f"波动率: ATR {_fmt_cell(row.get('atr_pct'))}%"
-        f"（上限 {_fmt_cell(row.get('atr_limit'))}%，{_fmt_cell(row.get('atr_ratio'))}×）"
-        f" | 距高点回撤: {_fmt_cell(row.get('drawdown_pct'))}%",
-    ]
-    if row.get("signals_hit"):
-        lines.append(f"已达标项: {row.get('signals_hit')}")
-    if row.get("risk_note"):
-        lines.append(f"⚠️ 风险: {row.get('risk_note')}")
-    return "\n".join(lines)
-
-
 def log_volatile_rejects(rows: list[dict], log: logging.Logger, top: int = VOLATILE_LOG_LIMIT) -> None:
     """逐只打印波动率风控否决明细（按技术分降序）。两策略共用同一打印格式。"""
     ordered = sort_volatile(rows)
@@ -2093,8 +2075,8 @@ def log_volatile_rejects(rows: list[dict], log: logging.Logger, top: int = VOLAT
                  r.get("atr_pct"), r.get("atr_limit"), r.get("atr_ratio"), r.get("risk_level"),
                  _fmt_cell(r.get("rsi")), _fmt_cell(r.get("vol_ratio")), r.get("signals_hit") or "-")
     if len(ordered) > max(1, int(top)):
-        log.info("  ...其余 %d 只详见飞书卡片高风险观察池", len(ordered) - max(1, int(top)))
-    log.info("  说明：ATR%% 收敛至上限以内后，这些标的本可进入正式候选，可作高风险观察池跟踪")
+        log.info("  ...其余 %d 只未逐只打印（仅日志留档，不推送飞书）", len(ordered) - max(1, int(top)))
+    log.info("  说明：ATR%% 收敛至上限以内后，这些标的本可进入正式候选，可继续观察（不做推荐）")
     log.info("-" * 60)
 
 
@@ -2455,8 +2437,8 @@ def evaluate(daily_df: Optional[pd.DataFrame], code: str = "", name: str = "", c
 
     latest_trade_date：市场（沪深300）最新交易日，用于行情时效校验——
     个股最新K线日期与之一致才评估（停牌/数据滞后 → 暂不推荐），None 时跳过校验。
-    volatile_out：可选 list，传入后被 FAIL_VOLATILE 否决的个股会以明细 dict 追加进去
-    （供日志逐只打印与飞书高风险观察池展示）；不影响返回值与准入判定。
+    volatile_out：可选 list，传入后被 FAIL_VOLATILE 否决的个股会以明细 dict 追加进去，
+    供 CI 日志逐只留档（**不发送飞书**）；不影响返回值与准入判定。
     val_context：行业相对估值上下文（仅 quality_value 模式使用，见 _industry_valuation_context）；
     None 时估值闸门回退绝对阈值。technical 模式忽略该参数。
     index_df：沪深300日线（仅 quality_value 模式使用，用于计算近60日相对强度）；
@@ -3711,7 +3693,7 @@ def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] 
     pending_out：可选 list，传出「待核验候选」（财务/周线数据缺失、不与正式推荐混排），
     由调用方决定是否展示——数据缺失不等于筛选通过，宁可少荐。
     volatile_out：可选 list，传出「波动率风控否决」明细（技术面已达标、仅 ATR 超限），
-    仅用于日志与飞书高风险观察池，不落库、不参与追踪与归因。
+    仅用于 CI 日志留档（**不发送飞书**），不落库、不参与追踪与归因。
     """
     if config is None: config = StrategyConfig()
     if cache is None: cache = CacheManager(expire_hours=config.CACHE_EXPIRE_HOURS)
@@ -3852,10 +3834,10 @@ def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] 
 
         # 波动率风控否决明细：技术面已过准入分数线、仅 ATR 超限被拦的标的逐只留档。
         # 这是实盘中最常见的「今天为什么没有推荐」的原因，只印计数无法复核，
-        # 故在此打印明细，并经 volatile_out 传给调用方推送飞书高风险观察池。
+        # 故在此打印明细留档（**不发送飞书**：通知只发通过全部筛选的正式推荐）。
         if volatile_out:
             # 并发筛选的完成顺序不确定，先按「技术分降序 → ATR% 降序」就地定序：
-            # 使日志与飞书卡片的 Top-N 稳定可复现（同一份数据两次运行给出同样名单）。
+            # 使日志里的 Top-N 稳定可复现（同一份数据两次运行给出同样名单）。
             volatile_out[:] = sort_volatile(volatile_out)
             log_volatile_rejects(volatile_out, logger)
         elif volatile_out is not None and not stats["fail_volatile"] and not stats["pass"]:

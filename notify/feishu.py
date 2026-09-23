@@ -7,7 +7,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 from datetime import datetime
@@ -87,8 +86,6 @@ _STRATEGY_ZH = {"bottom_fishing": "优质低估低位", "volume_breakout": "放�
 # 例：【优质低估低位】选股结果 / 【放量突破】选股结果 / 【低位企稳】选股结果（technical）
 _LOW_POSITION_ROLE = "低位企稳"
 _STRATEGY_ROLE_ZH = {"bottom_fishing": "优质低估低位", "volume_breakout": "放量突破"}
-_VOLATILE_STRATEGY_LABEL = {"bottom_fishing": "优质低估低位信号", "volume_breakout": "放量突破信号"}
-VOLATILE_CARD_TOP = 5   # 卡片内逐只展示上限（超出仅提示条数，避免卡片过长）
 # 飞书通知每策略最多展示的股票数。策略层已按 MAX_PICKS/NEUTRAL_MAX_PICKS/BEAR_MAX_PICKS
 # 截取正式推荐，这里再做一次通知口径的收敛：宁缺毋滥，用户只看 Top-3。
 NOTIFY_TOP_PER_STRATEGY = 3
@@ -121,55 +118,6 @@ _RECOMMENDATION_NOTE = (
 )
 
 
-def _volatile_elements(volatile: Optional[pd.DataFrame], strategy: str = "bottom_fishing",
-                       top: int = VOLATILE_CARD_TOP) -> list:
-    """构建「波动率风控否决」区块（高风险观察池）。
-
-    这些标的不是数据缺失、也不是形态不合格，而是**波动太大**：ATR 占现价百分比
-    超出风控上限，按 1.5×ATR 设止损需先承受较深浮亏才确认失败，日内噪声即可能扫损。
-    单独成区块并显式标注风险等级与风险提示——它们是「今天为什么没推荐」的直接答案，
-    也是可以持续观察（ATR% 收敛后可能重新达标）的对象，但绝不是买入建议。
-    """
-    if volatile is None or volatile.empty:
-        return []
-    try:
-        from bottom_fishing_strategy import describe_volatile, sort_volatile
-    except ImportError:
-        describe_volatile = sort_volatile = None
-
-    # 并发筛选的完成顺序不确定，这里按「技术分降序 → ATR% 降序」统一排序，
-    # 保证卡片里的 Top-N 与日志 [VOLATILE] 区块逐只对应、两次运行结果可复现。
-    rows = volatile.to_dict("records")
-    if sort_volatile:
-        rows = sort_volatile(rows)
-    total = len(rows)
-    top_n = max(1, int(top))
-
-    label = _VOLATILE_STRATEGY_LABEL.get(strategy, "信号")
-    elems = [
-        _divider(),
-        _md_element(
-            f"**⚠️ 波动率风控否决 {total} 只**"
-            f"（{label}已达标，仅因 ATR 超风控上限被拦下，未进入正式推荐）\n"
-            f"以下为**高风险观察池**，ATR% 收敛至上限以内后才可能重新达标；"
-            f"列出仅供观察与复核，**不构成买入建议**。"
-        ),
-    ]
-    for r in rows[:top_n]:
-        if describe_volatile:
-            elems.append(_md_element(describe_volatile(r)))
-        else:
-            elems.append(_md_element(
-                f"**{r.get('name', '')} {r.get('code', '')}**"
-                f" | 评分: {r.get('score', 0)} ({r.get('grade', '-')}级)"
-                f" | ATR: {r.get('atr_pct', '-')}% / 上限 {r.get('atr_limit', '-')}%"
-                f" | 风险: {r.get('risk_level', '-')}"
-            ))
-    if total > top_n:
-        elems.append(_md_element(f"*...共 {total} 只，仅展示前 {top_n} 只*"))
-    return elems
-
-
 def notify_screening_result(
     df: Optional[pd.DataFrame],
     market_env: str = "unknown",
@@ -188,15 +136,14 @@ def notify_screening_result(
         notify_screening_result(output_df, market_env=market_env_desc, strategy="volume_breakout")
         notify_screening_result(None, market_env=market_env_desc, error_msg=str(e))
 
-    展示口径：df 为正式推荐，每策略最多 NOTIFY_TOP_PER_STRATEGY=3 只（宁缺毋滥）；
-    volatile 为「波动率风控否决」的高风险观察池（技术面/形态已达标，仅 ATR 超限被拦），
-    单独成区块并显式标注风险等级与风险提示，避免被误读为推荐标的。
+    展示口径：df 为正式推荐，每策略最多 NOTIFY_TOP_PER_STRATEGY=3 只（宁缺毋滥）。
+    本通知**只发通过全部筛选闸门的正式推荐**——未通过筛选的对象（波动率风控否决的
+    观察池等）一律不上卡片，用户在群里看到的每一条都是可直接执行的推荐。
 
     **卡片形态（2026-09 改造）**：由"一张长卡片塞下所有股票"改为"汇总卡 + 每股独立卡"：
       · 1 张汇总卡：时间 / 市场环境 / 推荐数量 / 名单口径 / 数据源与估值口径提示；
       · N 张个股卡：每张标题带 [i/N] 序号 + 名称代码，卡内含 describe 全文 + 口径脚注
-        （策略口径 / 市场环境 / 时间 / 序号），保证单张卡在群里脱离汇总也可独立阅读；
-      · 1 张波动率观察池卡（若存在）：仍是单卡多行——每只是一行简述，拆开反而碎片化。
+        （策略口径 / 市场环境 / 时间 / 序号），保证单张卡在群里脱离汇总也可独立阅读。
     拆分带来的额外收益：飞书群里点击通知栏预览即可看到"哪只票"，不用先展开长卡片；
     单张卡片高度可控，操作计划不再被埋在滚动条深处。
     strategy 决定卡片标题前缀与单票描述格式（优质低估低位口径=「正式推荐 · 优质低估低位」/
@@ -218,8 +165,12 @@ def notify_screening_result(
     决定标题里的口径名。必须由调用方显式给出：零推荐时没有任何行可供推断口径，
     只凭 df 会把 production 的 quality_value 误标为【低位企稳】（technical 对照口径）。
 
-    注：pending（待核验候选）参数保留以兼容旧调用签名，但**不再在飞书卡片中渲染**——
+    注 1：pending（待核验候选）参数保留以兼容旧调用签名，但**不再在飞书卡片中渲染**——
     待核验意味着数据不全、既不构成推荐也不该被误读为备选，仅在 CI 日志中打印计数即可。
+
+    注 2：volatile（波动率风控否决）参数同样保留以兼容 run.py / run_breakout.py 的调用
+    签名，但**不再在飞书卡片中渲染**。这些标的未通过筛选（ATR 超风控上限），不属于
+    "通过筛选的通知"；其明细仍在 CI 日志里逐只留档，便于复核"今天为什么没有推荐"。
     """
     # 通知边界再次核验资格，兼容调用方误传候选或缺少 tier 的旧数据。
     if df is not None and not df.empty:
@@ -264,10 +215,9 @@ def notify_screening_result(
 
     # 尝试导入 describe 函数（按策略来源选择卡片格式）
     try:
-        from src.bottom_fishing_strategy import describe, describe_volatile
+        from src.bottom_fishing_strategy import describe
     except ImportError:
         describe = None
-        describe_volatile = None
     try:
         from src.volume_breakout_strategy import describe_breakout
     except ImportError:
@@ -288,30 +238,24 @@ def notify_screening_result(
             )
         else:
             no_signal_text = "今日无正式推荐（未发现数据完整且通过全部条件的标的），宁可少荐。"
-        if volatile is not None and not volatile.empty:
-            no_signal_text += (f"\n本轮有 {len(volatile)} 只仅因**波动率超限**被拦下"
-                               f"（技术面已达标），详见下方高风险观察池。")
         no_signal_text += _VALUATION_MODE_NOTE.get(str(valuation_mode), "")
         card = {
             "header": _build_header(
                 (f"{card_title} - 数据源不足，本次无正式推荐" if data_degraded
-                 else f"{card_title} - 今日无信号")
-                + (f"（波动率观察池 {len(volatile)} 只）" if volatile is not None and not volatile.empty else ""),
+                 else f"{card_title} - 今日无信号"),
                 color="orange" if data_degraded else "grey"),
             "elements": [
                 _md_element(f"**时间:** {now}\n**市场环境:** {market_env}\n\n{no_signal_text}"),
-                *_volatile_elements(volatile, strategy),
             ],
         }
         _send_feishu(card)
         return
 
     # 有信号：每策略最多展示 NOTIFY_TOP_PER_STRATEGY 只
-    # 展示形态：**汇总卡 1 张 + 每只个股独立卡 N 张 + 波动率观察池 1 张**
+    # 展示形态：**汇总卡 1 张 + 每只个股独立卡 N 张**
     #   · 汇总卡承载市场环境、名单口径、数据源/估值口径提示——全局只讲一次；
-    #   · 每只个股独立成卡，标题带 [i/N] 序号 + 名称代码便于群内快速扫读；
-    #     卡内自带"口径脚注"（策略口径 + 市场环境 + 时间），保证脱离汇总卡也可独立阅读；
-    #   · 波动率观察池保持单卡（每只是一行简述，拆开反而碎片化）。
+    #   · 每只个股独立成卡，标题带 [i/N] 序号 + 名称代码便于群内快速扫读，
+    #     卡内自带"口径脚注"（策略口径 + 市场环境 + 时间），脱离汇总卡也可独立阅读。
     top_n = max(1, int(NOTIFY_TOP_PER_STRATEGY))
     shown_df = df.head(top_n)
     shown_n = len(shown_df)
@@ -322,7 +266,6 @@ def notify_screening_result(
         if data_degraded else ""
     )
     valuation_note = _VALUATION_MODE_NOTE.get(str(valuation_mode), "")
-    volatile_n = int(len(volatile)) if volatile is not None else 0
 
     # ---------- 1) 汇总卡 ----------
     summary_text = (
@@ -332,8 +275,7 @@ def notify_screening_result(
         + _RECOMMENDATION_NOTE
         + degraded_note
         + valuation_note
-        + f"\n\n📇 下方将**逐只发送 {shown_n} 张个股卡片**（含操作计划）"
-        + (f"，另附**波动率观察池 {volatile_n} 只**（单独 1 张卡）。" if volatile_n else "。")
+        + f"\n\n📇 下方将**逐只发送 {shown_n} 张个股卡片**（含操作计划）。"
     )
     _send_feishu({
         "header": _build_header(f"{card_title} - {shown_n}只信号", color="green"),
@@ -369,20 +311,6 @@ def notify_screening_result(
             body,
             color="green",
         ))
-
-    # ---------- 3) 波动率观察池（单卡汇总） ----------
-    if volatile_n:
-        vol_elements = _volatile_elements(volatile, strategy)
-        # _volatile_elements 首个元素是分隔线，独立成卡时无需（卡片头已有视觉分隔）
-        if vol_elements and vol_elements[0].get("tag") == "hr":
-            vol_elements = vol_elements[1:]
-        _send_feishu({
-            "header": _build_header(
-                f"{card_title} - 波动率观察池 {volatile_n}只（不构成买入建议）",
-                color="orange",
-            ),
-            "elements": vol_elements,
-        })
 
 
 def notify_tracking_result(report: Optional[pd.DataFrame]) -> None:

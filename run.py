@@ -143,8 +143,8 @@ def run(argv: list[str] | None = None):
 
         # Step 2: 运行选股策略（传入 config/cache 复用市场环境缓存）
         # pending_rows 收集「待核验候选」（财务/周线数据缺失），只用于通知展示，不落库、不参与追踪
-        # volatile_rows 收集「波动率风控否决」（技术面已达标、仅 ATR 超限），同样只用于
-        # 日志与飞书高风险观察池：这是「今天为什么没有推荐」最常见的原因，需要可逐只复核
+        # volatile_rows 收集「波动率风控否决」（技术面已达标、仅 ATR 超限），只用于 CI 日志留档：
+        # 这是「今天为什么没有推荐」最常见的原因，需要可逐只复核（**飞书不再推送**）
         t = time.time()
         logger.info("Step 2/4 执行选股策略（明细见 strategy 日志）...")
         pending_rows: list[dict] = []
@@ -189,8 +189,9 @@ def run(argv: list[str] | None = None):
                            "估值字段(peTTM/pbMRQ)可能缺失，正式推荐数或被压低，通知将标注数据状态")
         if notify_enabled:
             logger.info("Step 4/4 发送飞书通知...")
-            # 待核验候选（pending）仅在上方 CI 日志中打印计数，不再进入飞书卡片：
-            # 数据不全的标的既不构成推荐也不该被误读为备选，飞书只展示正式推荐 Top-3。
+            # 飞书只发「通过全部筛选闸门的正式推荐 Top-3」：待核验候选（pending）与
+            # 波动率否决（volatile）都只在上方 CI 日志留档、不上卡片——用户在群里看到的
+            # 每一条都应是可直接执行的推荐，不含观察/备选标的。
             volatile_df = pd.DataFrame(volatile_rows) if volatile_rows else None
             # 估值口径声明：行业相对估值回退到绝对阈值时必须显式告知，否则用户会拿一份
             # 「口径已换」的名单与往常对比（绝对口径系统性偏向低 PE/PB 的传统板块）。

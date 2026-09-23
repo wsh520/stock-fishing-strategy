@@ -121,7 +121,7 @@ def run(argv: list[str] | None = None):
 
         # Step 2: 运行放量突破选股策略
         # volatile_rows 收集「波动率风控否决」（突破/量能/形态/趋势各层已过、仅 ATR 超限），
-        # 只用于日志与飞书高风险观察池，不落库、不参与追踪与归因
+        # 只用于 CI 日志留档（飞书不再推送），不落库、不参与追踪与归因
         t = time.time()
         logger.info("Step 2/4 执行放量突破选股策略（明细见 strategy.breakout 日志）...")
         volatile_rows: list[dict] = []
@@ -200,8 +200,9 @@ def run(argv: list[str] | None = None):
                 degraded = False
             if degraded:
                 logger.warning("本次运行数据源已降级（Baostock 不可用，回退 AkShare），通知将标注数据状态")
-            # 待核验候选（pending）仅在上方 CI 日志中打印计数，不再进入飞书卡片：
-            # 数据不全的标的既不构成推荐也不该被误读为备选，飞书只展示正式推荐 Top-3。
+            # 飞书只发「通过全部筛选闸门的正式推荐 Top-3」：待核验候选（pending）与
+            # 波动率否决（volatile）都只在上方 CI 日志留档、不上卡片——用户在群里看到的
+            # 每一条都应是可直接执行的推荐，不含观察/备选标的。
             volatile_df = pd.DataFrame(volatile_rows) if volatile_rows else None
             notify_screening_result(output_df, market_env=market_env_desc,
                                     strategy="volume_breakout", volatile=volatile_df,

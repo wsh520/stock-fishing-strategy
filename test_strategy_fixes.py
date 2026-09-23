@@ -18,8 +18,8 @@
 10. 突破评分重校准：浅幅度 L2 突破在新公式下可通过 B 级准入（旧纯乘法公式不能）
 11. 突破策略 RR 下限检查已删除（深幅度 L2/L1 不受摆设检查拦截）
 12. 波动率风控否决明细采集（FAIL_VOLATILE → volatile_out）：技术分/等级/ATR%与上限/风险档
-    /风险提示/已达标项，日志逐只打印（`[VOLATILE]` 区块）与飞书高风险观察池共用同一结构；
-    不传 volatile_out 时行为与旧版完全一致（向后兼容）；两策略共用同一记录与渲染实现
+    /风险提示/已达标项，日志逐只打印（`[VOLATILE]` 区块）留档，**飞书通知不再渲染观察池**；
+    不传 volatile_out 时行为与旧版完全一致（向后兼容）；两策略共用同一记录实现
 """
 import json
 import os
@@ -143,7 +143,7 @@ check("RR: compute_risk_reward 不再返回 passes", "passes" not in rr)
 check("RR: 止损止盈仍计算", rr["stop_loss"] > 0 and rr["take_profit"] > 10.0 and rr["rr_ratio"] > 0)
 
 # ===========================================================================
-# 4b) 波动率风控否决明细采集（日志逐只打印 + 飞书高风险观察池）
+# 4b) 波动率风控否决明细采集（仅日志逐只打印留档；飞书不再渲染观察池）
 # ===========================================================================
 _vol_rows: list[dict] = []
 _, r_vol2 = m.evaluate(df_volatile, code="600000", name="波动测试", config=cfg,
@@ -204,29 +204,48 @@ check("日志: 打印 [VOLATILE] 区块并逐只输出明细",
       "[VOLATILE] 波动率风控否决 3 只" in _log_text and _log_text.count("  · ") == 2)
 check("日志: 超出上限时提示剩余条数", "其余 1 只" in _log_text)
 
-# 飞书区块：由 notify.feishu 渲染「高风险观察池」，必须显式标注风险且不落库
+# 飞书通知边界：只发**通过全部筛选闸门的正式推荐**——波动率否决（观察池）不上卡片。
+# 观察池明细仍在 CI 日志里逐只留档（见上方 [VOLATILE] 区块），只是不再推送到群里，
+# 避免用户在通知里混入"未通过筛选的标的是否能买"的误读。
 try:
-    from notify.feishu import _volatile_elements
+    import notify.feishu as _fs_vol
 
-    _vdf = pd.DataFrame(_vol_rows)
-    _elems = _volatile_elements(_vdf, strategy="bottom_fishing")
-    _blob = json.dumps(_elems, ensure_ascii=False)
-    check("飞书: 生成波动率观察池区块并声明不构成买入建议",
-          any("波动率风控否决 1 只" in str(e.get("content", "")) for e in _elems)
-          and "不构成买入建议" in _blob)
-    check("飞书: 区块内含风险等级与风险提示",
-          "高风险观察" in _blob and "风险:" in _blob and "ATR" in _blob)
-    check("飞书: 无数据时不产生空区块", _volatile_elements(None) == [] and _volatile_elements(pd.DataFrame()) == [])
+    check("日志: 剩余条数提示不再指向飞书卡片", "详见飞书卡片" not in _log_text)
 
-    # 并发完成顺序不确定，渲染时必须统一排序，使卡片 Top-N 与日志 [VOLATILE] 区块一致
-    _low = dict(_vol_rows[0]); _low.update({"code": "600009", "name": "低分股", "score": 30.0})
-    _high = dict(_vol_rows[0]); _high.update({"code": "600010", "name": "高分股", "score": 95.0})
-    _elems_sorted = _volatile_elements(pd.DataFrame([_low, _high]), strategy="bottom_fishing")
-    _first_stock = str(_elems_sorted[2].get("content", ""))
-    check("飞书: 卡片顺序按技术分降序（与日志一致）",
-          "高分股" in _first_stock and "低分股" not in _first_stock)
+    _vrows = [dict(_vol_rows[0], code="600011", name="高波动股", score=88.0)]
+    _vol_cards: list[dict] = []
+    _vol_orig_send = _fs_vol._send_feishu
+    _fs_vol._send_feishu = lambda card: (_vol_cards.append(card), True)[1]
+    try:
+        # ① 有正式推荐 + 同时存在波动率否决：卡片只讲推荐，绝不提观察池
+        _fdf = pd.DataFrame([{
+            "code": "600000", "name": "测试股", "date": "2025-06-30", "close": 10.0,
+            "score": 70.0, "grade": "B", "tier": "formal", "fund_status": "verified",
+            "weekly_status": "not_required", "stop_loss": 9.5, "take_profit": 11.0,
+            "rr_ratio": 2.0, "signals_hit": "优质低估低位", "position_250": 0.2,
+        }])
+        _fs_vol.notify_screening_result(
+            _fdf, market_env="中性", strategy="bottom_fishing",
+            volatile=pd.DataFrame(_vrows), recommendation_mode="quality_value")
+        _vol_blob = json.dumps(_vol_cards, ensure_ascii=False)
+        check("飞书: 通知中不再出现观察池/波动率否决区块",
+              "观察池" not in _vol_blob and "波动率" not in _vol_blob
+              and "高波动股" not in _vol_blob)
+        check("飞书: 有推荐时只发汇总卡 + 个股卡（观察池不再单独成卡）", len(_vol_cards) == 2)
+
+        # ② 零推荐 + 存在波动率否决：仍是"今日无信号"单卡，不附观察池
+        _vol_cards.clear()
+        _fs_vol.notify_screening_result(
+            None, market_env="中性", strategy="bottom_fishing",
+            volatile=pd.DataFrame(_vrows), recommendation_mode="quality_value")
+        _vol_blob2 = json.dumps(_vol_cards, ensure_ascii=False)
+        check("飞书: 零推荐时也不渲染观察池（仅一张「今日无信号」卡）",
+              "观察池" not in _vol_blob2 and "今日无信号" in _vol_blob2
+              and len(_vol_cards) == 1)
+    finally:
+        _fs_vol._send_feishu = _vol_orig_send
 except ImportError as _e:  # requests 等依赖缺失的环境：跳过并明确提示
-    print(f"[SKIP] 飞书区块渲染测试（依赖缺失: {_e}）")
+    print(f"[SKIP] 飞书观察池移除测试（依赖缺失: {_e}）")
 
 # ===========================================================================
 # 4b) 数据源降级 / 估值口径 / 口径名 的显式声明（通知可观测性补强）

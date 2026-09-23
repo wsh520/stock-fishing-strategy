@@ -586,8 +586,8 @@ def evaluate_breakout(
     - reason == "PASS"：signal 为 BreakoutSignal 实例
     - reason 以 "FAIL_" 开头：signal 为 None，reason 为失败归因码
 
-    volatile_out：可选 list，FAIL_VOLATILE 的个股会以明细 dict 追加进去（供日志逐只
-    打印与飞书高风险观察池展示）。注意本策略的波动率检查位于评分定级之前，
+    volatile_out：可选 list，FAIL_VOLATILE 的个股会以明细 dict 追加进去（供 CI 日志
+    逐只留档，**不发送飞书**）。注意本策略的波动率检查位于评分定级之前，
     因此其中的标的只保证「突破/量能/形态/趋势」各层已过，评分等级尚未校验。
 
     val_context：行业相对估值上下文，仅在 quality_value 委派路径下透传给
@@ -920,7 +920,7 @@ def main_breakout(
     初始化数据源 → 市场环境 → 股票池 → 并发筛选（漏斗日志） → 决赛圈周线确认 → 排序截取。
 
     volatile_out：可选 list，传出「波动率风控否决」明细（突破/量能/形态/趋势各层已过、
-    仅 ATR 超限），仅用于日志与飞书高风险观察池，不落库、不参与追踪与归因。
+    仅 ATR 超限），仅用于 CI 日志留档（**不发送飞书**），不落库、不参与追踪与归因。
     """
     if config is None:
         config = VolumeBreakoutConfig()
@@ -1075,10 +1075,10 @@ def main_breakout(
                     fetch_stats["bs_ok"], fetch_stats["ak_ok"], fetch_stats["fail"])
         logger.info("=" * 50)
 
-        # 波动率风控否决明细：逐只留档便于复核「为什么今天没推荐」，
-        # 并经 volatile_out 传给调用方推送飞书高风险观察池（不落库、不参与追踪）。
+        # 波动率风控否决明细：逐只留档便于复核「为什么今天没推荐」（**不发送飞书**，
+        # 通知只发通过全部筛选的正式推荐；不落库、不参与追踪）。
         if volatile_out:
-            # 就地定序（技术分降序 → ATR% 降序），保证日志与飞书卡片 Top-N 可复现
+            # 就地定序（技术分降序 → ATR% 降序），保证日志 Top-N 可复现
             volatile_out[:] = sort_volatile(volatile_out)
             log_volatile_rejects(volatile_out, logger)
         elif volatile_out is not None and not stats["fail_volatile"] and not stats["pass"]:
