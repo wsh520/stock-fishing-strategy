@@ -9,9 +9,11 @@
   规则3 PE 保持主要估值准入（行业分位优先、绝对上限回退）；PB 不再因偏高单独否决，
         非正 PB 仍异常、缺失只标注缺项而不自动降级。
   规则4 估值评分以实际准入的 PE 口径为主，行业 60% 分位与绝对 PE=25 锚定同一分值（40）；
-        PB 不参与估值评分；综合分下限 60 的资格判定不受本轮改动影响。
+        PB 不参与估值评分；综合分下限（现 50，权重 0.45/0.30/0.25）的资格判定不受本轮改动影响。
   规则5 近 60 个交易日相对沪深300强度：起止日期对齐、缺失中性、只做小幅排序微调。
   规则6 quality_value 路径接入 has_halt_gap（沿用 REQUIRE_NO_HALT_GAP / MAX_BAR_GAP_DAYS）。
+  规则7 横盘筑底加分（2026-09 加入）：距 250 日低点 ≥30 天起线性加分、≥120 天满分 +5，
+        只影响 rank_score 排序，不参与资格判定，可置 0 关闭。
   对照：放量突破 technical 模式的资格/评分/否决口未经本轮改动影响。
 
 ⚠️ 本文件只证明「逻辑按要求实现」，不证明荐股胜率提升。
@@ -187,7 +189,9 @@ class TestQVATRGuard(unittest.TestCase):
         tech = m.compute_daily_signals(m._recompute_pct_chg(mk_df(HEALTHY).copy()),
                                        m.StrategyConfig(USE_CACHE=False))
         tech = tech.copy()
-        tech.loc[tech.index[-1], "atr"] = float(tech.iloc[-1]["close"]) * 0.05
+        # ATR 上限已从 3.33% 放宽到 10%（与 3×ATR 止损 + 30% 止盈的 RR≥2.0 对齐），
+        # 样本须超过新上限才能触发否决
+        tech.loc[tech.index[-1], "atr"] = float(tech.iloc[-1]["close"]) * 0.15
         return tech
 
     def test_default_guard_rejects_and_records_volatile_row(self):
@@ -339,7 +343,10 @@ class TestForwardThreshold(unittest.TestCase):
 # ===========================================================================
 class TestPePbResponsibilities(unittest.TestCase):
     def setUp(self):
-        self.cfg = m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0)
+        # MIN_TECHNICAL_SCORE_FORMAL=0：隔离「技术分短板降级 pending」门槛（2026-09 后加入，
+        # 合成样本技术分恒 0 会被降级），本类只验证 PE/PB 职责划分
+        self.cfg = m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0,
+                                    MIN_TECHNICAL_SCORE_FORMAL=0)
 
     def test_pe_over_absolute_cap_still_vetoed(self):
         self.assertEqual(ev(mk_df(HEALTHY, pe=25.01), cfg=self.cfg)[1], "FAIL_VALUATION")
@@ -476,18 +483,24 @@ class TestValuationScoring(unittest.TestCase):
         e = m.qv_floor_equivalence(self.cfg)
         self.assertAlmostEqual(e["valuation_industry_at_cap"], e["valuation_absolute_at_cap"], places=6)
         self.assertAlmostEqual(e["valuation_absolute_at_cap"], 40.0, places=6)
-        self.assertLess(e["ceiling_industry"], self.cfg.MIN_QV_SCORE)
+        # 权重 0.45/0.30/0.25：压线合格者技术分满分的综合分上限 = 22.5+12+25 = 59.5
+        self.assertAlmostEqual(e["ceiling_industry"], 59.5, places=2)
+        # 下限 50 不再高于压线上限 → 结论措辞须随配置动态给出「不低于下限」分支
+        self.assertLessEqual(self.cfg.MIN_QV_SCORE, e["ceiling_industry"])
         text = m.describe_qv_floor(self.cfg)
         self.assertIn("锚定", text)
+        self.assertIn("不低于下限", text)
         self.assertNotIn("绝对口径 0", text)
 
     def test_score_weights_and_floor_unchanged(self):
+        # 2026-09 生产口径：技术权重 15%→25%（让有底部形态的排前面），下限收紧到 50
         self.assertEqual((self.cfg.QUALITY_SCORE_WEIGHT, self.cfg.VALUATION_SCORE_WEIGHT,
-                          self.cfg.TECHNICAL_SCORE_WEIGHT), (0.50, 0.35, 0.15))
-        self.assertEqual(self.cfg.MIN_QV_SCORE, 60.0)
-        # 综合分低于下限的 formal 候选仍被否决（本轮不放松资格判定）
-        cfg = m.StrategyConfig(USE_CACHE=False)     # 默认下限 60
-        df, fund = mk_df(HEALTHY, pe=12.0, pb=1.2), mk_fund(roe=(11, 12, 13))
+                          self.cfg.TECHNICAL_SCORE_WEIGHT), (0.45, 0.30, 0.25))
+        self.assertEqual(self.cfg.MIN_QV_SCORE, 50.0)
+        # 综合分低于下限的 formal 候选仍被否决（本轮不放松资格判定）：
+        # ROE 10/10/10 + PE12 → 0.45×61.6 + 0.30×71.2 ≈ 49.1 < 50
+        cfg = m.StrategyConfig(USE_CACHE=False)     # 默认下限 50
+        df, fund = mk_df(HEALTHY, pe=12.0, pb=1.2), mk_fund(roe=(10, 10, 10))
         sig, reason = ev(df, fund=fund, cfg=cfg)
         self.assertIsNone(sig)
         self.assertEqual(reason, "FAIL_QV_SCORE")
@@ -532,14 +545,19 @@ class TestRelativeStrength(unittest.TestCase):
         self.assertIsNone(m.compute_relative_strength(stock, short, self.cfg))
 
     def test_missing_index_leaves_rank_score_neutral(self):
-        cfg = m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0)
+        # CONSOLIDATION_BONUS=0：隔离横盘筑底加分（另有 TestConsolidationBonus 覆盖），
+        # 本用例只验证「指数缺失 → RS 中性、rank_score 不受 RS 影响」
+        cfg = m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0, CONSOLIDATION_BONUS=0)
         with_none, _ = ev(cfg=cfg)                       # 无 index_df
         self.assertIsNone(with_none.relative_strength)
         self.assertAlmostEqual(with_none.rank_score, with_none.score, places=6)
         self.assertIn("相对强度未核验", with_none.signals_hit)
 
     def test_only_adjusts_sorting_within_bounded_weight(self):
-        cfg = m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0)
+        # MIN_TECHNICAL_SCORE_FORMAL=0 隔离技术短板降级；CONSOLIDATION_BONUS=0 隔离筑底加分，
+        # 保证 rank_score 与 score 之差只来自 RS 微调（±RS_WEIGHT 有界）
+        cfg = m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0,
+                               MIN_TECHNICAL_SCORE_FORMAL=0, CONSOLIDATION_BONUS=0)
         n = cfg.RS_LOOKBACK + 1
         # 指数大跌 → 个股相对强势（正贡献）；指数大涨 → 个股相对弱势（负贡献）
         strong, _ = ev(cfg=cfg, index_df=idx_df(np.linspace(100.0, 70.0, n)))
@@ -554,10 +572,10 @@ class TestRelativeStrength(unittest.TestCase):
         self.assertIn("风险提示", weak.signals_hit)
 
     def test_relative_strength_cannot_bypass_score_floor(self):
-        # 门槛判定用 score（不含相对强度）：明显强势也不能把 52 分的候选救过 60 分下限
-        cfg = m.StrategyConfig(USE_CACHE=False)          # 默认下限 60
+        # 门槛判定用 score（不含相对强度/筑底加分）：明显强势也不能把 ≈49.1 分的候选救过 50 分下限
+        cfg = m.StrategyConfig(USE_CACHE=False)          # 默认下限 50
         n = cfg.RS_LOOKBACK + 1
-        sig, reason = ev(mk_df(HEALTHY, pe=12.0, pb=1.2), fund=mk_fund(roe=(11, 12, 13)),
+        sig, reason = ev(mk_df(HEALTHY, pe=12.0, pb=1.2), fund=mk_fund(roe=(10, 10, 10)),
                          cfg=cfg, index_df=idx_df(np.linspace(100.0, 10.0, n)))
         self.assertIsNone(sig)
         self.assertEqual(reason, "FAIL_QV_SCORE")
@@ -632,6 +650,39 @@ class TestRelativeStrength(unittest.TestCase):
 
 
 # ===========================================================================
+# 规则7：横盘筑底加分（2026-09 加入；排序微调，不参与准入）
+# ===========================================================================
+class TestConsolidationBonus(unittest.TestCase):
+    """距 250 日低点越久，rank_score 加分越高（线性插值，≥120 天满分 +5）。
+
+    只影响排序：score（资格判定用）与 tier 均不变；CONSOLIDATION_BONUS=0 完全关闭。
+    """
+
+    def test_days_since_low_earns_interpolated_bonus(self):
+        # HEALTHY：250 日低点在末根前约 50 个交易日 → 加分 = 5×(50-30)/(120-30) ≈ 1.111
+        cfg = m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0)
+        sig, _ = ev(cfg=cfg)                             # 无 index_df → RS 中性
+        bonus = sig.rank_score - sig.score
+        self.assertAlmostEqual(bonus, 5.0 * 20 / 90, places=2)
+        self.assertGreater(bonus, 0.0)
+
+    def test_recent_low_earns_no_bonus(self):
+        # BELOW_MA20_MACD_UP：低点就在末端（止跌由 MACD 连续改善确认）→ 不加分
+        cfg = m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0)
+        sig, _ = ev(mk_df(BELOW_MA20_MACD_UP), cfg=cfg)
+        self.assertAlmostEqual(sig.rank_score, sig.score, places=6)
+
+    def test_bonus_can_be_disabled_and_does_not_change_eligibility(self):
+        base = m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0, CONSOLIDATION_BONUS=0)
+        sig, _ = ev(cfg=base)
+        self.assertAlmostEqual(sig.rank_score, sig.score, places=6)
+        # 加分不参与资格判定：开/关两种配置下 score 完全一致
+        on = m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0)
+        sig_on, _ = ev(cfg=on)
+        self.assertAlmostEqual(sig_on.score, sig.score, places=6)
+
+
+# ===========================================================================
 # 新增质量持续性与波动率护栏
 # ===========================================================================
 class TestQualityHardeningGuards(unittest.TestCase):
@@ -654,10 +705,13 @@ class TestQualityHardeningGuards(unittest.TestCase):
         self.assertEqual(reason, "PASS")
 
     def test_qv_atr_guard_can_be_disabled(self):
+        # ATR 上限已放宽到 10%：把末端 5 根 K 线振幅拉宽（high ×1.30 / low ×0.85，
+        # 非对称以保持 20 日区间位置 ≤0.5），使 ATR% 明确越过新上限
         cfg = m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0, QV_ATR_GUARD=True)
         high_range = mk_df(HEALTHY)
-        high_range.loc[high_range.index[-1], "high"] = high_range.iloc[-1]["close"] * 1.10
-        high_range.loc[high_range.index[-1], "low"] = high_range.iloc[-1]["close"] * .90
+        for i in range(-5, 0):
+            high_range.loc[high_range.index[i], "high"] = high_range.iloc[i]["close"] * 1.30
+            high_range.loc[high_range.index[i], "low"] = high_range.iloc[i]["close"] * .85
         sig, reason = ev(high_range, cfg=cfg)
         self.assertIsNone(sig)
         self.assertEqual(reason, "FAIL_VOLATILE")

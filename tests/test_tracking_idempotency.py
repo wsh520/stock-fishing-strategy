@@ -133,7 +133,10 @@ class StoreTests(unittest.TestCase):
             self.assertTrue(store.save_tracking(1, '2024-01-02', '1', 1, '2024-01-09', 11, 10, 5))
             sql, args = cur.execute.call_args.args
             self.assertIn('WHERE rec_id = %s AND close_date = %s', sql)
-            self.assertEqual(args[-3:], (5, 1, '2024-01-09'))
+            # INSERT 列含周/月收益率；首次追踪无历史观测 → 两列均为 NULL
+            self.assertIn('weekly_return_pct, monthly_return_pct', sql)
+            self.assertEqual(args[9:12], (5, None, None))   # holding_trade_days, weekly, monthly
+            self.assertEqual(args[-2:], (1, '2024-01-09'))  # NOT EXISTS 幂等参数
             cur.execute.return_value = 0
             self.assertFalse(store.save_tracking(1, '2024-01-02', '1', 2, '2024-01-09', 11, 10))
             self.assertFalse(store.save_tracking(1, '2024-01-02', '1', 1, '2024-01-02', 11, 10))
@@ -152,10 +155,26 @@ class StoreTests(unittest.TestCase):
         self.assertTrue(any('earlier.id < t.id SET t.legacy_duplicate = 1' in s for s in statements))
         self.assertFalse(any('DELETE ' in s or 'TRUNCATE ' in s for s in statements))
         cur.reset_mock()
-        cur.fetchall.side_effect = [[(c,) for c in ('holding_trade_days', 'legacy_duplicate', 'unique_close_date')],
+        # 已含全部补列（含周/月收益率两列）与目标索引 → 重复执行不得再 ALTER/UPDATE
+        cur.fetchall.side_effect = [[(c,) for c in ('holding_trade_days', 'legacy_duplicate',
+                                                    'unique_close_date', 'weekly_return_pct',
+                                                    'monthly_return_pct')],
                                    [(c,) for c in ('idx_rec_week', 'uk_rec_close_date', 'uk_rec_horizon')]]
         store._ensure_tracking_schema(conn)
         self.assertFalse(any('ALTER ' in c.args[0] or 'UPDATE ' in c.args[0] for c in cur.execute.call_args_list))
+
+    def test_weekly_return_uses_prior_observation(self):
+        # 周收益率 = 本次观测收盘价 vs 同推荐 5 个交易日前那次追踪观测的收盘价；
+        # 无对应历史观测（含月收益率所需的第 0 日基准）时对应列为 NULL
+        conn = MagicMock()
+        cur = conn.cursor.return_value.__enter__.return_value
+        cur.fetchall.return_value = [(5, 10.0)]      # 已有第 5 交易日观测，收盘 10.0
+        cur.execute.return_value = 1
+        with patch.object(store, 'is_configured', return_value=True), patch.object(store, '_connect', return_value=conn), patch.object(store, '_ensure_tables'):
+            self.assertTrue(store.save_tracking(1, '2024-01-02', '1', 2, '2024-01-16', 11, 10, 10))
+            args = cur.execute.call_args.args[1]
+        self.assertAlmostEqual(args[10], 10.0)       # (11/10 − 1) × 100
+        self.assertIsNone(args[11])                  # 无第 0 日观测 → 月收益率 NULL
 
     def test_active_query_uses_distinct_dates_and_horizons(self):
         conn = MagicMock()

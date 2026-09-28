@@ -163,6 +163,10 @@ class StrategyConfig:
     # ===== 维度短板门槛（防止单维高分掩盖其他维度缺陷）=====
     # 质量分低于此值 → FAIL_QUALITY_FLOOR 否决（差公司再便宜也不买）。
     # 估值分可以很高（PE低），但如果质量不行就是价值陷阱。
+    # 只判已核验（verified）样本：质量数据缺失/部分缺失/金融专项待核验的候选
+    # 仍按分层约定降级 pending（缺失不误杀），不被本门槛否决。
+    # 评分锚点下 verified 样本质量分恒 ≥50，默认值即保底防线；上调（如 60）
+    # 可拦截「已核验但平庸」的候选。
     MIN_QUALITY_SCORE: float = 50.0
     # 技术分低于此值 → 降为 pending（底部未确认，观察但不正式推荐）。
     # 不直接否决是因为基本面确实好的票值得跟踪，只是当前不是好的入场点。
@@ -301,7 +305,7 @@ class StrategyConfig:
     # 定义：同一起止日期下，个股区间涨跌幅 − 沪深300区间涨跌幅（百分点）。
     # 只使用决策当日及之前的数据；起止日期必须对齐。
     # 用途：quality_value 正式候选之间的小幅排序调整（RS_WEIGHT 控制影响幅度）
-    # 和明显跑输市场时的风险提示标签。不改变综合分 60 的资格判定。
+    # 和明显跑输市场时的风险提示标签。不改变综合分下限（MIN_QV_SCORE）的资格判定。
     # 指数或对齐数据不足时给出「未核验/不可计算」状态，排序影响保持中性（0）。
     RS_LOOKBACK: int = 60              # 相对强度回看交易日数
     RS_WEIGHT: float = 3.0             # 排序微调最大影响分值（限制相对强度不压倒财务/估值）
@@ -518,8 +522,8 @@ class StrategyConfig:
     RQ_W_LOW_VOL: float = 0.35        # ATR% 越低越好（低波异象 + 降低止损被扫概率）
     RQ_W_DRAWDOWN: float = 0.35       # 回撤越深越好（均值回归的空间来自跌幅）
     RQ_W_RANGE_POS: float = 0.30      # 20 日区间位置越低越好（闸门内细分）
-    # 动能维度默认权重 0：REQUIRE_MACD_MOMENTUM + MACD_MOMENTUM_DAYS=2 已是硬闸门，
-    # 通过者的 MACD 柱必然连续 2 日改善，该维度在整个候选集内几乎恒为满分
+    # 动能维度默认权重 0：REQUIRE_MACD_MOMENTUM + MACD_MOMENTUM_DAYS=3 已是硬闸门，
+    # 通过者的 MACD 柱必然连续 3 日改善，该维度在整个候选集内几乎恒为满分
     # （test_optimizations_p0 实测饱和在 W×1.0），不提供区分度——与上方已删除的
     # DAILY_RSI_OVERBOUGHT_PENALTY 同属「被前置闸门架空的死权重」。
     # 保留实现与参数，便于关闭 MACD 闸门做 A/B 时重新启用。
@@ -2938,9 +2942,12 @@ def _tag_valuation_mode(frame: pd.DataFrame, snapshot: Optional[dict],
 def qv_floor_equivalence(config: StrategyConfig) -> dict:
     """量化 MIN_QV_SCORE 相对三道硬闸门的等效门槛（纯计算，不取数、不联网）。
 
-    评分口径决定了「恰好压线通过硬闸门」的公司拿不到下限分，因此该下限**严格强于**
-    三档硬闸门之和。这个结论此前只写在配置注释里，实盘日志完全看不到，容易把
-    「被下限卡掉」误读为「市场没机会」；此函数把它算成数字供漏斗日志与审计使用。
+    「恰好压线通过硬闸门」的样本综合分上限 = qw×压线质量分 + vw×压线估值分 + tw×100。
+    该上限与下限的大小关系决定闸门的实际严厉度（describe_qv_floor 会动态给出结论）：
+    上限低于下限时压线合格者 100% 被淘汰（下限严格强于硬闸门）；否则下限只拦
+    综合分不足的候选，压线合格者仍可凭技术分过线。这个算术此前只写在配置注释里，
+    实盘日志完全看不到，容易把「被下限卡掉」误读为「市场没机会」；此函数把它算成
+    数字供漏斗日志与审计使用。
 
     · 最小可达质量分：构造「中位 ROE = QUALITY_MEDIAN_ROE_MIN、最低 ROE = QUALITY_MIN_ROE、
       现金转换 = QUALITY_CASH_CONVERSION_MIN」三档同时压线的样本（如 3 年 ROE=(5,10,10)），
@@ -2998,7 +3005,7 @@ def qv_floor_equivalence(config: StrategyConfig) -> dict:
 
 
 def describe_qv_floor(config: StrategyConfig) -> str:
-    """把 MIN_QV_SCORE 的真实严厉度写成一行日志（数值随配置实时计算，不写死）。"""
+    """把 MIN_QV_SCORE 的真实严厉度写成一行日志（数值与结论均随配置实时计算，不写死）。"""
     e = qv_floor_equivalence(config)
 
     def _fmt(v: Optional[float]) -> str:
@@ -3006,11 +3013,16 @@ def describe_qv_floor(config: StrategyConfig) -> str:
             return "技术分权重为 0"
         return "不可达（需 >100）" if v > 100.0 else f"≥{v:.0f}"
 
+    # 结论随「压线上限 vs 下限」的大小关系动态给出：上限低于下限时压线合格者
+    # 100% 被淘汰（下限严格强于硬闸门）；否则压线合格者仍可凭技术分过线。
+    verdict = ("低于下限 → 该下限严格强于三道硬闸门，压线合格者 100% 被淘汰"
+               if e["ceiling_industry"] < e["floor"] else
+               "不低于下限 → 压线合格者能否过线取决于技术分，本下限只拦综合分不足的候选")
     return (
         f"综合分下限 {e['floor']:.0f}｜压线合格样本质量分仅 {e['min_verified_quality']:.1f}，"
         f"估值分（仅PE）在行业/绝对口径压线处均锚定 {e['valuation_industry_at_cap']:.0f}，"
         f"其综合分上限为 {e['ceiling_industry']:.1f}"
-        f"（低于下限 → 该下限严格强于三道硬闸门，压线合格者 100% 被淘汰）；"
+        f"（{verdict}）；"
         f"要过线所需技术分：{_fmt(e['req_tech_industry'])}"
     )
 
@@ -3372,11 +3384,17 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
     score = round(config.QUALITY_SCORE_WEIGHT * quality_score +
                   config.VALUATION_SCORE_WEIGHT * valuation_score +
                   config.TECHNICAL_SCORE_WEIGHT * tech_score, 2)
-    # ===== 规则4b：质量分短板否决 =====
+    # ===== 规则4b：质量分短板否决（只判已核验样本）=====
     # 质量是根基：差公司再便宜也是价值陷阱。估值分可以很高（PE低），但如果
     # 质量分低于门槛，说明基本面有硬伤，综合分被估值拉高是假象。
+    # 仅对 status="verified" 的样本生效：missing/partial/金融专项待核验的质量分
+    # 因证据不足为 0 或失真，按「数据缺失不误杀」的分层约定走 pending 待核验，
+    # 而不是否决——否则该门槛会退化成「缺数据即淘汰」，待核验候选的 CI 观测
+    # 口径（计数 + 前 10 只明细）随之丢失，金融股也永远无法进入专项核验流程。
+    # 评分锚点决定 verified 样本质量分恒 ≥50（阈值处恰好 50 分），默认门槛下
+    # 本闸门是保底防线；上调 MIN_QUALITY_SCORE（如 60）即可拦截「已核验但平庸」的候选。
     _min_quality = float(getattr(config, "MIN_QUALITY_SCORE", 0.0) or 0.0)
-    if _min_quality > 0 and quality_score < _min_quality:
+    if _min_quality > 0 and quality["status"] == "verified" and quality_score < _min_quality:
         return None, "FAIL_QUALITY_FLOOR"
     # ===== 规则5：近60日相对沪深300强度（排序微调，不设硬性准入线）=====
     rs = compute_relative_strength(df, index_df, config)

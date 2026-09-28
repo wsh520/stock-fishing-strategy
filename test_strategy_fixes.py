@@ -52,7 +52,7 @@ vcfg = vb.VolumeBreakoutConfig(RECOMMENDATION_MODE="technical")
 
 check("配置: SCREEN_TIME_BUDGET_MIN 存在", getattr(cfg, "SCREEN_TIME_BUDGET_MIN", None) == 240.0)
 check("配置: PROGRESS_LOG_EVERY 存在", getattr(cfg, "PROGRESS_LOG_EVERY", None) == 500)
-check("配置: MAX_ATR_PCT=3.33", getattr(cfg, "MAX_ATR_PCT", None) == 3.33)
+check("配置: MAX_ATR_PCT=10", getattr(cfg, "MAX_ATR_PCT", None) == 10.0)
 check("配置: FUND_LOOKBACK_QUARTERS=4", getattr(cfg, "FUND_LOOKBACK_QUARTERS", None) == 4)
 check("配置: 旧 FUND_QUARTER_LOOKBACK 已移除", not hasattr(cfg, "FUND_QUARTER_LOOKBACK"))
 check("配置: UNKNOWN_AS_BEAR 显式存在", getattr(cfg, "UNKNOWN_AS_BEAR", None) is True)
@@ -129,8 +129,8 @@ check("流动性: 僵尸股 FAIL_LIQUIDITY（不再混入 FAIL_DATA）", r_liq =
 # ===========================================================================
 # 4) 波动率否决 FAIL_VOLATILE 替代 FAIL_RR
 # ===========================================================================
-# 中部 30 根 ±6% 宽幅震荡抬高 ATR（末端 20 根保持正常振幅，避免触发区间位置否决）
-df_volatile = make_df(base_closes(), volatile_span=(60, 90, 1.07, 0.93))
+# 中部 25 根 ±30%+ 宽幅震荡抬高 ATR（上限已放宽到 10%，需更宽振幅；末端 20+ 根保持正常振幅，避免触发区间位置否决）
+df_volatile = make_df(base_closes(), volatile_span=(70, 95, 1.35, 0.70))
 _, r_vol = m.evaluate(df_volatile, code="600000", name="测试", config=cfg,
                       market_env=_NEUTRAL, fund_data=_FUND_OK)
 _out_vol = m.compute_daily_signals(df_volatile, cfg)
@@ -174,11 +174,11 @@ _, r_pass = m.evaluate(df_a, code="600000", name="测试", config=cfg,
                        market_env=_NEUTRAL, fund_data=_FUND_OK, volatile_out=_pass_rows)
 check("观察池: 通过前置层的正常标的不会进入观察池", r_pass == "PASS" and not _pass_rows)
 
-# 风险分档阈值（3.33% 为抄底上限）
-check("风险档: 2.0× 及以上为极高", m._atr_risk_level(7.0, 3.33) == "极高")
-check("风险档: 1.5× 为高", m._atr_risk_level(5.0, 3.33) == "高")
-check("风险档: 1.2× 为偏高", m._atr_risk_level(4.0, 3.33) == "偏高")
-check("风险档: 略超上限为轻度超限", m._atr_risk_level(3.4, 3.33) == "轻度超限")
+# 风险分档阈值（阈值按参数传入，与生产上限 MAX_ATR_PCT=10% 对齐）
+check("风险档: 2.0× 及以上为极高", m._atr_risk_level(20.0, 10.0) == "极高")
+check("风险档: 1.5× 为高", m._atr_risk_level(15.0, 10.0) == "高")
+check("风险档: 1.2× 为偏高", m._atr_risk_level(12.0, 10.0) == "偏高")
+check("风险档: 略超上限为轻度超限", m._atr_risk_level(10.2, 10.0) == "轻度超限")
 
 # 展示排序：技术分降序 → ATR% 降序（只影响展示顺序，这些标的都已被否决）
 _ordered = m.sort_volatile([

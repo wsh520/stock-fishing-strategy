@@ -4,6 +4,7 @@
   #1 突破策略独立成第二信号源（technical 模式不再委派 quality_value 资格）
   #2 quality_value 接入市场级刹车（regime 数量收缩 + 急跌熔断）
   #3 综合分下限 MIN_QV_SCORE（仅对 formal 生效，pending 不受其累）
+  #3b 维度短板门槛（MIN_QUALITY_SCORE 只判已核验样本 / MIN_TECHNICAL_SCORE_FORMAL 降级 pending）
   #4a 行业相对估值闸门（行业内分位 + 绝对阈值回退）
   #4b 前瞻确认闸门（当年净利同比恶化否决 / 缺失行为可配）
 """
@@ -49,23 +50,28 @@ def ev(df, fund, cfg=None, val_context=None, **kw):
 # ===========================================================================
 class TestScoreFloor(unittest.TestCase):
     def test_low_score_formal_rejected_at_default_floor(self):
-        # ROE 11/12/13 + PE12/PB1.2 → 综合分≈52.7，无缺项（formal 候选）→ 默认下限 60 否决
-        df, fund = make_df(pe=12., pb=1.2), make_fund(roe=(11, 12, 13))
-        sig, reason = ev(df, fund, m.StrategyConfig(USE_CACHE=False))  # MIN_QV_SCORE=60 默认
+        # ROE 10/10/10 + PE12/PB1.2 → 质量分≈61.6、估值分≈71.2、技术分 0
+        # → 综合分≈49.1 < 50，无缺项（formal 候选）→ 默认下限 50 否决
+        df, fund = make_df(pe=12., pb=1.2), make_fund(roe=(10, 10, 10))
+        sig, reason = ev(df, fund, m.StrategyConfig(USE_CACHE=False))  # MIN_QV_SCORE=50 默认
         self.assertIsNone(sig)
         self.assertEqual(reason, "FAIL_QV_SCORE")
 
     def test_floor_disabled_passes(self):
         df, fund = make_df(pe=12., pb=1.2), make_fund(roe=(11, 12, 13))
-        sig, reason = ev(df, fund, m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0))
+        # MIN_TECHNICAL_SCORE_FORMAL=0：隔离技术短板门槛（其行为由 TestDimensionFloors 覆盖）
+        sig, reason = ev(df, fund, m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0,
+                                                    MIN_TECHNICAL_SCORE_FORMAL=0))
         self.assertEqual(reason, "PASS")
         self.assertEqual(sig.tier, "formal")
 
     def test_high_score_passes_default_floor(self):
-        sig, reason = ev(make_df(), make_fund())  # 综合分≈66
+        # 综合分≈62.3 ≥ 默认下限 50；技术短板门槛置 0 隔离（本用例只验证综合分下限语义）
+        cfg = m.StrategyConfig(USE_CACHE=False, MIN_TECHNICAL_SCORE_FORMAL=0)
+        sig, reason = ev(make_df(), make_fund(), cfg)
         self.assertEqual(reason, "PASS")
         self.assertEqual(sig.tier, "formal")
-        self.assertGreaterEqual(sig.score, 60.0)
+        self.assertGreaterEqual(sig.score, m.StrategyConfig().MIN_QV_SCORE)
 
     def test_floor_not_applied_to_pending(self):
         # 缺 PE → 估值分记 0、综合分被人为压低；但属 pending，下限不应把它直接否决，
@@ -75,20 +81,60 @@ class TestScoreFloor(unittest.TestCase):
         sig, reason = ev(df, make_fund(), m.StrategyConfig(USE_CACHE=False))
         self.assertEqual(reason, "PASS")
         self.assertEqual(sig.tier, "pending")
-        self.assertLess(sig.score, 60.0)
+        self.assertLess(sig.score, m.StrategyConfig().MIN_QV_SCORE)
+
+
+class TestDimensionFloors(unittest.TestCase):
+    """维度短板门槛（MIN_QUALITY_SCORE / MIN_TECHNICAL_SCORE_FORMAL，2026-09 新增）。
+
+    质量短板只判**已核验**样本：verified 的评分锚点决定质量分恒 ≥50，默认门槛 50
+    是保底防线，上调后才实际拦截「已核验但平庸」的候选；质量数据缺失/部分缺失/
+    金融专项待核验仍按分层约定降级 pending（缺失不误杀），不被本门槛否决。
+    技术短板不否决、只把 tech_score < 45 的候选降为 pending（基本面好但入场时机未到）。
+    """
+
+    def test_verified_mediocre_quality_rejected_when_floor_raised(self):
+        # ROE 11/12/13 → verified、质量分≈66.2；门槛上调到 70 → FAIL_QUALITY_FLOOR
+        df, fund = make_df(pe=12., pb=1.2), make_fund(roe=(11, 12, 13))
+        sig, reason = ev(df, fund, m.StrategyConfig(USE_CACHE=False, MIN_QUALITY_SCORE=70))
+        self.assertIsNone(sig)
+        self.assertEqual(reason, "FAIL_QUALITY_FLOOR")
+
+    def test_missing_quality_not_rejected_by_floor(self):
+        # 年度质量数据缺失（质量分=0）：只判 verified 的门槛不得否决，仍降级 pending
+        sig, reason = ev(make_df(), {}, m.StrategyConfig(USE_CACHE=False))
+        self.assertEqual(reason, "PASS")
+        self.assertEqual(sig.tier, "pending")
+        self.assertEqual(sig.quality_status, "missing")
+
+    def test_low_tech_score_demoted_to_pending_not_rejected(self):
+        # 技术分 0 < 45：不否决（综合分≈51.2 已过下限），降为 pending 保留跟踪价值
+        sig, reason = ev(make_df(pe=12., pb=1.2), make_fund(roe=(11, 12, 13)),
+                         m.StrategyConfig(USE_CACHE=False))
+        self.assertEqual(reason, "PASS")
+        self.assertEqual(sig.tier, "pending")
+        self.assertEqual(sig.daily_score, 0.0)
+
+    def test_tech_floor_can_be_disabled(self):
+        sig, reason = ev(make_df(pe=12., pb=1.2), make_fund(roe=(11, 12, 13)),
+                         m.StrategyConfig(USE_CACHE=False, MIN_TECHNICAL_SCORE_FORMAL=0))
+        self.assertEqual(reason, "PASS")
+        self.assertEqual(sig.tier, "formal")
 
 
 class TestScoreFloorEquivalence(unittest.TestCase):
-    """把「MIN_QV_SCORE=60 的实际等效门槛」固化成可执行断言。
+    """把「MIN_QV_SCORE=50 相对硬闸门的等效门槛」固化成可执行断言。
 
-    背景：评分口径决定了「恰好压线达标」的公司拿不到 60 分——
+    背景：评分口径决定了「恰好压线达标」样本的分数锚点——
       · 质量分：_dimension_score 在阈值处恰好给 50 分；
       · 估值分（仅 PE）：行业口径在分位 0.60（闸门上限）处给 40 分；绝对口径在
         PE=MAX_PE_TTM（闸门上限）处**同样**给 40 分（锚点对齐，见 _valuation_pe_score）。
-    于是三道硬闸门全部恰好达标的公司，综合分上限两种口径都是 54.0，
-    都不足 60 —— 即本下限严格强于三道硬闸门之和，硬闸门的阈值形同虚设。
-    该算术此前只存在于口头约定，改动评分权重/闸门值就会静默失真，故在此锁死；
-    并直接校验随产品代码发布的 qv_floor_equivalence()，避免文档与实现漂移。
+    权重 0.45/0.30/0.25 下，压线合格者即便技术分满分，综合分上限也只有 59.5；
+    而 formal 候选的理论最低分（质量 50 + 估值 40 + 技术门槛 45）= 45.75。
+    默认下限 50 落在两者之间：不再是「严格强于硬闸门」（旧口径 60 > 上限 54），
+    而是**高于 formal 理论最低分**——能实际拦截「三项都仅勉强达标」的候选，
+    压线合格者须凭技术分（≥62）过线。改动评分权重/闸门值/下限都会使这些数字漂移，故在此锁死；
+    并直接校验随产品代码发布的 qv_floor_equivalence()/describe_qv_floor()，避免文档与实现漂移。
     """
 
     def test_quality_score_floor_for_verified_sample(self):
@@ -101,28 +147,43 @@ class TestScoreFloorEquivalence(unittest.TestCase):
         q = evaluate_annual_quality(rows, DAY, years=3)
         self.assertEqual(q["status"], "verified")
         self.assertAlmostEqual(q["quality_score"], 50.0, places=2)
-        # 对照：三年皆 10（看起来更"均匀"）也只有 56.25，同样远低于 60
+        # 对照：三年皆 10（看起来更"均匀"）也只有 56.25
         even = [dict(r, roe=10.0) for r in rows]
         self.assertAlmostEqual(evaluate_annual_quality(even, DAY, years=3)["quality_score"],
                                56.25, places=2)
 
-    def test_shipped_helper_reports_floor_stricter_than_gates(self):
+    def test_shipped_helper_reports_floor_between_formal_min_and_ceiling(self):
         cfg = m.StrategyConfig()
         e = m.qv_floor_equivalence(cfg)
+        self.assertAlmostEqual(e["floor"], 50.0, places=2)
         self.assertAlmostEqual(e["min_verified_quality"], 50.0, places=2)
         self.assertAlmostEqual(e["valuation_industry_at_cap"], 40.0, places=6)
         # 规则4：绝对口径压线处与行业口径锚定相同估值分（均为 40）
         self.assertAlmostEqual(e["valuation_absolute_at_cap"], 40.0, places=6)
-        # 压线合格者即便技术分满分，综合分上限也低于下限 —— 两种口径都过不了
+        # 压线合格者技术分满分时的综合分上限 = 0.45×50 + 0.30×40 + 0.25×100 = 59.5
         for key in ("ceiling_industry", "ceiling_absolute"):
-            self.assertLess(e[key], cfg.MIN_QV_SCORE, f"{key}={e[key]} 应低于下限")
-        self.assertAlmostEqual(e["ceiling_industry"], 54.0, places=2)
-        self.assertAlmostEqual(e["ceiling_absolute"], 54.0, places=2)
-        # 日志说明必须点出"严格强于硬闸门"这一结论，且随配置实时计算
-        self.assertIn("严格强于三道硬闸门", m.describe_qv_floor(cfg))
+            self.assertAlmostEqual(e[key], 59.5, places=2)
+        # 下限 50 落在 (formal 理论最低分 45.75, 压线上限 59.5) 之间：
+        # 能拦「三项均压线」的候选，但不再 100% 淘汰全部压线合格者
+        formal_min = (cfg.QUALITY_SCORE_WEIGHT * 50.0 + cfg.VALUATION_SCORE_WEIGHT * 40.0
+                      + cfg.TECHNICAL_SCORE_WEIGHT * cfg.MIN_TECHNICAL_SCORE_FORMAL)
+        self.assertAlmostEqual(formal_min, 45.75, places=2)
+        self.assertGreater(cfg.MIN_QV_SCORE, formal_min)
+        self.assertLess(cfg.MIN_QV_SCORE, e["ceiling_industry"])
+        # 日志说明必须随配置动态给出正确结论（当前口径：上限不低于下限）
+        desc = m.describe_qv_floor(cfg)
+        self.assertIn("不低于下限", desc)
+        self.assertNotIn("严格强于三道硬闸门", desc)
 
-    def test_implied_technical_requirement_matches_documented_table(self):
-        # 反解 0.5q + 0.35v + 0.15t ≥ 60 所需技术分，与配置注释/README 中的表格一致。
+    def test_describe_qv_floor_strict_branch_when_floor_above_ceiling(self):
+        # 下限抬到压线上限之上（如旧口径 60 > 59.5）时，结论必须切回「严格强于硬闸门」
+        cfg = m.StrategyConfig(MIN_QV_SCORE=60)
+        desc = m.describe_qv_floor(cfg)
+        self.assertIn("严格强于三道硬闸门", desc)
+        self.assertIn("不可达（需 >100）", desc)
+
+    def test_implied_technical_requirement_matches_documented_values(self):
+        # 反解 0.45q + 0.30v + 0.25t ≥ 50 所需技术分，与配置注释/README 口径一致。
         # 规则4后：行业/绝对口径压线处估值分均为 40（锚点对齐）。
         cfg = m.StrategyConfig()
 
@@ -130,12 +191,16 @@ class TestScoreFloorEquivalence(unittest.TestCase):
             return (cfg.MIN_QV_SCORE - cfg.QUALITY_SCORE_WEIGHT * quality_score
                     - cfg.VALUATION_SCORE_WEIGHT * valuation_score) / cfg.TECHNICAL_SCORE_WEIGHT
 
-        # 质量分=压线下限 50，估值分=40（两口径一致）：技术分要求不可达
-        self.assertGreater(required_tech(50, 40), 100.0)
-        # 质量分 70：需 73 左右
-        self.assertAlmostEqual(required_tech(70, 40), 73.33, places=1)
-        # 质量分 90：几乎无约束
-        self.assertAlmostEqual(required_tech(90, 40), 6.67, places=1)
+        # 质量分=压线下限 50，估值分=40（两口径一致）：技术分须 ≥62 才能过线
+        self.assertAlmostEqual(required_tech(50, 40), 62.0, places=1)
+        # 质量分 70：需 26
+        self.assertAlmostEqual(required_tech(70, 40), 26.0, places=1)
+        # 质量分 90：无需技术分（负值 → 无约束）
+        self.assertLessEqual(required_tech(90, 40), 0.0)
+        # 与随代码发布的 helper 数值一致
+        e = m.qv_floor_equivalence(cfg)
+        self.assertAlmostEqual(e["req_tech_industry"], required_tech(50, 40), places=1)
+        self.assertAlmostEqual(e["req_tech_absolute"], required_tech(50, 40), places=1)
 
 
 # ===========================================================================
@@ -327,7 +392,9 @@ class TestQualityValueMarketBrake(unittest.TestCase):
 
     def test_screen_pool_honors_max_picks_cap(self):
         # _screen_quality_pool 应按传入 max_picks 截取，而非恒用 config.MAX_PICKS
-        cfg = m.StrategyConfig(USE_CACHE=False, MAX_WORKERS=1, FETCH_DELAY=0, MAX_PICKS=5)
+        # MIN_TECHNICAL_SCORE_FORMAL=0：合成样本技术分为 0，隔离技术短板降级对本用例的干扰
+        cfg = m.StrategyConfig(USE_CACHE=False, MAX_WORKERS=1, FETCH_DELAY=0, MAX_PICKS=5,
+                               MIN_TECHNICAL_SCORE_FORMAL=0)
         stocks = [{"code": f"60000{i}", "name": f"工业{i}"} for i in range(1, 6)]
         with patch.object(m, "get_stock_list", return_value=stocks), \
              patch.object(m, "get_daily_data", return_value=make_df()), \

@@ -15,8 +15,8 @@ DAY = "2025-06-30"
 def prices(end=DAY):
     close = np.r_[np.linspace(20, 10, 250), np.linspace(10, 11, 50)]
     dates = pd.bdate_range(end=end, periods=len(close)).strftime("%Y-%m-%d")
-    # peTTM=8 / pbMRQ=0.9：让「合格」样本的综合分稳过生产默认下限 MIN_QV_SCORE=60
-    # （0.50×质量 + 0.35×估值 + 0.15×技术）。各估值/质量闸门测试会在末根覆盖这两个值，
+    # peTTM=8 / pbMRQ=0.9：让「合格」样本的综合分稳过生产默认下限 MIN_QV_SCORE=50
+    # （0.45×质量 + 0.30×估值 + 0.25×技术）。各估值/质量闸门测试会在末根覆盖这两个值，
     # 故基准取值不影响它们；这里只需保证「应当入选」的样本分数达标。
     return pd.DataFrame(dict(date=dates, open=close, high=close * 1.01,
                              low=close * .99, close=close, volume=1e7,
@@ -34,7 +34,11 @@ def fundamentals():
 
 class QualityRecommendations(unittest.TestCase):
     def setUp(self):
-        self.cfg = m.StrategyConfig(USE_CACHE=False)
+        # MIN_TECHNICAL_SCORE_FORMAL=0：隔离「技术分短板降级 pending」门槛（2026-09 后加入）。
+        # 本文件的合成行情样本技术分恒 0（无趋势转折/放量布尔命中），不隔离则所有
+        # 「应为 formal」的断言都会被该门槛降级；其自身行为由
+        # test_recommendation_upgrades.TestDimensionFloors 与 test_quality_value_hardening 覆盖。
+        self.cfg = m.StrategyConfig(USE_CACHE=False, MIN_TECHNICAL_SCORE_FORMAL=0)
         self.df = prices()
 
     def evaluate(self, df=None, fund=None, **kwargs):
@@ -121,8 +125,11 @@ class QualityRecommendations(unittest.TestCase):
 
     def test_both_strategies_share_eligibility_and_score(self):
         a, _ = self.evaluate()
+        # 与 self.cfg 同口径隔离技术短板门槛：evaluate_breakout 在 quality_value 模式下
+        # 委派 evaluate_quality_value，两条路径必须用相同配置才可比 tier
         b, reason = vb.evaluate_breakout(self.df, "600001", "工业企业",
-                                         vb.VolumeBreakoutConfig(USE_CACHE=False),
+                                         vb.VolumeBreakoutConfig(USE_CACHE=False,
+                                                                 MIN_TECHNICAL_SCORE_FORMAL=0),
                                          {"regime": "bear"}, fundamentals(), latest_trade_date=DAY)
         self.assertEqual(reason, "PASS")
         self.assertEqual((b.tier, b.score, b.position_250), (a.tier, a.score, a.position_250))

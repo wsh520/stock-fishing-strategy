@@ -36,8 +36,8 @@ CREATE TABLE IF NOT EXISTS stock_recommendation (
     rsi21            DECIMAL(5, 1)   NULL COMMENT 'RSI21',
     vol_ratio        DECIMAL(8, 2)   NULL COMMENT '量比（对20日均量）',
     turnover_ratio   DECIMAL(8, 2)   NULL COMMENT '换手比（展示用）',
-    stop_loss        DECIMAL(10, 3)  NULL COMMENT '止损价（2×ATR 或固定5%）',
-    take_profit      DECIMAL(10, 3)  NULL COMMENT '止盈价（固定10%）',
+    stop_loss        DECIMAL(10, 3)  NULL COMMENT '止损价（3×ATR 或固定15%）',
+    take_profit      DECIMAL(10, 3)  NULL COMMENT '止盈价（固定30%）',
     rr_ratio         DECIMAL(6, 2)   NULL COMMENT '风险收益比（仅展示，不参与否决）',
     market_env       VARCHAR(16)     NULL COMMENT '市场环境 bull/bear/neutral/unknown',
     has_divergence   TINYINT(1)      NOT NULL DEFAULT 0 COMMENT '是否底背离（双低点算法）1/0',
@@ -60,7 +60,8 @@ CREATE TABLE IF NOT EXISTS stock_recommendation (
 -- 周度追踪表：推荐后第5/10/15/20个市场交易日，允许60日内补跑。
 -- 目标日停牌/缺价不填充。holding_trade_days=NULL 的历史行不混入固定期限归因。
 -- 存量迁移由 _ensure_tracking_schema 自动执行：保留所有历史行及周号、日期、价格，
--- 同 rec_id+close_date 仅最早一行 legacy_duplicate=0，其他行标记为1。
+-- 同 rec_id+close_date 仅最早一行 legacy_duplicate=0，其他行标记为1；
+-- 并自动补 weekly_return_pct / monthly_return_pct 期收益率列（幂等）。
 -- 生成列将历史重复行映射NULL，既保留历史又约束所有正常新行同日唯一。
 -- 原 uk_rec_week 改为普通索引，避免历史错误周号占满额度；新期限由 uk_rec_horizon 保证唯一。
 -- 不要对存在历史重复的旧表直接增加 (rec_id, close_date) UNIQUE。
@@ -78,7 +79,9 @@ CREATE TABLE IF NOT EXISTS stock_tracking (
     unique_close_date DATE GENERATED ALWAYS AS (CASE WHEN legacy_duplicate = 0 THEN close_date ELSE NULL END) STORED,
     close_price   DECIMAL(10, 3)  NOT NULL COMMENT '目标交易日收盘价（元）',
     return_value  DECIMAL(10, 3)  NOT NULL COMMENT '收益值 = close_price - 推荐时收盘价（元）',
-    return_pct    DECIMAL(8, 3)   NOT NULL COMMENT '收益率 = return_value / 推荐时收盘价 × 100（%）',
+    return_pct    DECIMAL(8, 3)   NOT NULL COMMENT '累计收益率 = return_value / 推荐时收盘价 × 100（%）',
+    weekly_return_pct DECIMAL(8, 3) NULL COMMENT '周收益率 = (当日收盘价 - 5日前收盘价) / 5日前收盘价 × 100（%）',
+    monthly_return_pct DECIMAL(8, 3) NULL COMMENT '月收益率 = (当日收盘价 - 20日前收盘价) / 20日前收盘价 × 100（%）',
     created_at    DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '写入时间',
     PRIMARY KEY (id),
     KEY idx_rec_week (rec_id, week_no),

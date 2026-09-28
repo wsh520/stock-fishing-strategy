@@ -189,11 +189,13 @@ checks.append(("_range_position_ok 区间顶部否决", m._range_position_ok(m.c
 checks.append(("_macd_momentum_ok 基准放行", m._macd_momentum_ok(out_a, cfg) is True))
 checks.append(("_kdj_ok 基准放行", m._kdj_ok(out_a, cfg) is True))
 
-# MACD 动能：默认要求连续 2 日柱值递增（MACD_MOMENTUM_DAYS=2）
+# MACD 动能：默认要求连续 3 日柱值递增（MACD_MOMENTUM_DAYS=3，需 n+1=4 根柱值；不足放行）
 checks.append(("_macd_momentum_ok 连续改善放行",
-               m._macd_momentum_ok(pd.DataFrame({"macd_histogram": [-0.9, -0.5, -0.1]}), cfg) is True))
+               m._macd_momentum_ok(pd.DataFrame({"macd_histogram": [-1.2, -0.9, -0.5, -0.1]}), cfg) is True))
 checks.append(("_macd_momentum_ok 单日反抽后转弱否决",
-               m._macd_momentum_ok(pd.DataFrame({"macd_histogram": [-0.5, 0.35, 0.30]}), cfg) is False))
+               m._macd_momentum_ok(pd.DataFrame({"macd_histogram": [-0.9, -0.5, 0.35, 0.30]}), cfg) is False))
+checks.append(("_macd_momentum_ok 数据不足(≤n根)放行",
+               m._macd_momentum_ok(pd.DataFrame({"macd_histogram": [-0.5, 0.35, 0.30]}), cfg) is True))
 
 # MACD 动能恶化：反弹后再次大跌，MACD 柱当日走低
 _md = np.concatenate([np.linspace(20.0, 15.0, 110), [15.6, 15.6, 15.3]])

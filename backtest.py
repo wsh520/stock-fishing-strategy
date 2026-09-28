@@ -1468,10 +1468,10 @@ AB_VARIANTS: dict[str, dict[str, dict]] = {
         "qv_veto_d3": {"QV_ENFORCE_KDJ_MACD_VETO": True, "MACD_WEAK_DAYS": 3},
     },
     "technical": {
-        "baseline": {},                                            # MACD 连 2 日改善 + KDJ 金叉 K≤55 且 K 上行
+        "baseline": {},                                            # MACD 连 3 日改善 + KDJ 金叉 K≤55 且 K 上行
         "no_kdj": {"REQUIRE_KDJ_GOLDEN": False},                    # 完全关掉 KDJ 闸门
         "kdj_k70": {"KDJ_K_MAX": 70.0},                             # K 上限 55 → 70（放行更热的标的）
-        "macd_d1": {"MACD_MOMENTUM_DAYS": 1},                       # 连续改善 2 日 → 1 日（放行单日反抽）
+        "macd_d1": {"MACD_MOMENTUM_DAYS": 1},                       # 连续改善 3 日 → 1 日（放行单日反抽）
     },
 }
 

@@ -17,8 +17,10 @@ class MinimalQualityRepairs(unittest.TestCase):
 
     def test_industry_cheap_is_scored_using_industry(self):
         # 行业口径：PE 分位 0.2 → 估值分 80；PB=4（高于绝对上限 3.0）自本轮起不再否决
+        # MIN_TECHNICAL_SCORE_FORMAL=0：隔离技术短板降级（合成样本技术分恒 0）
         context = dict(mode='industry', pe_pct=.2, pb_pct=.2, peers=20)
-        sig, reason = ev(make_df(pe=30, pb=4), make_fund(), val_context=context)
+        cfg = m.StrategyConfig(USE_CACHE=False, MIN_TECHNICAL_SCORE_FORMAL=0)
+        sig, reason = ev(make_df(pe=30, pb=4), make_fund(), cfg, val_context=context)
         self.assertEqual(reason, 'PASS')
         self.assertEqual(sig.tier, 'formal')
         self.assertEqual(sig.valuation_score, 80)
@@ -40,7 +42,9 @@ class MinimalQualityRepairs(unittest.TestCase):
                 self.assertIn('forward', sig.missing_tags)
 
     def test_growth_escape_hatch_is_explicit(self):
-        cfg = m.StrategyConfig(USE_CACHE=False, FORWARD_MISSING_AS_PENDING=False)
+        # MIN_TECHNICAL_SCORE_FORMAL=0：隔离技术短板降级，本用例只验证成长缺失放行口径
+        cfg = m.StrategyConfig(USE_CACHE=False, FORWARD_MISSING_AS_PENDING=False,
+                               MIN_TECHNICAL_SCORE_FORMAL=0)
         sig, _ = ev(make_df(), make_fund(forward_ni_yoy=None), cfg)
         self.assertEqual(sig.tier, 'formal')
         self.assertIn('近期业绩待核验', sig.signals_hit)
