@@ -129,7 +129,10 @@ jobs:
 
       - name: Run bottom-fishing strategy
         env:
-          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+          # 按触发方式选飞书机器人：定时(schedule)=生产机器人 FEISHU_WEBHOOK_URL；
+          # GitHub 页面手动测试(workflow_dispatch)=测试机器人 FEISHU_WEBHOOK_URL_TEST，
+          # 避免白天反复测试的消息刷屏生产群。TEST 未配置时手动运行静默跳过通知。
+          FEISHU_WEBHOOK_URL: ${{ github.event_name == 'schedule' && secrets.FEISHU_WEBHOOK_URL || secrets.FEISHU_WEBHOOK_URL_TEST }}
           MYSQL_HOST: ${{ secrets.MYSQL_HOST }}
           MYSQL_PORT: ${{ secrets.MYSQL_PORT }}
           MYSQL_USER: ${{ secrets.MYSQL_USER }}
@@ -171,7 +174,10 @@ jobs:
       - name: Run breakout strategy
         if: always() && inputs.skip_breakout != true
         env:
-          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+          # 按触发方式选飞书机器人：定时(schedule)=生产机器人 FEISHU_WEBHOOK_URL；
+          # GitHub 页面手动测试(workflow_dispatch)=测试机器人 FEISHU_WEBHOOK_URL_TEST，
+          # 避免白天反复测试的消息刷屏生产群。TEST 未配置时手动运行静默跳过通知。
+          FEISHU_WEBHOOK_URL: ${{ github.event_name == 'schedule' && secrets.FEISHU_WEBHOOK_URL || secrets.FEISHU_WEBHOOK_URL_TEST }}
           MYSQL_HOST: ${{ secrets.MYSQL_HOST }}
           MYSQL_PORT: ${{ secrets.MYSQL_PORT }}
           MYSQL_USER: ${{ secrets.MYSQL_USER }}
