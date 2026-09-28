@@ -123,8 +123,8 @@ SORT_ASC = [False]
 # 长期为 0 的闸门＝对区分候选无贡献，是数据驱动瘦身的审计对象。新增否决码时同步登记。
 _QV_REASON_CODES = (
     "FAIL_DATA", "FAIL_STALE", "FAIL_LIQUIDITY", "FAIL_POSITION", "FAIL_VALUATION",
-    "FAIL_FUND", "FAIL_FORWARD", "FAIL_QV_SCORE", "FAIL_STABILIZATION",
-    "FAIL_VOLATILE",
+    "FAIL_FUND", "FAIL_FORWARD", "FAIL_QV_SCORE", "FAIL_QUALITY_FLOOR",
+    "FAIL_STABILIZATION", "FAIL_VOLATILE",
     "FAIL_HALT_GAP", "FAIL_MACD_WEAK", "FAIL_KDJ_HIGH", "ERROR",
 )
 
@@ -160,6 +160,13 @@ class StrategyConfig:
     CONSOLIDATION_DAYS_MIN: int = 30     # 开始加分的最低天数
     CONSOLIDATION_DAYS_MAX: int = 120    # 满分的天数上限
     CONSOLIDATION_BONUS: float = 5.0     # 最大加分值
+    # ===== 维度短板门槛（防止单维高分掩盖其他维度缺陷）=====
+    # 质量分低于此值 → FAIL_QUALITY_FLOOR 否决（差公司再便宜也不买）。
+    # 估值分可以很高（PE低），但如果质量不行就是价值陷阱。
+    MIN_QUALITY_SCORE: float = 50.0
+    # 技术分低于此值 → 降为 pending（底部未确认，观察但不正式推荐）。
+    # 不直接否决是因为基本面确实好的票值得跟踪，只是当前不是好的入场点。
+    MIN_TECHNICAL_SCORE_FORMAL: float = 45.0
     CSI300_AK_SYMBOL: str = "sh000300"  # Baostock 格式为 sh.000300
     MARKET_MA_PERIOD: int = 20
     MARKET_SLOPE_LOOKBACK: int = 4
@@ -3364,6 +3371,12 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
     score = round(config.QUALITY_SCORE_WEIGHT * quality_score +
                   config.VALUATION_SCORE_WEIGHT * valuation_score +
                   config.TECHNICAL_SCORE_WEIGHT * tech_score, 2)
+    # ===== 规则4b：质量分短板否决 =====
+    # 质量是根基：差公司再便宜也是价值陷阱。估值分可以很高（PE低），但如果
+    # 质量分低于门槛，说明基本面有硬伤，综合分被估值拉高是假象。
+    _min_quality = float(getattr(config, "MIN_QUALITY_SCORE", 0.0) or 0.0)
+    if _min_quality > 0 and quality_score < _min_quality:
+        return None, "FAIL_QUALITY_FLOOR"
     # ===== 规则5：近60日相对沪深300强度（排序微调，不设硬性准入线）=====
     rs = compute_relative_strength(df, index_df, config)
     # 排序微调：限制在 ±RS_WEIGHT 内，避免相对强度压倒财务质量、PE 估值与原有综合分。
@@ -3516,7 +3529,12 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
         has_divergence=bool(d.get("bottom_divergence", False)), signals_hit=",".join(tags),
         fund_status="verified" if quality["status"] == "verified" and debt is not None else "partial",
         weekly_status="not_required", missing_tags=",".join(dict.fromkeys(missing)),
-        tier="pending" if effective_missing else "formal", rank_score=rank_score,
+        # 技术分短板：低于门槛降为 pending（基本面好但入场时机未到，跟踪观察）
+        tier=("pending" if effective_missing
+              or (float(getattr(config, "MIN_TECHNICAL_SCORE_FORMAL", 0.0) or 0.0) > 0
+                  and tech_score < float(getattr(config, "MIN_TECHNICAL_SCORE_FORMAL", 0.0)))
+              else "formal"),
+        rank_score=rank_score,
         quality_score=quality_score, valuation_score=round(valuation_score, 2),
         position_250=round(position, 4), pe_ttm=pe, pb_mrq=pb,
         quality_status=quality["status"], relative_strength=rs, **brief), "PASS"
