@@ -3373,19 +3373,6 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
         # 线性映射：rs 在 [-30, +30] 百分点范围内映射到 [-rs_cap, +rs_cap]
         rs_adj = float(np.clip(rs / 30.0 * rs_cap, -rs_cap, rs_cap))
     rank_score = round(score + rs_adj, 3)
-    # ===== 规则6：横盘筑底加分（排序微调，不参与准入）=====
-    # 距250日低点天数越长，"下跌中继"概率越低。已在 assess_entry_timing 中算出
-    # days_since_low，这里直接复用 timing 结果，零额外取数。
-    _cons_bonus = 0.0
-    _days_low = timing.get("days_since_low")
-    _cb_max = float(getattr(config, "CONSOLIDATION_BONUS", 0.0) or 0.0)
-    if _cb_max > 0 and _days_low is not None:
-        _d_min = max(0, int(getattr(config, "CONSOLIDATION_DAYS_MIN", 30)))
-        _d_max = max(_d_min + 1, int(getattr(config, "CONSOLIDATION_DAYS_MAX", 120)))
-        if _days_low >= _d_min:
-            _progress = min(1.0, (_days_low - _d_min) / max(1, _d_max - _d_min))
-            _cons_bonus = round(_cb_max * _progress, 3)
-    rank_score = round(rank_score + _cons_bonus, 3)
     # 综合分下限（#3：宁缺毋滥）。低于 MIN_QV_SCORE 的候选不推荐——弱市自然收敛到少推/不推，
     # 不再「只要有票过硬闸门就凑满 MAX_PICKS」。设 0 关闭该闸门。
     # 仅对「将要成为正式推荐」（missing 为空）的候选生效：待核验候选的估值分因数据缺失被
@@ -3447,6 +3434,18 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
     # ===== P0：入场时机判读（左侧/右侧 + 是否仍在下跌）=====
     # 始终计算（止跌闸门与 P5 简报都要用）；SURFACE_TIMING_READ 只控制是否加标签/出简报。
     timing = assess_entry_timing(technical, config)
+    # ===== 规则6：横盘筑底加分（排序微调，不参与准入）=====
+    # 距250日低点天数越长，"下跌中继"概率越低。复用 timing 中已算出的 days_since_low。
+    _cons_bonus = 0.0
+    _days_low = timing.get("days_since_low")
+    _cb_max = float(getattr(config, "CONSOLIDATION_BONUS", 0.0) or 0.0)
+    if _cb_max > 0 and _days_low is not None:
+        _d_min = max(0, int(getattr(config, "CONSOLIDATION_DAYS_MIN", 30)))
+        _d_max = max(_d_min + 1, int(getattr(config, "CONSOLIDATION_DAYS_MAX", 120)))
+        if _days_low >= _d_min:
+            _progress = min(1.0, (_days_low - _d_min) / max(1, _d_max - _d_min))
+            _cons_bonus = round(_cb_max * _progress, 3)
+    rank_score = round(rank_score + _cons_bonus, 3)
     # ===== 规则1：止跌确认闸门（QV_STABILIZATION_GATE，全市场环境生效）=====
     # 正式推荐须满足以下条件之一：
     #   (a) 当日收盘价 ≥ MA20 **且** MA20 近 N 日斜率 ≥ 0（走平或上行才算有效站上）
