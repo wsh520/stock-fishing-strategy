@@ -68,7 +68,7 @@ def mk_fund(roe=(18, 20, 22), **extra):
 
 
 def ev(df=None, fund=None, cfg=None, regime="bull", val_context=None, index_df=None, **kw):
-    cfg = cfg or m.StrategyConfig(USE_CACHE=False)
+    cfg = cfg or m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False)
     return m.evaluate(mk_df(HEALTHY) if df is None else df, "600001", "工业企业", cfg,
                       {"regime": regime}, mk_fund() if fund is None else fund,
                       latest_trade_date=kw.get("latest_trade_date", DAY),
@@ -100,8 +100,8 @@ def idx_df(closes, end=DAY):
 # ===========================================================================
 class TestStabilizationGate(unittest.TestCase):
     def test_default_on_and_all_regimes_equivalent(self):
-        cfg = m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0, QV_ATR_GUARD=False)
-        self.assertTrue(m.StrategyConfig().QV_STABILIZATION_GATE)
+        cfg = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False, MIN_QV_SCORE=0, QV_ATR_GUARD=False)
+        self.assertTrue(m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", ).QV_STABILIZATION_GATE)
         # 未止跌形态在牛/中/熊/未知四种环境下口径一致
         for regime in ("bull", "neutral", "bear", "unknown"):
             with self.subTest(regime=regime):
@@ -110,7 +110,7 @@ class TestStabilizationGate(unittest.TestCase):
                 self.assertEqual(reason, "FAIL_STABILIZATION")
 
     def test_ma20_above_satisfies_gate(self):
-        cfg = m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0, QV_ATR_GUARD=False)
+        cfg = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False, MIN_QV_SCORE=0, QV_ATR_GUARD=False)
         sig, reason = ev(cfg=cfg)
         self.assertEqual(reason, "PASS")
         timing = m.assess_entry_timing(
@@ -119,7 +119,7 @@ class TestStabilizationGate(unittest.TestCase):
 
     def test_macd_improvement_satisfies_gate_without_ma20_or_ma60(self):
         # 不额外要求 MA60 站稳 / RSI 反弹 / KDJ 金叉：仅 MACD 柱连续改善即可确认止跌
-        cfg = m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0, QV_ATR_GUARD=False)
+        cfg = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False, MIN_QV_SCORE=0, QV_ATR_GUARD=False)
         df = mk_df(BELOW_MA20_MACD_UP)
         tech = m.compute_daily_signals(m._recompute_pct_chg(df.copy()), cfg)
         timing = m.assess_entry_timing(tech, cfg)
@@ -132,7 +132,7 @@ class TestStabilizationGate(unittest.TestCase):
 
     def test_insufficient_indicator_data_is_not_confirmation(self):
         # MA20 不可得（below_ma20=None）+ MACD 柱含 NaN → 「无法确认止跌」不得当作已确认
-        cfg = m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0, QV_ATR_GUARD=False)
+        cfg = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False, MIN_QV_SCORE=0, QV_ATR_GUARD=False)
         df = mk_df(BELOW_MA20_MACD_UP)
         tech = m.compute_daily_signals(m._recompute_pct_chg(df.copy()), cfg).copy()
         blank_timing = {"side": "unknown", "label": "时机未知", "below_ma20": None,
@@ -152,27 +152,27 @@ class TestStabilizationGate(unittest.TestCase):
         self.assertEqual(reason, "FAIL_STABILIZATION")
 
     def test_gate_can_be_switched_off_explicitly(self):
-        off = m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0, QV_STABILIZATION_GATE=False)
+        off = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False, MIN_QV_SCORE=0, QV_STABILIZATION_GATE=False)
         self.assertEqual(ev(mk_df(WEAK), cfg=off)[1], "PASS")
 
     def test_legacy_config_name_migrates_both_ways(self):
         # 构造时传入旧名
-        self.assertFalse(m.StrategyConfig(QV_BEAR_TIMING_GATE=False).QV_STABILIZATION_GATE)
-        self.assertTrue(m.StrategyConfig(QV_BEAR_TIMING_GATE=True).QV_STABILIZATION_GATE)
+        self.assertFalse(m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", QV_BEAR_TIMING_GATE=False).QV_STABILIZATION_GATE)
+        self.assertTrue(m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", QV_BEAR_TIMING_GATE=True).QV_STABILIZATION_GATE)
         # 构造后赋值旧名（写穿），否则旧脚本会静默失去作用、闸门意外保持开启
-        cfg = m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0)
+        cfg = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False, MIN_QV_SCORE=0)
         cfg.QV_BEAR_TIMING_GATE = False
         self.assertFalse(cfg.QV_STABILIZATION_GATE)
         self.assertEqual(ev(mk_df(WEAK), cfg=cfg)[1], "PASS")
         # 默认（未指定旧名）不被旧字段空值抹掉
-        self.assertTrue(m.StrategyConfig(QV_BEAR_TIMING_GATE=None).QV_STABILIZATION_GATE)
+        self.assertTrue(m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", QV_BEAR_TIMING_GATE=None).QV_STABILIZATION_GATE)
         # dataclasses.replace / asdict 往返同样保持语义
-        self.assertFalse(replace(m.StrategyConfig(), QV_BEAR_TIMING_GATE=False).QV_STABILIZATION_GATE)
+        self.assertFalse(replace(m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", ), QV_BEAR_TIMING_GATE=False).QV_STABILIZATION_GATE)
         from dataclasses import asdict
-        self.assertIsNone(asdict(m.StrategyConfig())["QV_BEAR_TIMING_GATE"])
+        self.assertIsNone(asdict(m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", ))["QV_BEAR_TIMING_GATE"])
 
     def test_breakout_config_inherits_and_defaults_on(self):
-        vbcfg = vb.VolumeBreakoutConfig(RECOMMENDATION_MODE="technical")
+        vbcfg = vb.VolumeBreakoutConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", RECOMMENDATION_MODE="technical")
         self.assertTrue(vbcfg.QV_STABILIZATION_GATE)
 
     def test_veto_reason_is_registered_in_funnel_attribution(self):
@@ -187,7 +187,7 @@ class TestStabilizationGate(unittest.TestCase):
 class TestQVATRGuard(unittest.TestCase):
     def _high_atr_tech(self):
         tech = m.compute_daily_signals(m._recompute_pct_chg(mk_df(HEALTHY).copy()),
-                                       m.StrategyConfig(USE_CACHE=False))
+                                       m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False))
         tech = tech.copy()
         # ATR 上限已从 3.33% 放宽到 10%（与 3×ATR 止损 + 30% 止盈的 RR≥2.0 对齐），
         # 样本须超过新上限才能触发否决
@@ -198,7 +198,7 @@ class TestQVATRGuard(unittest.TestCase):
         tech = self._high_atr_tech()
         volatile = []
         with patch.object(m, "compute_daily_signals", return_value=tech):
-            sig, reason = ev(cfg=m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0),
+            sig, reason = ev(cfg=m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False, MIN_QV_SCORE=0),
                              volatile_out=volatile)
         self.assertIsNone(sig)
         self.assertEqual(reason, "FAIL_VOLATILE")
@@ -208,14 +208,14 @@ class TestQVATRGuard(unittest.TestCase):
     def test_guard_can_be_disabled_for_compatibility(self):
         tech = self._high_atr_tech()
         with patch.object(m, "compute_daily_signals", return_value=tech):
-            sig, reason = ev(cfg=m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0,
+            sig, reason = ev(cfg=m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False, MIN_QV_SCORE=0,
                                                   QV_ATR_GUARD=False))
         self.assertEqual(reason, "PASS")
         self.assertIsNotNone(sig)
 
     def test_atr_exactly_at_limit_passes(self):
         tech = self._high_atr_tech()
-        cfg = m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0)
+        cfg = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False, MIN_QV_SCORE=0)
         tech.loc[tech.index[-1], "atr"] = (
             float(tech.iloc[-1]["close"]) * cfg.MAX_ATR_PCT / 100.0)
         with patch.object(m, "compute_daily_signals", return_value=tech):
@@ -227,7 +227,7 @@ class TestQVATRGuard(unittest.TestCase):
         tech = self._high_atr_tech()
         tech.loc[tech.index[-1], "atr"] = np.nan
         with patch.object(m, "compute_daily_signals", return_value=tech):
-            sig, reason = ev(cfg=m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0))
+            sig, reason = ev(cfg=m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False, MIN_QV_SCORE=0))
         self.assertIsNone(sig)
         self.assertEqual(reason, "FAIL_DATA")
 
@@ -237,7 +237,7 @@ class TestQVATRGuard(unittest.TestCase):
 # ===========================================================================
 class TestQVValuationDualGuard(unittest.TestCase):
     def setUp(self):
-        self.cfg = m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0,
+        self.cfg = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False, MIN_QV_SCORE=0,
                                     QV_VALUATION_DUAL_GUARD=True)
 
     def test_high_pb_is_rejected_when_dual_guard_enabled(self):
@@ -265,7 +265,7 @@ class TestQVAnnualContinuity(unittest.TestCase):
         fund = mk_fund()
         fund["annual_rows"][1]["net_profit"] = -10.0
         fund["annual_rows"][2]["operating_cashflow"] = 1000.0
-        cfg = m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0)
+        cfg = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False, MIN_QV_SCORE=0)
         sig, reason = ev(fund=fund, cfg=cfg)
         self.assertIsNone(sig)
         self.assertEqual(reason, "FAIL_FUND")
@@ -274,7 +274,7 @@ class TestQVAnnualContinuity(unittest.TestCase):
         fund = mk_fund()
         fund["annual_rows"][1]["net_profit"] = -10.0
         fund["annual_rows"][2]["operating_cashflow"] = 1000.0
-        cfg = m.StrategyConfig(
+        cfg = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy",
             USE_CACHE=False, MIN_QV_SCORE=0,
             QUALITY_REQUIRE_ANNUAL_NET_PROFIT_POSITIVE=False,
             QUALITY_REQUIRE_ANNUAL_CASHFLOW_POSITIVE=False)
@@ -288,7 +288,7 @@ class TestQVAnnualContinuity(unittest.TestCase):
 # ===========================================================================
 class TestForwardThreshold(unittest.TestCase):
     def setUp(self):
-        self.cfg = m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0)
+        self.cfg = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False, MIN_QV_SCORE=0)
 
     def test_boundary_exactly_minus_ten_passes(self):
         sig, reason = ev(fund=mk_fund(forward_ni_yoy=-10.0), cfg=self.cfg)
@@ -331,7 +331,7 @@ class TestForwardThreshold(unittest.TestCase):
 
     def test_growth_gate_not_applied_to_technical_breakout(self):
         # -90% 在 quality_value 是 FAIL_FORWARD；technical 放量突破路径不应因此改口径
-        vbcfg = vb.VolumeBreakoutConfig(USE_CACHE=False, RECOMMENDATION_MODE="technical")
+        vbcfg = vb.VolumeBreakoutConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False, RECOMMENDATION_MODE="technical")
         sig, reason = vb.evaluate_breakout(mk_df(HEALTHY), "600001", "工业企业", vbcfg,
                                            {"regime": "bull"}, mk_fund(forward_ni_yoy=-90.0),
                                            latest_trade_date=DAY)
@@ -345,7 +345,7 @@ class TestPePbResponsibilities(unittest.TestCase):
     def setUp(self):
         # MIN_TECHNICAL_SCORE_FORMAL=0：隔离「技术分短板降级 pending」门槛（2026-09 后加入，
         # 合成样本技术分恒 0 会被降级），本类只验证 PE/PB 职责划分
-        self.cfg = m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0,
+        self.cfg = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False, MIN_QV_SCORE=0,
                                     MIN_TECHNICAL_SCORE_FORMAL=0)
 
     def test_pe_over_absolute_cap_still_vetoed(self):
@@ -404,7 +404,7 @@ class TestPePbResponsibilities(unittest.TestCase):
 
     def test_technical_mode_pb_veto_unchanged(self):
         # technical 路径的 PB 绝对上限否决未被本轮改动影响
-        tcfg = m.StrategyConfig(USE_CACHE=False, RECOMMENDATION_MODE="technical")
+        tcfg = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False, RECOMMENDATION_MODE="technical")
         tech_fund = {"roe": 12.0, "debt_ratio": 45.0,
                      "goodwill_ratio": 3.0, "deducted_profit_ratio": 0.9}
         sig, reason = m.evaluate(mk_df(HEALTHY, pb=10.0), "600001", "工业企业", tcfg,
@@ -414,7 +414,7 @@ class TestPePbResponsibilities(unittest.TestCase):
     def test_industry_fallback_is_labeled_by_pe_availability(self):
         # PE 是唯一估值准入口径 → 「行业口径生效」以 pe_pct 可得为准：
         # 行业 PE 样本不足（仅 PB 分位可得）时实际回退绝对 PE 上限，必须标为 absolute。
-        cfg = m.StrategyConfig()
+        cfg = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", )
         thin_pe = {"工业": {"pe": np.array([8.0, 10.0, 12.0]),                    # < MIN_PEERS(5)
                             "pb": np.array([0.8, 1.0, 1.2, 1.4, 1.6, 1.8])}}
         ctx = m._industry_valuation_context(thin_pe, "工业", 12.0, 1.2, cfg)
@@ -435,7 +435,7 @@ class TestPePbResponsibilities(unittest.TestCase):
 # ===========================================================================
 class TestValuationScoring(unittest.TestCase):
     def setUp(self):
-        self.cfg = m.StrategyConfig(USE_CACHE=False)
+        self.cfg = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False)
 
     def test_anchor_alignment_at_admission_caps(self):
         cap_pct = self.cfg.VALUATION_INDUSTRY_PERCENTILE_MAX      # 0.60
@@ -463,14 +463,14 @@ class TestValuationScoring(unittest.TestCase):
 
     def test_pb_absent_from_valuation_score(self):
         # 同一 PE 下 PB 从 0.9 抬到 30，估值分不得变化（否则等于变相重建高 PB 硬否决）
-        cfg = m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0)
+        cfg = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False, MIN_QV_SCORE=0)
         a, _ = ev(mk_df(HEALTHY, pe=12.0, pb=0.9), cfg=cfg)
         b, _ = ev(mk_df(HEALTHY, pe=12.0, pb=30.0), cfg=cfg)
         self.assertAlmostEqual(a.valuation_score, b.valuation_score, places=6)
         self.assertNotIn("valuation_pb", a.missing_tags)
 
     def test_industry_and_absolute_capped_candidates_score_identically(self):
-        cfg = m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0)
+        cfg = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False, MIN_QV_SCORE=0)
         ctx = {"mode": "industry", "pe_pct": cfg.VALUATION_INDUSTRY_PERCENTILE_MAX,
                "pb_pct": 0.30, "peers": 12}
         ind, r1 = ev(mk_df(HEALTHY, pe=12.0, pb=0.9), cfg=cfg, val_context=ctx)
@@ -499,7 +499,7 @@ class TestValuationScoring(unittest.TestCase):
         self.assertEqual(self.cfg.MIN_QV_SCORE, 50.0)
         # 综合分低于下限的 formal 候选仍被否决（本轮不放松资格判定）：
         # ROE 10/10/10 + PE12 → 0.45×61.6 + 0.30×71.2 ≈ 49.1 < 50
-        cfg = m.StrategyConfig(USE_CACHE=False)     # 默认下限 50
+        cfg = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False, MIN_TECHNICAL_SCORE_FORMAL=0)     # 默认下限 50
         df, fund = mk_df(HEALTHY, pe=12.0, pb=1.2), mk_fund(roe=(10, 10, 10))
         sig, reason = ev(df, fund=fund, cfg=cfg)
         self.assertIsNone(sig)
@@ -511,7 +511,7 @@ class TestValuationScoring(unittest.TestCase):
 # ===========================================================================
 class TestRelativeStrength(unittest.TestCase):
     def setUp(self):
-        self.cfg = m.StrategyConfig(USE_CACHE=False)
+        self.cfg = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False)
 
     def test_aligned_returns_excess_return_in_points(self):
         # 起止日期完全对齐的简单构造：个股 +20%、指数 +5% → +15.0 个百分点
@@ -547,7 +547,7 @@ class TestRelativeStrength(unittest.TestCase):
     def test_missing_index_leaves_rank_score_neutral(self):
         # CONSOLIDATION_BONUS=0：隔离横盘筑底加分（另有 TestConsolidationBonus 覆盖），
         # 本用例只验证「指数缺失 → RS 中性、rank_score 不受 RS 影响」
-        cfg = m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0, CONSOLIDATION_BONUS=0)
+        cfg = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False, MIN_QV_SCORE=0, CONSOLIDATION_BONUS=0)
         with_none, _ = ev(cfg=cfg)                       # 无 index_df
         self.assertIsNone(with_none.relative_strength)
         self.assertAlmostEqual(with_none.rank_score, with_none.score, places=6)
@@ -556,7 +556,7 @@ class TestRelativeStrength(unittest.TestCase):
     def test_only_adjusts_sorting_within_bounded_weight(self):
         # MIN_TECHNICAL_SCORE_FORMAL=0 隔离技术短板降级；CONSOLIDATION_BONUS=0 隔离筑底加分，
         # 保证 rank_score 与 score 之差只来自 RS 微调（±RS_WEIGHT 有界）
-        cfg = m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0,
+        cfg = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False, MIN_QV_SCORE=0,
                                MIN_TECHNICAL_SCORE_FORMAL=0, CONSOLIDATION_BONUS=0)
         n = cfg.RS_LOOKBACK + 1
         # 指数大跌 → 个股相对强势（正贡献）；指数大涨 → 个股相对弱势（负贡献）
@@ -573,7 +573,7 @@ class TestRelativeStrength(unittest.TestCase):
 
     def test_relative_strength_cannot_bypass_score_floor(self):
         # 门槛判定用 score（不含相对强度/筑底加分）：明显强势也不能把 ≈49.1 分的候选救过 50 分下限
-        cfg = m.StrategyConfig(USE_CACHE=False)          # 默认下限 50
+        cfg = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False, MIN_TECHNICAL_SCORE_FORMAL=0)          # 默认下限 50
         n = cfg.RS_LOOKBACK + 1
         sig, reason = ev(mk_df(HEALTHY, pe=12.0, pb=1.2), fund=mk_fund(roe=(10, 10, 10)),
                          cfg=cfg, index_df=idx_df(np.linspace(100.0, 10.0, n)))
@@ -592,7 +592,7 @@ class TestRelativeStrength(unittest.TestCase):
         self.assertEqual(m._rank_signals(rows).iloc[0]["code"], "600001")
 
     def test_index_data_is_wired_through_production_entry(self):
-        cfg = m.StrategyConfig(USE_CACHE=False)
+        cfg = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False)
         index = idx_df(np.linspace(100.0, 101.0, 70))
         with patch.object(m, "_bs_login", return_value=True), patch.object(m, "_bs_logout"), \
              patch.object(m, "get_market_environment", return_value={"regime": "neutral"}), \
@@ -604,7 +604,7 @@ class TestRelativeStrength(unittest.TestCase):
     def test_screen_pool_forwards_index_to_evaluator(self):
         # 两阶段流程（先价格预筛、后补财务重估）都必须拿到同一份指数数据，
         # 否则相对强度在正式评估阶段会永远不可计算。
-        cfg = m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0, MAX_WORKERS=1, FETCH_DELAY=0)
+        cfg = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False, MIN_QV_SCORE=0, MAX_WORKERS=1, FETCH_DELAY=0)
         index = idx_df(np.linspace(100.0, 105.0, 70))
         volatile = []
         seen = []
@@ -629,7 +629,7 @@ class TestRelativeStrength(unittest.TestCase):
 
     def test_screen_pool_forwards_volatile_to_default_evaluator(self):
         """生产质量池必须把 ATR 观察池传给默认 evaluate，而不是只在单票调用时生效。"""
-        cfg = m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0,
+        cfg = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False, MIN_QV_SCORE=0,
                                MAX_WORKERS=1, FETCH_DELAY=0)
         volatile = []
         seen = []
@@ -660,7 +660,7 @@ class TestConsolidationBonus(unittest.TestCase):
 
     def test_days_since_low_earns_interpolated_bonus(self):
         # HEALTHY：250 日低点在末根前约 50 个交易日 → 加分 = 5×(50-30)/(120-30) ≈ 1.111
-        cfg = m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0)
+        cfg = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False, MIN_QV_SCORE=0)
         sig, _ = ev(cfg=cfg)                             # 无 index_df → RS 中性
         bonus = sig.rank_score - sig.score
         self.assertAlmostEqual(bonus, 5.0 * 20 / 90, places=2)
@@ -668,16 +668,16 @@ class TestConsolidationBonus(unittest.TestCase):
 
     def test_recent_low_earns_no_bonus(self):
         # BELOW_MA20_MACD_UP：低点就在末端（止跌由 MACD 连续改善确认）→ 不加分
-        cfg = m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0)
+        cfg = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False, MIN_QV_SCORE=0)
         sig, _ = ev(mk_df(BELOW_MA20_MACD_UP), cfg=cfg)
         self.assertAlmostEqual(sig.rank_score, sig.score, places=6)
 
     def test_bonus_can_be_disabled_and_does_not_change_eligibility(self):
-        base = m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0, CONSOLIDATION_BONUS=0)
+        base = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False, MIN_QV_SCORE=0, CONSOLIDATION_BONUS=0)
         sig, _ = ev(cfg=base)
         self.assertAlmostEqual(sig.rank_score, sig.score, places=6)
         # 加分不参与资格判定：开/关两种配置下 score 完全一致
-        on = m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0)
+        on = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False, MIN_QV_SCORE=0)
         sig_on, _ = ev(cfg=on)
         self.assertAlmostEqual(sig_on.score, sig.score, places=6)
 
@@ -687,7 +687,7 @@ class TestConsolidationBonus(unittest.TestCase):
 # ===========================================================================
 class TestQualityHardeningGuards(unittest.TestCase):
     def test_annual_profit_and_cashflow_guards_are_wired(self):
-        cfg = m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0)
+        cfg = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False, MIN_QV_SCORE=0)
         fund = mk_fund()
         fund["annual_rows"][1]["net_profit"] = -10.0
         fund["annual_rows"][1]["operating_cashflow"] = -10.0
@@ -695,7 +695,7 @@ class TestQualityHardeningGuards(unittest.TestCase):
         self.assertIsNone(sig)
         self.assertEqual(reason, "FAIL_FUND")
 
-        relaxed = m.StrategyConfig(
+        relaxed = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy",
             USE_CACHE=False, MIN_QV_SCORE=0,
             QUALITY_REQUIRE_ANNUAL_NET_PROFIT_POSITIVE=False,
             QUALITY_REQUIRE_ANNUAL_CASHFLOW_POSITIVE=False,
@@ -707,7 +707,7 @@ class TestQualityHardeningGuards(unittest.TestCase):
     def test_qv_atr_guard_can_be_disabled(self):
         # ATR 上限已放宽到 10%：把末端 5 根 K 线振幅拉宽（high ×1.30 / low ×0.85，
         # 非对称以保持 20 日区间位置 ≤0.5），使 ATR% 明确越过新上限
-        cfg = m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0, QV_ATR_GUARD=True)
+        cfg = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False, MIN_QV_SCORE=0, QV_ATR_GUARD=True)
         high_range = mk_df(HEALTHY)
         for i in range(-5, 0):
             high_range.loc[high_range.index[i], "high"] = high_range.iloc[i]["close"] * 1.30
@@ -716,7 +716,7 @@ class TestQualityHardeningGuards(unittest.TestCase):
         self.assertIsNone(sig)
         self.assertEqual(reason, "FAIL_VOLATILE")
 
-        relaxed = m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0, QV_ATR_GUARD=False)
+        relaxed = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False, MIN_QV_SCORE=0, QV_ATR_GUARD=False)
         sig, reason = ev(high_range, cfg=relaxed)
         self.assertIsNotNone(sig)
         self.assertEqual(reason, "PASS")
@@ -727,7 +727,7 @@ class TestQualityHardeningGuards(unittest.TestCase):
 # ===========================================================================
 class TestHaltGapOnQualityValue(unittest.TestCase):
     def test_gap_vetoed_on_quality_value_path(self):
-        cfg = m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0)
+        cfg = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False, MIN_QV_SCORE=0)
         base = mk_df(HEALTHY)
         self.assertEqual(ev(base, cfg=cfg)[1], "PASS")            # 前置条件：原序列可 PASS
         gapped = base.copy()
@@ -737,7 +737,7 @@ class TestHaltGapOnQualityValue(unittest.TestCase):
         self.assertEqual(reason, "FAIL_HALT_GAP")
 
     def test_long_holiday_not_misjudged(self):
-        cfg = m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0)
+        cfg = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False, MIN_QV_SCORE=0)
         base = mk_df(HEALTHY)
         for gap in (10, 7):                                       # 春节约 11 / 国庆约 8 天间隔
             with self.subTest(gap=gap):
@@ -749,18 +749,18 @@ class TestHaltGapOnQualityValue(unittest.TestCase):
         base = mk_df(HEALTHY)
         df = base.copy()
         df["date"] = dates_with_gap(len(df), gap_at=40, gap_days=40)
-        cfg = m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0, REQUIRE_NO_HALT_GAP=False)
+        cfg = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False, MIN_QV_SCORE=0, REQUIRE_NO_HALT_GAP=False)
         self.assertEqual(ev(df, cfg=cfg)[1], "PASS")
 
     def test_threshold_is_configurable(self):
         base = mk_df(HEALTHY)
         df = base.copy()
         df["date"] = dates_with_gap(len(df), gap_at=40, gap_days=40)
-        cfg = m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0, MAX_BAR_GAP_DAYS=60)
+        cfg = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False, MIN_QV_SCORE=0, MAX_BAR_GAP_DAYS=60)
         self.assertEqual(ev(df, cfg=cfg)[1], "PASS")
 
     def test_technical_path_behaviour_unchanged(self):
-        cfg = m.StrategyConfig(RECOMMENDATION_MODE="technical")
+        cfg = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", RECOMMENDATION_MODE="technical")
         base = mk_df(HEALTHY)
         gapped = base.copy()
         gapped["date"] = dates_with_gap(len(gapped), gap_at=40, gap_days=40)

@@ -40,7 +40,7 @@ def make_fund(roe=(18, 20, 22), **extra):
 
 
 def ev(df, fund, cfg=None, val_context=None, **kw):
-    cfg = cfg or m.StrategyConfig(USE_CACHE=False)
+    cfg = cfg or m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False)
     return m.evaluate(df, "600001", "工业企业", cfg, {"regime": "bear"}, fund,
                       latest_trade_date=kw.get("latest_trade_date", DAY), val_context=val_context)
 
@@ -53,35 +53,35 @@ class TestScoreFloor(unittest.TestCase):
         # ROE 10/10/10 + PE12/PB1.2 → 质量分≈61.6、估值分≈71.2、技术分 0
         # → 综合分≈49.1 < 50，无缺项（formal 候选）→ 默认下限 50 否决
         df, fund = make_df(pe=12., pb=1.2), make_fund(roe=(10, 10, 10))
-        sig, reason = ev(df, fund, m.StrategyConfig(USE_CACHE=False))  # MIN_QV_SCORE=50 默认
+        sig, reason = ev(df, fund, m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False, MIN_TECHNICAL_SCORE_FORMAL=0))  # MIN_QV_SCORE=50 默认
         self.assertIsNone(sig)
         self.assertEqual(reason, "FAIL_QV_SCORE")
 
     def test_floor_disabled_passes(self):
         df, fund = make_df(pe=12., pb=1.2), make_fund(roe=(11, 12, 13))
         # MIN_TECHNICAL_SCORE_FORMAL=0：隔离技术短板门槛（其行为由 TestDimensionFloors 覆盖）
-        sig, reason = ev(df, fund, m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0,
+        sig, reason = ev(df, fund, m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False, MIN_QV_SCORE=0,
                                                     MIN_TECHNICAL_SCORE_FORMAL=0))
         self.assertEqual(reason, "PASS")
         self.assertEqual(sig.tier, "formal")
 
     def test_high_score_passes_default_floor(self):
         # 综合分≈62.3 ≥ 默认下限 50；技术短板门槛置 0 隔离（本用例只验证综合分下限语义）
-        cfg = m.StrategyConfig(USE_CACHE=False, MIN_TECHNICAL_SCORE_FORMAL=0)
+        cfg = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False, MIN_TECHNICAL_SCORE_FORMAL=0)
         sig, reason = ev(make_df(), make_fund(), cfg)
         self.assertEqual(reason, "PASS")
         self.assertEqual(sig.tier, "formal")
-        self.assertGreaterEqual(sig.score, m.StrategyConfig().MIN_QV_SCORE)
+        self.assertGreaterEqual(sig.score, m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", ).MIN_QV_SCORE)
 
     def test_floor_not_applied_to_pending(self):
         # 缺 PE → 估值分记 0、综合分被人为压低；但属 pending，下限不应把它直接否决，
         # 否则「数据缺失」与「质量不够」两种语义被混为一谈。
         df = make_df()
         df.loc[df.index[-1], "peTTM"] = np.nan
-        sig, reason = ev(df, make_fund(), m.StrategyConfig(USE_CACHE=False))
+        sig, reason = ev(df, make_fund(), m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False))
         self.assertEqual(reason, "PASS")
         self.assertEqual(sig.tier, "pending")
-        self.assertLess(sig.score, m.StrategyConfig().MIN_QV_SCORE)
+        self.assertLess(sig.score, m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", ).MIN_QV_SCORE)
 
 
 class TestDimensionFloors(unittest.TestCase):
@@ -96,13 +96,13 @@ class TestDimensionFloors(unittest.TestCase):
     def test_verified_mediocre_quality_rejected_when_floor_raised(self):
         # ROE 11/12/13 → verified、质量分≈66.2；门槛上调到 70 → FAIL_QUALITY_FLOOR
         df, fund = make_df(pe=12., pb=1.2), make_fund(roe=(11, 12, 13))
-        sig, reason = ev(df, fund, m.StrategyConfig(USE_CACHE=False, MIN_QUALITY_SCORE=70))
+        sig, reason = ev(df, fund, m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False, MIN_QUALITY_SCORE=70))
         self.assertIsNone(sig)
         self.assertEqual(reason, "FAIL_QUALITY_FLOOR")
 
     def test_missing_quality_not_rejected_by_floor(self):
         # 年度质量数据缺失（质量分=0）：只判 verified 的门槛不得否决，仍降级 pending
-        sig, reason = ev(make_df(), {}, m.StrategyConfig(USE_CACHE=False))
+        sig, reason = ev(make_df(), {}, m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False))
         self.assertEqual(reason, "PASS")
         self.assertEqual(sig.tier, "pending")
         self.assertEqual(sig.quality_status, "missing")
@@ -110,14 +110,14 @@ class TestDimensionFloors(unittest.TestCase):
     def test_low_tech_score_demoted_to_pending_not_rejected(self):
         # 技术分 0 < 45：不否决（综合分≈51.2 已过下限），降为 pending 保留跟踪价值
         sig, reason = ev(make_df(pe=12., pb=1.2), make_fund(roe=(11, 12, 13)),
-                         m.StrategyConfig(USE_CACHE=False))
+                         m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False))
         self.assertEqual(reason, "PASS")
         self.assertEqual(sig.tier, "pending")
         self.assertEqual(sig.daily_score, 0.0)
 
     def test_tech_floor_can_be_disabled(self):
         sig, reason = ev(make_df(pe=12., pb=1.2), make_fund(roe=(11, 12, 13)),
-                         m.StrategyConfig(USE_CACHE=False, MIN_TECHNICAL_SCORE_FORMAL=0))
+                         m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False, MIN_TECHNICAL_SCORE_FORMAL=0))
         self.assertEqual(reason, "PASS")
         self.assertEqual(sig.tier, "formal")
 
@@ -153,7 +153,7 @@ class TestScoreFloorEquivalence(unittest.TestCase):
                                56.25, places=2)
 
     def test_shipped_helper_reports_floor_between_formal_min_and_ceiling(self):
-        cfg = m.StrategyConfig()
+        cfg = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", )
         e = m.qv_floor_equivalence(cfg)
         self.assertAlmostEqual(e["floor"], 50.0, places=2)
         self.assertAlmostEqual(e["min_verified_quality"], 50.0, places=2)
@@ -177,7 +177,7 @@ class TestScoreFloorEquivalence(unittest.TestCase):
 
     def test_describe_qv_floor_strict_branch_when_floor_above_ceiling(self):
         # 下限抬到压线上限之上（如旧口径 60 > 59.5）时，结论必须切回「严格强于硬闸门」
-        cfg = m.StrategyConfig(MIN_QV_SCORE=60)
+        cfg = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", MIN_QV_SCORE=60)
         desc = m.describe_qv_floor(cfg)
         self.assertIn("严格强于三道硬闸门", desc)
         self.assertIn("不可达（需 >100）", desc)
@@ -185,7 +185,7 @@ class TestScoreFloorEquivalence(unittest.TestCase):
     def test_implied_technical_requirement_matches_documented_values(self):
         # 反解 0.45q + 0.30v + 0.25t ≥ 50 所需技术分，与配置注释/README 口径一致。
         # 规则4后：行业/绝对口径压线处估值分均为 40（锚点对齐）。
-        cfg = m.StrategyConfig()
+        cfg = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", )
 
         def required_tech(quality_score, valuation_score):
             return (cfg.MIN_QV_SCORE - cfg.QUALITY_SCORE_WEIGHT * quality_score
@@ -212,37 +212,37 @@ class TestForwardConfirmation(unittest.TestCase):
         for yoy in (-55.0, -30.0, -10.01):
             with self.subTest(yoy=yoy):
                 sig, reason = ev(make_df(), make_fund(forward_ni_yoy=yoy),
-                                 m.StrategyConfig(USE_CACHE=False))
+                                 m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False))
                 self.assertIsNone(sig)
                 self.assertEqual(reason, "FAIL_FORWARD")
 
     def test_healthy_growth_passes_and_is_tagged(self):
         fund = make_fund(forward_ni_yoy=12.0)
-        sig, reason = ev(make_df(), fund, m.StrategyConfig(USE_CACHE=False))
+        sig, reason = ev(make_df(), fund, m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False))
         self.assertEqual(reason, "PASS")
         self.assertIn("2025Q1 净利同比+12%", sig.signals_hit)
 
     def test_missing_growth_pending_by_default(self):
-        sig, reason = ev(make_df(), make_fund(forward_ni_yoy=None), m.StrategyConfig(USE_CACHE=False))
+        sig, reason = ev(make_df(), make_fund(forward_ni_yoy=None), m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False))
         self.assertEqual(reason, "PASS")
         self.assertEqual(sig.tier, "pending")
 
     def test_missing_growth_pending_when_configured(self):
-        cfg = m.StrategyConfig(USE_CACHE=False, FORWARD_MISSING_AS_PENDING=True)
+        cfg = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False, FORWARD_MISSING_AS_PENDING=True)
         sig, reason = ev(make_df(), make_fund(forward_ni_yoy=None), cfg)
         self.assertEqual(reason, "PASS")
         self.assertEqual(sig.tier, "pending")
         self.assertIn("forward", sig.missing_tags)
 
     def test_gate_disabled_ignores_bad_growth(self):
-        cfg = m.StrategyConfig(USE_CACHE=False, REQUIRE_FORWARD_CONFIRMATION=False)
+        cfg = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False, REQUIRE_FORWARD_CONFIRMATION=False)
         sig, reason = ev(make_df(), make_fund(forward_ni_yoy=-90.0), cfg)
         self.assertEqual(reason, "PASS")
 
     def test_boundary_equal_to_threshold_passes(self):
         # 恰好等于阈值（-10）不算「低于」，应放行
         sig, reason = ev(make_df(), make_fund(forward_ni_yoy=-10.0),
-                         m.StrategyConfig(USE_CACHE=False))
+                         m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False))
         self.assertEqual(reason, "PASS")
 
 
@@ -259,11 +259,11 @@ class TestIndustryRelativeValuation(unittest.TestCase):
         self.assertIsNone(m._percentile_of(None, 10.))
 
     def test_context_fallbacks(self):
-        cfg = m.StrategyConfig(USE_CACHE=False)
+        cfg = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False)
         snap = {"银行": {"pe": np.sort(np.array([5., 6., 7., 8., 9., 10.])),
                          "pb": np.sort(np.array([.5, .6, .7, .8, .9, 1.0]))}}
         # 关闭 → None
-        off = m.StrategyConfig(USE_CACHE=False, USE_INDUSTRY_RELATIVE_VALUATION=False)
+        off = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False, USE_INDUSTRY_RELATIVE_VALUATION=False)
         self.assertIsNone(m._industry_valuation_context(snap, "银行", 8., .8, off))
         # 无快照 / 无行业 / 行业不在快照 → None
         self.assertIsNone(m._industry_valuation_context({}, "银行", 8., .8, cfg))
@@ -282,7 +282,7 @@ class TestIndustryRelativeValuation(unittest.TestCase):
         # PE=40（> 绝对上限 25）但行业内分位 0.30（便宜）→ 行业模式放行
         ctx = {"mode": "industry", "pe_pct": 0.30, "pb_pct": 0.40, "peers": 12}
         df = make_df(pe=40., pb=2.0)
-        sig, reason = ev(df, make_fund(), m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0),
+        sig, reason = ev(df, make_fund(), m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False, MIN_QV_SCORE=0),
                          val_context=ctx)
         self.assertEqual(reason, "PASS")
 
@@ -290,7 +290,7 @@ class TestIndustryRelativeValuation(unittest.TestCase):
         # PE=20（< 绝对上限 25）但行业内分位 0.90（贵）→ 行业模式否决
         ctx = {"mode": "industry", "pe_pct": 0.90, "pb_pct": 0.40, "peers": 12}
         df = make_df(pe=20., pb=1.5)
-        sig, reason = ev(df, make_fund(), m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0),
+        sig, reason = ev(df, make_fund(), m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False, MIN_QV_SCORE=0),
                          val_context=ctx)
         self.assertIsNone(sig)
         self.assertEqual(reason, "FAIL_VALUATION")
@@ -298,17 +298,17 @@ class TestIndustryRelativeValuation(unittest.TestCase):
     def test_absolute_fallback_without_context(self):
         # 无 val_context → 绝对阈值：PE=40 > 25 否决
         sig, reason = ev(make_df(pe=40., pb=2.0), make_fund(),
-                         m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0))
+                         m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False, MIN_QV_SCORE=0))
         self.assertEqual(reason, "FAIL_VALUATION")
 
     def test_negative_pe_still_vetoed_in_industry_mode(self):
         ctx = {"mode": "industry", "pe_pct": 0.10, "pb_pct": 0.10, "peers": 12}
         sig, reason = ev(make_df(pe=-5., pb=1.0), make_fund(),
-                         m.StrategyConfig(USE_CACHE=False, MIN_QV_SCORE=0), val_context=ctx)
+                         m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False, MIN_QV_SCORE=0), val_context=ctx)
         self.assertEqual(reason, "FAIL_VALUATION")
 
     def test_snapshot_build_and_empty_industry(self):
-        cfg = m.StrategyConfig(USE_CACHE=False, MAX_WORKERS=2)
+        cfg = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False, MAX_WORKERS=2)
         stocks = [{"code": f"60000{i}", "name": f"银行{i}"} for i in range(1, 7)]
         industry = {f"60000{i}": "银行" for i in range(1, 7)}
 
@@ -334,7 +334,7 @@ class TestIndustryRelativeValuation(unittest.TestCase):
 # ===========================================================================
 class TestBreakoutIndependence(unittest.TestCase):
     def test_technical_mode_does_not_delegate_to_quality_value(self):
-        cfg = vb.VolumeBreakoutConfig(USE_CACHE=False, RECOMMENDATION_MODE="technical")
+        cfg = vb.VolumeBreakoutConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False, RECOMMENDATION_MODE="technical")
         with patch.object(vb, "evaluate_quality_value",
                           side_effect=AssertionError("technical 模式不应委派 quality_value")):
             sig, reason = vb.evaluate_breakout(make_df(), "600001", "工业企业", cfg,
@@ -359,7 +359,7 @@ class TestQualityValueMarketBrake(unittest.TestCase):
         return pd.DataFrame({"date": dates, "close": closes})
 
     def test_crash_halt_blocks_quality_value(self):
-        cfg = m.StrategyConfig(USE_CACHE=False)
+        cfg = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False)
         crashing = self._index([100., 100., 100., 100., 100., 100., 90.])  # 近5日 -10%
         with patch.object(m, "_bs_login", return_value=True), patch.object(m, "_bs_logout"), \
              patch.object(m, "get_market_environment", return_value={"regime": "neutral"}), \
@@ -370,7 +370,7 @@ class TestQualityValueMarketBrake(unittest.TestCase):
         self.assertEqual(screen.call_count, 0)  # 熔断在筛选之前
 
     def test_bear_regime_contracts_max_picks(self):
-        cfg = m.StrategyConfig(USE_CACHE=False)
+        cfg = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False)
         flat = self._index([100.] * 7)  # 不触发熔断
         with patch.object(m, "_bs_login", return_value=True), patch.object(m, "_bs_logout"), \
              patch.object(m, "get_market_environment", return_value={"regime": "bear"}), \
@@ -381,7 +381,7 @@ class TestQualityValueMarketBrake(unittest.TestCase):
         self.assertEqual(screen.call_args.kwargs.get("max_picks"), cfg.BEAR_MAX_PICKS)
 
     def test_bull_regime_uses_full_max_picks(self):
-        cfg = m.StrategyConfig(USE_CACHE=False)
+        cfg = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False)
         flat = self._index([100.] * 7)
         with patch.object(m, "_bs_login", return_value=True), patch.object(m, "_bs_logout"), \
              patch.object(m, "get_market_environment", return_value={"regime": "bull"}), \
@@ -393,7 +393,7 @@ class TestQualityValueMarketBrake(unittest.TestCase):
     def test_screen_pool_honors_max_picks_cap(self):
         # _screen_quality_pool 应按传入 max_picks 截取，而非恒用 config.MAX_PICKS
         # MIN_TECHNICAL_SCORE_FORMAL=0：合成样本技术分为 0，隔离技术短板降级对本用例的干扰
-        cfg = m.StrategyConfig(USE_CACHE=False, MAX_WORKERS=1, FETCH_DELAY=0, MAX_PICKS=5,
+        cfg = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False, MAX_WORKERS=1, FETCH_DELAY=0, MAX_PICKS=5,
                                MIN_TECHNICAL_SCORE_FORMAL=0)
         stocks = [{"code": f"60000{i}", "name": f"工业{i}"} for i in range(1, 6)]
         with patch.object(m, "get_stock_list", return_value=stocks), \

@@ -102,7 +102,7 @@ class BreakoutVerificationTests(unittest.TestCase):
         self.assertEqual(int(out.loc[event, "breakout_level"]), 2)
         self.assertTrue(bool(out.loc[event + 1, "recent_failed_breakout"]))
 
-    def run_pipeline(self, funds=None, weeks=None, config=None, latest=DAY, crash=None, industries=None, filled=None):
+    def run_pipeline(self, funds=None, weeks=None, config=None, latest=DAY, crash=None, industries=None, filled=None, operating=None):
         funds = funds or {"000001": GOOD_FUND}
         config = config or self.config(MAX_PICKS=2, USE_INDUSTRY_DEDUP=False)
         stocks = [{"code": code, "name": "股票" + code} for code in funds]
@@ -120,6 +120,16 @@ class BreakoutVerificationTests(unittest.TestCase):
             }
             handles = {name: stack.enter_context(patch.object(vb, name, return_value=value))
                        for name, value in mocks.items()}
+            from src.recent_operating import evaluate_operating_trend
+            def enrich(code, fund, cfg, cache, as_of):
+                rows = [dict(report_date=f"{y}-03-31", available_date=f"{y}-04-20",
+                    revenue=1000., net_profit=100., deducted_profit=90., operating_cashflow=110.,
+                    gross_margin=30., net_margin=10.) for y in (2025, 2026)]
+                evidence = dict(evaluate_operating_trend(rows, as_of), code=code)
+                if operating is not None:
+                    evidence = operating(code, evidence)
+                return dict(fund or {}, operating_trend=evidence)
+            stack.enter_context(patch.object(vb, "enrich_recent_operating", side_effect=enrich))
             stack.enter_context(patch.object(vb, "run_concurrent_screen", side_effect=screen))
             stack.enter_context(patch.object(vb, "get_fundamentals", side_effect=lambda code, *_: funds[code]))
             stack.enter_context(patch.object(vb, "_fill_optional_fundamentals", side_effect=lambda code, fund, cfg: filled if filled is not None else fund))
@@ -190,6 +200,23 @@ class BreakoutVerificationTests(unittest.TestCase):
             result, pending = self.run_pipeline(funds=funds, industries=industries, config=config)
             self.assertEqual(result.code.tolist(), ["000002", "000005"])
             self.assertEqual([r["code"] for r in pending], ["000001"])
+
+    def test_recent_operating_finalization_blocks_promotion(self):
+        def weak(code, value):
+            return dict(value, status="weak", reasons=["net_profit_declining"])
+        def failed(code, value):
+            return dict(value, status="failed", reasons=["net_profit_severe_contraction"])
+        for transform, tag in [(weak, "operating_weak"),
+                               (lambda c, e: dict(e, status="missing"), "operating_trend"),
+                               (lambda c, e: dict(e, code="600999"), "operating_trend"),
+                               (lambda c, e: dict(e, available_date="2099-01-01"), "operating_trend")]:
+            result, pending = self.run_pipeline(operating=transform)
+            self.assertTrue(result.empty)
+            self.assertEqual(pending[0]["tier"], "pending")
+            self.assertIn(tag, pending[0]["missing_tags"])
+        result, pending = self.run_pipeline(operating=failed)
+        self.assertTrue(result.empty)
+        self.assertEqual(pending, [])
 
     def test_late_fund_fill_can_promote_or_reject(self):
         for filled, formal in [(GOOD_FUND, True), ({**GOOD_FUND, "roe": -100.}, False)]:

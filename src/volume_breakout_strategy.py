@@ -74,6 +74,7 @@ from src.bottom_fishing_strategy import (
     fetch_stats,
     get_daily_data,
     get_fundamentals,
+    enrich_recent_operating,
     get_market_environment,
     get_stock_list,
     has_halt_gap,
@@ -620,8 +621,6 @@ def evaluate_breakout(
     # 层 1：基本面防雷
     if not check_fundamentals(fund_data, config, code=code, name=name):
         return None, "FAIL_FUND"
-
-    # 层 2：数据 & 流动性
     if daily_df is None or daily_df.empty:
         return None, "FAIL_DATA"
     if "amount" in daily_df.columns and len(daily_df) >= 20:
@@ -803,10 +802,20 @@ def evaluate_breakout(
     _amt = pd.to_numeric(out["amount"], errors="coerce").tail(20).mean() if "amount" in out.columns else float("nan")
 
     fund_status, fund_tags = _fund_verify_state(fund_data)
+    from src.recent_operating import validated_operating_status, summarize_operating
+    op_status = "not_required"
+    operating = (fund_data or {}).get("operating_trend")
+    if config.REQUIRE_RECENT_OPERATING:
+        op_status = validated_operating_status(operating, code, day.strftime("%Y-%m-%d"))
+        if op_status == "failed":
+            return None, "FAIL_RECENT_FUNDAMENTAL"
+        if op_status != "verified":
+            fund_tags.append("operating_weak" if op_status == "weak" else "operating_trend")
     if latest_trade_date is None:
         fund_tags.append("market_date")
     sig = BreakoutSignal(
         tier="pending", fund_status=fund_status, weekly_status="unverified",
+        operating_status=op_status, operating_summary=summarize_operating(operating, op_status),
         missing_tags=",".join(fund_tags),
         code=code, name=name,
         date=pd.to_datetime(d_last["date"]).strftime("%Y-%m-%d"),
@@ -857,6 +866,9 @@ def describe_breakout(row: dict) -> str:
         f" | 日均额: {_fmt_cell(row.get('avg_amount'))}万"
         f" | 市场: {row.get('market_env') or '-'}",
     ]
+    lines.append("策略口径: 技术突破 + 基本面防雷 + 近期经营核验；评分为规则分，不代表成功概率")
+    if row.get("operating_summary"):
+        lines.append(f"近期经营: {row['operating_summary']}")
     lines.extend(describe_trade_plan(row))
     lines.extend(_breakout_brief_lines(row, lvl))
     return "\n".join(lines)
@@ -987,6 +999,7 @@ def main_breakout(
         stats = {
             "total": total, "error": 0, "fail_data": 0, "fail_liq": 0, "fail_halt": 0,
             "fail_fund": 0,
+            "fail_recent_fund": 0,
             "fail_breakout": 0, "fail_vol": 0, "fail_pattern": 0, "fail_trend": 0,
             "fail_fake": 0, "fail_chase": 0, "fail_rsi": 0, "fail_volatile": 0,
             "fail_tech": 0, "pass": 0,
@@ -1020,6 +1033,7 @@ def main_breakout(
                 logger.info("[通过] %s(%s) 评分 %.1f %s级 L%d 突破幅度 %.2f%%",
                             sig.name, sig.code, sig.score, sig.grade, sig.breakout_level, sig.breakout_margin)
             elif reason == "FAIL_FUND": stats["fail_fund"] += 1
+            elif reason == "FAIL_RECENT_FUNDAMENTAL": stats["fail_recent_fund"] += 1
             elif reason in ("FAIL_DATA", "FAIL_STALE"): stats["fail_data"] += 1
             elif reason == "FAIL_LIQUIDITY": stats["fail_liq"] += 1
             elif reason == "FAIL_HALT_GAP": stats["fail_halt"] += 1
@@ -1048,9 +1062,9 @@ def main_breakout(
         logger.info("2. 数据 & 流动性达标: %d 只 (数据缺失 %d, 僵尸股 %d, 停牌缺口 %d, 异常 %d)",
                     _pass_data,
                     stats["fail_data"], stats["fail_liq"], stats["fail_halt"], stats["error"])
-        logger.info("3. 基本面防雷通过: %d 只 (淘汰 %d)",
-                    _pass_data - stats["fail_fund"],
-                    stats["fail_fund"])
+        logger.info("3. 基本面防雷通过: %d 只 (硬伤淘汰 %d, 近期净利负增长 %d)",
+                    _pass_data - stats["fail_fund"] - stats["fail_recent_fund"],
+                    stats["fail_fund"], stats["fail_recent_fund"])
         # 各层通过数 = pass + 该层之后所有层的淘汰数（层序见 evaluate_breakout）：
         # 3.1 突破 → 3.2 量能 → 3.3 K线形态 → 3.4 平台 → 3.5 趋势 → 3.6 假突破
         # → 3.7 RSI → 3.8 KDJ/MACD 动能下限 → 4 波动率 → 5 评分定级
@@ -1118,11 +1132,28 @@ def main_breakout(
             missing = [] if latest is not None else ["market_date"]
             fund = get_fundamentals(code, cache, config)
             fund = _fill_optional_fundamentals(code, dict(fund or {}), config)
+            fund = enrich_recent_operating(code, fund, config, cache, as_of=str(row.get("date") or latest))
+            from src.recent_operating import validated_operating_status, summarize_operating
+            from src.bottom_fishing_strategy import _is_financial_stock
+            op_status = "not_required"
+            if config.REQUIRE_RECENT_OPERATING:
+                if _is_financial_stock(code, str(row["name"]), config):
+                    op_status = "missing"
+                    missing.append("financial_review")
+                else:
+                    op_status = validated_operating_status(fund.get("operating_trend"), code, row["date"])
+                    if op_status == "failed":
+                        logger.info("%s 终审近期经营恶化，取消推荐", code)
+                        continue
+                    if op_status != "verified":
+                        missing.append("operating_weak" if op_status == "weak" else "operating_trend")
+            row["operating_status"] = op_status
+            row["operating_summary"] = summarize_operating(fund.get("operating_trend"), op_status)
             if not check_fundamentals(fund, config, code=code, name=str(row["name"])):
                 continue
             row["fund_status"], fund_tags = _fund_verify_state(fund)
             missing.extend(fund_tags)
-            verified = row["fund_status"] == "verified" and latest is not None
+            verified = row["fund_status"] == "verified" and latest is not None and op_status in {"verified", "not_required"}
             row["weekly_status"] = "disabled"
             if weekly_enabled:
                 wk = _fetch_weekly_dual(code, config)

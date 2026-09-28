@@ -124,7 +124,7 @@ SORT_ASC = [False]
 _QV_REASON_CODES = (
     "FAIL_DATA", "FAIL_STALE", "FAIL_LIQUIDITY", "FAIL_POSITION", "FAIL_VALUATION",
     "FAIL_FUND", "FAIL_FORWARD", "FAIL_QV_SCORE", "FAIL_QUALITY_FLOOR",
-    "FAIL_STABILIZATION", "FAIL_VOLATILE",
+    "FAIL_STABILIZATION", "FAIL_VOLATILE", "FAIL_RECENT_FUNDAMENTAL",
     "FAIL_HALT_GAP", "FAIL_MACD_WEAK", "FAIL_KDJ_HIGH", "ERROR",
 )
 
@@ -241,6 +241,7 @@ class StrategyConfig:
     # 同比 < FORWARD_NI_YOY_MIN（%）判为当年明显恶化 → FAIL_FORWARD 否决。
     # 恰好等于阈值不触发否决（严格小于才否决）。
     # 数据缺失或报告期过旧默认降级为待核验，不把未确认的近期业绩视为通过。
+    # 兼容单项前瞻：仅 REQUIRE_RECENT_OPERATING=False 时参与质量策略资格。
     REQUIRE_FORWARD_CONFIRMATION: bool = True
     FORWARD_NI_YOY_MIN: float = -10.0
     # 成长数据缺失（AkShare 兜底日 / 离线环境 / 该接口无返回）时是否降级为待核验。
@@ -252,8 +253,15 @@ class StrategyConfig:
     # 硬否决线已收紧至 -10%，黄标覆盖 [-10%, 0%) 即「未触发硬否决但当年利润为负增长」。
     # 设为 ≤ FORWARD_NI_YOY_MIN 可关闭黄标（此时只有触发硬否决才提示）。
     FORWARD_NI_YOY_WARN: float = 0.0
+    # 已核验的近期净利同比为负时降为待核验，避免历史优秀掩盖当前恶化。
+    FORWARD_NEGATIVE_AS_PENDING: bool = True
+    # 近期经营趋势（新浪合并财务摘要，含公告日）：收入/净利/扣非/现金流/毛利率/净利率同期比较。
+    # verified 才能进入正式推荐；weak/missing 降为 pending，failed 直接拒绝。
+    REQUIRE_RECENT_OPERATING: bool = True
+    RECENT_OPERATING_PROFIT_YOY_MIN: float = -10.0
+    RECENT_OPERATING_GROSS_MARGIN_DROP_MAX: float = 3.0
+    RECENT_OPERATING_NET_MARGIN_DROP_MAX: float = 2.0
 
-    # ===== 综合分下限（#3：宁缺毋滥）=====
     # quality_value 综合分 = 0.45×质量 + 0.30×估值 + 0.25×技术（0~100）。
     # 综合分 < MIN_QV_SCORE 的候选直接否决（FAIL_QV_SCORE），弱市自然收敛到少推/不推。
     # 设 0 关闭该闸门。
@@ -297,6 +305,12 @@ class StrategyConfig:
     # MA20 斜率回看天数：计算 MA20 近 N 日的变化率，≥0 才算"走平或上行"。
     # 5 日约一周，足够区分"MA20 拐头"与"单日噪声"。
     STABILIZATION_MA20_SLOPE_DAYS: int = 5
+    # MACD路径还需近N日不再创新低，减少下跌中继反抽误判。
+    STABILIZATION_NO_NEW_LOW_LOOKBACK: int = 5
+    STABILIZATION_PRIOR_LOW_LOOKBACK: int = 20
+    CONSOLIDATION_WINDOW: int = 20
+    CONSOLIDATION_RANGE_MAX: float = 0.12
+    CONSOLIDATION_CLOSE_DISPERSION_MAX: float = 0.04
     # deprecated：旧配置名，仅为向后兼容保留。构造时传入、或构造后赋值（写穿）均会
     # 覆盖 QV_STABILIZATION_GATE；保持 None 表示「未指定」，不抹掉新配置项的值。
     QV_BEAR_TIMING_GATE: Optional[bool] = None
@@ -491,8 +505,12 @@ class StrategyConfig:
     WEEKLY_REQUIRE_CLOSED_BAR: bool = True
 
     # 趋势转折（MA5拐头 或 EMA金叉，同源信号合并计分，避免右侧拐点同日触发导致分数通胀）
+    DAILY_SCORING_MODE: str = "grouped"  # grouped 或 legacy；旧权重自定义自动兼容
     W_DAILY_TREND_TURN: float = 40.0
+    # 保留旧字段以兼容外部配置；实际评分由 W_DAILY_MOMENTUM_GROUP 统一封顶。
     W_DAILY_RSI_REBOUND: float = 25.0
+    # 动能组独立封顶，避免 RSI/MACD/KDJ 同时改善时重复奖励。
+    W_DAILY_MOMENTUM_GROUP: float = 30.0
     # 量价质量分：基础条件（上涨+适度放量）之上按 收盘位置/实体方向/上影线占比 分三档，
     # 冲高回落只降分不否决（满分档须为阳线、收盘位于日内区间上部、上影线占比小）
     W_DAILY_VOL_PRICE: float = 25.0        # 满分档：放量企稳（阳线收高位、短上影）
@@ -934,6 +952,40 @@ def _quarter_candidates(now: datetime, n: int = 4) -> list[tuple[int, int]]:
     return out
 
 
+def validate_forward_growth(fund_data: Optional[dict], decision_day: str,
+                            config: StrategyConfig) -> tuple[str, Optional[float]]:
+    """Validate the latest growth observation against the decision date.
+
+    Returns ``("verified"|"missing"|"stale", yoy)``.  A value is verified only
+    when its report period is one of the currently disclosed quarters, its
+    period end is not after the decision day, and the numeric YOY value is
+    finite.  The helper deliberately does not treat a missing/stale value as
+    healthy; callers decide whether that becomes pending or a hard failure.
+    """
+    if not getattr(config, "REQUIRE_FORWARD_CONFIRMATION", False):
+        return "disabled", None
+    fund = fund_data or {}
+    try:
+        yoy = float(fund.get("forward_ni_yoy"))
+        if not np.isfinite(yoy):
+            raise ValueError
+    except (TypeError, ValueError):
+        return "missing", None
+    period = str(fund.get("forward_stat_date") or "")
+    try:
+        decision = datetime.strptime(str(decision_day)[:10], _DATE_FMT)
+        candidates = _quarter_candidates(decision, n=1)
+        year_text, quarter_text = period.split("Q")
+        year, quarter = int(year_text), int(quarter_text)
+        period_end = pd.Timestamp(year=year, month=quarter * 3, day=1) + pd.offsets.MonthEnd(0)
+        expected_year, expected_quarter = candidates[0]
+        if decision.month < 5:
+            expected_quarter = 3
+        valid = (1 <= quarter <= 4 and (year, quarter) >= (expected_year, expected_quarter)
+                 and period_end.date() <= decision.date())
+    except (ValueError, TypeError, OverflowError):
+        valid = False
+    return ("verified", yoy) if valid else ("stale", None)
 def _annualize_roe(roe_ytd: float, quarter: int) -> float:
     """把年初至今累计 ROE 线性年化为全年口径，与 MIN_ROE（年化阈值）可比。
 
@@ -1827,12 +1879,37 @@ def compute_daily_signals(df: pd.DataFrame, config: StrategyConfig) -> Optional[
     out["vol_price_quality"], out["vol_price_label"] = _vol_price_quality(out, config)
     out["multi_resonance"] = out["rsi_multi_res"] & out["macd_golden_cross"] & out["vol_price_coord"]
 
-    out["daily_score"] = (
-        out["trend_turn"].astype(float) * config.W_DAILY_TREND_TURN +
-        out["rsi_rebound"].astype(float) * config.W_DAILY_RSI_REBOUND +
-        out["vol_price_quality"].astype(float) +
-        out["multi_resonance"].astype(float) * config.DAILY_MULTI_RESONANCE_BONUS
-    ).fillna(0).clip(0, 100).round(1)
+    # 默认评分采用三个证据组，封顶100分：趋势40、动能30、量价30。
+    # 动能组内 RSI/MACD/KDJ 取最高证据，避免同一轮反弹重复加分；多周期共振
+    # 不再另行加分。旧配置若显式改过旧字段，则进入兼容公式，避免配置静默失效。
+    _mode = str(config.DAILY_SCORING_MODE)
+    if _mode not in {"grouped", "legacy"}:
+        raise ValueError("DAILY_SCORING_MODE must be grouped or legacy")
+    _legacy_scoring = _mode == "legacy" or any([
+        config.W_DAILY_TREND_TURN != 40.0,
+        config.W_DAILY_RSI_REBOUND != 25.0,
+        config.DAILY_MULTI_RESONANCE_BONUS != 10.0,
+        config.W_DAILY_VOL_PRICE != 25.0,
+    ])
+    if _legacy_scoring:
+        out["momentum_group_score"] = out["rsi_rebound"].astype(float) * config.W_DAILY_RSI_REBOUND
+        out["daily_score"] = (
+            out["trend_turn"].astype(float) * config.W_DAILY_TREND_TURN
+            + out["momentum_group_score"] + out["vol_price_quality"].astype(float)
+            + out["multi_resonance"].astype(float) * config.DAILY_MULTI_RESONANCE_BONUS
+        ).fillna(0).clip(0, 100).round(1)
+    else:
+        trend_group = out["trend_turn"].astype(float) * 40.0
+        momentum_group = np.maximum.reduce([
+            out["rsi_rebound"].astype(float).to_numpy(),
+            out["macd_golden_cross"].astype(float).to_numpy(),
+            out["rsi_multi_res"].astype(float).to_numpy(),
+            ((out["kdj_k"] > out["kdj_d"]) & (out["kdj_k"] < 80)).astype(float).to_numpy(),
+        ])
+        out["momentum_group_score"] = pd.Series(momentum_group * config.W_DAILY_MOMENTUM_GROUP, index=out.index)
+        # vol_price_quality 的默认满分为25，归一化后映射到量价组30分。
+        volume_group = out["vol_price_quality"].astype(float).clip(lower=0) / 25.0 * 30.0
+        out["daily_score"] = (trend_group + out["momentum_group_score"] + volume_group).fillna(0).clip(0, 100).round(1)
 
     return out
 
@@ -1914,7 +1991,9 @@ _MISSING_TAG_ZH = {
     "financial_review": "金融企业待专项核验",
     "valuation": "估值缺失", "pct_chg": "涨幅数据缺失", "gap": "开盘价缺失",
     "macd_mom": "MACD柱数据缺失", "kdj": "KDJ数据缺失",
-    "forward": "当年成长未核验", "valuation_industry": "行业估值样本不足",
+    "operating_trend": "近期经营证据未核验", "operating_weak": "近期经营走弱·观察",
+    "stabilization_weak": "止跌弱确认·观察", "technical_weak": "技术证据不足·观察",
+    "forward": "当年成长未核验", "forward_negative": "近期净利负增长待核验", "valuation_industry": "行业估值样本不足",
 }
 
 def _missing_tags_zh(tags: str) -> str:
@@ -1957,12 +2036,15 @@ def describe(row: dict) -> str:
     if row.get("weekly_status") == "not_required":
         lines = [
             f"**{row.get('name', '')} {row.get('code', '')}** · 正式推荐 · 优质低估低位",
-            f"综合分: {_fmt_cell(row.get('score'))} | 质量分: {_fmt_cell(row.get('quality_score'))}"
+            f"综合规则分: {_fmt_cell(row.get('score'))} | 质量分: {_fmt_cell(row.get('quality_score'))}"
             f" | 估值分: {_fmt_cell(row.get('valuation_score'))} | 技术分: {_fmt_cell(row.get('daily_score'))}",
             f"收盘: {_fmt_cell(row.get('close'))} | PE: {_fmt_cell(row.get('pe_ttm'))}"
             f" | PB: {_fmt_cell(row.get('pb_mrq'))} | 250日区间位置: {float(row.get('position_250', 0)):.1%}",
             f"入选依据: {row.get('signals_hit', '')}",
         ]
+        lines.append(f"排序分: {_fmt_cell(row.get('rank_score'))}（规则排序，不代表成功概率）")
+        if row.get("operating_summary"):
+            lines.append(f"近期经营: {row['operating_summary']}")
         lines.extend(describe_trade_plan(row))
         lines.append(
             f"核验: {_FUND_STATUS_ZH.get(str(row.get('fund_status')), '待核验')}"
@@ -2130,6 +2212,10 @@ class Signal:
     pe_ttm: Optional[float] = None
     pb_mrq: Optional[float] = None
     quality_status: str = "missing"
+    operating_status: str = "not_required"
+    operating_summary: str = ""
+    stabilization_level: str = "not_required"
+    bottom_structure: bool = False
     # ===== P5：决策简报（纯展示，供人工裁量；不落库、不参与排序/否决/追踪）=====
     # 交易按实际情况人工判断，故把「看多理由 / 主要风险 / 失效价 / 信心分档 / 今日为何触发」
     # 结构化成简报，让推荐从「一个代码」升级为「一份可复核的研究摘要」。
@@ -2585,6 +2671,9 @@ def evaluate(daily_df: Optional[pd.DataFrame], code: str = "", name: str = "", c
     min_grade = config.MIN_PASS_GRADE if config.MIN_PASS_GRADE in _GRADE_ORDER else "B"
     grade_floor = {"A": config.GRADE_A, "B": config.GRADE_B, "C": config.GRADE_C, "D": 0.0}[min_grade]
     required_score = grade_floor + (config.BEAR_GRADE_BOOST if regime == "bear" else 0.0)
+    slope = _num_or_none(d_last.get("ma20_slope"))
+    if slope is not None and slope < config.MA20_TREND_MIN_SLOPE and not has_div:
+        return None, "FAIL_TECH"
     if daily_score < required_score:
         return None, "FAIL_TECH"
 
@@ -2650,6 +2739,46 @@ def enrich_annual_fundamentals(code: str, fund_data: Optional[dict], config: Str
     result["annual_rows"] = rows
     if path and rows:
         _write_cache_json({"annual_rows": rows}, path)
+    return result
+
+
+def enrich_recent_operating(code: str, fund_data: Optional[dict], config: StrategyConfig,
+                            cache: Optional[CacheManager], as_of: str) -> dict:
+    """Attach same-source recent operating evidence to fundamental data.
+
+    Cache keys include the decision date so a newly disclosed report cannot be
+    hidden by an older run. Fetch errors remain ``missing`` and therefore cause
+    pending status under the default policy.
+    """
+    result = dict(fund_data or {})
+    if not getattr(config, "REQUIRE_RECENT_OPERATING", True):
+        return result
+    key = (f"recent_operating_{str(code).zfill(6)}_{str(as_of)[:10]}_"
+           f"{float(getattr(config, 'RECENT_OPERATING_PROFIT_YOY_MIN', -10.0))!r}_"
+           f"{float(getattr(config, 'RECENT_OPERATING_GROSS_MARGIN_DROP_MAX', 3.0))!r}_"
+           f"{float(getattr(config, 'RECENT_OPERATING_NET_MARGIN_DROP_MAX', 2.0))!r}")
+    evidence = cache.get(key) if cache is not None else None
+    if isinstance(evidence, dict) and (str(evidence.get("code") or "").zfill(6) != str(code).zfill(6)
+                                       or str(evidence.get("as_of") or "")[:10] != str(as_of)[:10]):
+        evidence = None
+    if evidence is None:
+        try:
+            from src.recent_operating import fetch_operating_trend
+            evidence = fetch_operating_trend(
+                str(code).zfill(6), str(as_of)[:10],
+                profit_yoy_min=float(getattr(config, "RECENT_OPERATING_PROFIT_YOY_MIN", -10.0)),
+                gross_margin_drop_max=float(getattr(config, "RECENT_OPERATING_GROSS_MARGIN_DROP_MAX", 3.0)),
+                net_margin_drop_max=float(getattr(config, "RECENT_OPERATING_NET_MARGIN_DROP_MAX", 2.0)))
+        except Exception as exc:
+            evidence = {"status": "missing", "missing_tags": ["operating_fetch_error"],
+                        "reasons": [type(exc).__name__]}
+        if isinstance(evidence, dict):
+            evidence = dict(evidence)
+            evidence.setdefault("code", str(code).zfill(6))
+            evidence.setdefault("as_of", str(as_of)[:10])
+        if cache is not None:
+            cache.set(key, evidence)
+    result["operating_trend"] = evidence
     return result
 
 
@@ -3027,6 +3156,23 @@ def describe_qv_floor(config: StrategyConfig) -> str:
     )
 
 
+def bottom_structure_confirmed(technical: pd.DataFrame, config: StrategyConfig) -> bool:
+    """Recent range contracts, lows stop moving down, and closes form a tight base."""
+    n = max(5, int(config.CONSOLIDATION_WINDOW))
+    if technical is None or len(technical) < 2 * n or not {"high", "low", "close"}.issubset(technical):
+        return False
+    values = technical[["high", "low", "close"]].tail(2 * n).apply(pd.to_numeric, errors="coerce")
+    if not np.isfinite(values.to_numpy()).all() or (values <= 0).any().any():
+        return False
+    prior, recent = values.iloc[:n], values.iloc[n:]
+    width = recent["high"].max() / recent["low"].min() - 1
+    prior_width = prior["high"].max() / prior["low"].min() - 1
+    dispersion = recent["close"].std(ddof=0) / recent["close"].mean()
+    return bool(recent["low"].min() >= prior["low"].min()
+                and width <= min(prior_width, config.CONSOLIDATION_RANGE_MAX)
+                and dispersion <= config.CONSOLIDATION_CLOSE_DISPERSION_MAX)
+
+
 def assess_entry_timing(technical: pd.DataFrame, config: StrategyConfig) -> dict:
     """入场时机判读（P0）：为 quality_value 推荐补上「左侧/右侧 + 是否仍在下跌」的择时读数。
 
@@ -3313,7 +3459,16 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
             return None, "FAIL_VALUATION"
     fund = fund_data or {}
     debt = finite(fund.get("debt_ratio"))
+    from src.recent_operating import validated_operating_status, summarize_operating
+    operating = fund.get("operating_trend")
     financial = _is_financial_stock(code, name, config)
+    op_status = "not_required"
+    if getattr(config, "REQUIRE_RECENT_OPERATING", True) and not financial:
+        op_status = validated_operating_status(operating, code, day)
+        if op_status == "failed":
+            return None, "FAIL_RECENT_FUNDAMENTAL"
+        if op_status != "verified":
+            missing.append("operating_weak" if op_status == "weak" else "operating_trend")
     debt_limit = config.FINANCE_MAX_DEBT_RATIO if financial else config.MAX_DEBT_RATIO
     if debt is None:
         missing.append("fund_debt")
@@ -3337,28 +3492,19 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
         missing.append("fund_annual")
     # 最近应披露季度的同比核验；缺失、报告期过旧或晚于决策日均不算已确认。
     forward_verified = False
-    if getattr(config, "REQUIRE_FORWARD_CONFIRMATION", False) and not financial:
-        ni_yoy = finite(fund.get("forward_ni_yoy"))
-        period = str(fund.get("forward_stat_date") or "")
-        decision = datetime.strptime(day, _DATE_FMT)
-        expected_year, expected_quarter = _quarter_candidates(decision, n=1)[0]
-        # 1–4月年报尚未全部披露，允许上一年三季报；已披露年报也有效。
-        if decision.month < 5:
-            expected_quarter = 3
-        try:
-            year_text, quarter_text = period.split("Q")
-            year, quarter = int(year_text), int(quarter_text)
-            period_end = pd.Timestamp(year=year, month=quarter * 3, day=1) + pd.offsets.MonthEnd(0)
-            forward_verified = (1 <= quarter <= 4 and
-                (year, quarter) >= (expected_year, expected_quarter) and
-                period_end.date() <= decision.date() and ni_yoy is not None)
-        except (ValueError, TypeError, OverflowError):
-            forward_verified = False
-        if forward_verified:
-            if ni_yoy < float(config.FORWARD_NI_YOY_MIN):
-                return None, "FAIL_FORWARD"
-        elif getattr(config, "FORWARD_MISSING_AS_PENDING", True):
-            missing.append("forward")
+    _legacy_forward = (getattr(config, "REQUIRE_FORWARD_CONFIRMATION", False)
+                       and not getattr(config, "REQUIRE_RECENT_OPERATING", True))
+    forward_status, forward_yoy = validate_forward_growth(fund, day, config) if _legacy_forward else ("disabled", None)
+    if forward_status == "verified" and not financial:
+        ni_yoy = forward_yoy
+        forward_verified = True
+        if ni_yoy < float(config.FORWARD_NI_YOY_MIN):
+            return None, "FAIL_FORWARD"
+        if (getattr(config, "FORWARD_NEGATIVE_AS_PENDING", True)
+                and ni_yoy < 0):
+            missing.append("forward_negative")
+    elif _legacy_forward and not financial and getattr(config, "FORWARD_MISSING_AS_PENDING", True):
+        missing.append("forward")
     # 技术缺项只影响标签/分数，绝不覆盖财务和估值的待核验状态。
     df = _recompute_pct_chg(df)
     technical = compute_daily_signals(df, config)
@@ -3384,18 +3530,6 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
     score = round(config.QUALITY_SCORE_WEIGHT * quality_score +
                   config.VALUATION_SCORE_WEIGHT * valuation_score +
                   config.TECHNICAL_SCORE_WEIGHT * tech_score, 2)
-    # ===== 规则4b：质量分短板否决（只判已核验样本）=====
-    # 质量是根基：差公司再便宜也是价值陷阱。估值分可以很高（PE低），但如果
-    # 质量分低于门槛，说明基本面有硬伤，综合分被估值拉高是假象。
-    # 仅对 status="verified" 的样本生效：missing/partial/金融专项待核验的质量分
-    # 因证据不足为 0 或失真，按「数据缺失不误杀」的分层约定走 pending 待核验，
-    # 而不是否决——否则该门槛会退化成「缺数据即淘汰」，待核验候选的 CI 观测
-    # 口径（计数 + 前 10 只明细）随之丢失，金融股也永远无法进入专项核验流程。
-    # 评分锚点决定 verified 样本质量分恒 ≥50（阈值处恰好 50 分），默认门槛下
-    # 本闸门是保底防线；上调 MIN_QUALITY_SCORE（如 60）即可拦截「已核验但平庸」的候选。
-    _min_quality = float(getattr(config, "MIN_QUALITY_SCORE", 0.0) or 0.0)
-    if _min_quality > 0 and quality["status"] == "verified" and quality_score < _min_quality:
-        return None, "FAIL_QUALITY_FLOOR"
     # ===== 规则5：近60日相对沪深300强度（排序微调，不设硬性准入线）=====
     rs = compute_relative_strength(df, index_df, config)
     # 排序微调：限制在 ±RS_WEIGHT 内，避免相对强度压倒财务质量、PE 估值与原有综合分。
@@ -3405,18 +3539,7 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
         # 线性映射：rs 在 [-30, +30] 百分点范围内映射到 [-rs_cap, +rs_cap]
         rs_adj = float(np.clip(rs / 30.0 * rs_cap, -rs_cap, rs_cap))
     rank_score = round(score + rs_adj, 3)
-    # 综合分下限（#3：宁缺毋滥）。低于 MIN_QV_SCORE 的候选不推荐——弱市自然收敛到少推/不推，
-    # 不再「只要有票过硬闸门就凑满 MAX_PICKS」。设 0 关闭该闸门。
-    # 仅对「将要成为正式推荐」（missing 为空）的候选生效：待核验候选的估值分因数据缺失被
-    # 记为 0、综合分被人为压低，对其套下限没有意义（且 pending 本就不进正式推荐）。
-    # 注意：综合分下限判定使用原始 score（不含 rs_adj），相对强度不改变资格判定。
-    min_qv = float(getattr(config, "MIN_QV_SCORE", 0.0) or 0.0)
-    # 默认 PB 是辅助证据，缺失不降级；双护栏开启后 PB 是准入证据，缺失必须 pending。
-    effective_missing = (list(missing) if dual_valuation_guard else
-                         [t for t in missing if t != "valuation_pb"])
-    if min_qv > 0 and not effective_missing and score < min_qv:
-        return None, "FAIL_QV_SCORE"
-    tags = ["优质低估低位" if not effective_missing else "低位候选待核验"]
+    tags = ["优质低估低位"]
     hits = _signal_hits(d)
     tags.append("动能改善" if hits else "趋势待确认")
     tags.extend(hits)
@@ -3441,7 +3564,13 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
     # 规则3：PB 偏高风险说明（不否决，仅展示）
     if pb_high and pb is not None:
         tags.append(f"PB偏高({pb:.1f})仅风险提示")
-    _ni = finite(fund.get("forward_ni_yoy"))
+    if getattr(config, "REQUIRE_RECENT_OPERATING", True):
+        _ni = finite((operating or {}).get("metrics", {}).get("net_profit_yoy")) if op_status in {"verified", "weak"} else None
+        forward_verified = _ni is not None
+        # 简报使用实际采用的同源最新报告期，不混入旧源季度。
+        fund = dict(fund, forward_stat_date=(operating or {}).get("period"))
+    else:
+        _ni = finite(fund.get("forward_ni_yoy"))
     if _ni is not None:
         label = "净利同比" if forward_verified else "历史净利同比（未确认）"
         tags.append(f"{fund.get('forward_stat_date') or '报告期未知'} {label}{_ni:+.0f}%")
@@ -3473,41 +3602,76 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
     _cons_bonus = 0.0
     _days_low = timing.get("days_since_low")
     _cb_max = float(getattr(config, "CONSOLIDATION_BONUS", 0.0) or 0.0)
-    if _cb_max > 0 and _days_low is not None:
+    structure = bottom_structure_confirmed(technical, config)
+    if _cb_max > 0 and _days_low is not None and structure:
         _d_min = max(0, int(getattr(config, "CONSOLIDATION_DAYS_MIN", 30)))
         _d_max = max(_d_min + 1, int(getattr(config, "CONSOLIDATION_DAYS_MAX", 120)))
         if _days_low >= _d_min:
             _progress = min(1.0, (_days_low - _d_min) / max(1, _d_max - _d_min))
             _cons_bonus = round(_cb_max * _progress, 3)
     rank_score = round(rank_score + _cons_bonus, 3)
-    # ===== 规则1：止跌确认闸门（QV_STABILIZATION_GATE，全市场环境生效）=====
-    # 正式推荐须满足以下条件之一：
-    #   (a) 当日收盘价 ≥ MA20 **且** MA20 近 N 日斜率 ≥ 0（走平或上行才算有效站上）
-    #   (b) MACD 柱连续 MACD_MOMENTUM_DAYS(=3) 日改善
-    # MA20 仍在下行时的"站上"只是下跌反抽，不算止跌证据。
-    # 用于准入的指标数据不足时，不把「无法确认止跌」当成已确认——数据不足视为未止跌。
-    # 兼容：旧配置名 QV_BEAR_TIMING_GATE 通过 __setattr__/__post_init__ 迁移到本开关。
+    # ===== 规则1：止跌确认分层（QV_STABILIZATION_GATE）=====
+    # strong：站上MA20且MA20不下行，同时站上MA60；
+    # medium：MA20确认，或MACD柱改善且近N日没有新低；
+    # weak：MACD柱改善但近N日仍创新低，只保留为待核验观察；
+    # none：指标缺失或没有改善，直接淘汰。MACD和低点数据不足绝不放行。
+    stabilization_level = "confirmed"
     if getattr(config, "QV_STABILIZATION_GATE", True):
-        # 现价站上 MA20 且 MA20 走平/上行（MA20 缺失 → 不视为已确认）
         _ma20_ok = False
         if timing.get("below_ma20") is False and "ma20" in technical.columns:
             _slope_days = max(1, int(getattr(config, "STABILIZATION_MA20_SLOPE_DAYS", 5)))
             if len(technical) >= _slope_days + 1:
-                _ma20_now = technical["ma20"].iloc[-1]
-                _ma20_prev = technical["ma20"].iloc[-(_slope_days + 1)]
-                if not pd.isna(_ma20_now) and not pd.isna(_ma20_prev) and _ma20_prev > 0:
-                    _ma20_slope = (_ma20_now - _ma20_prev) / _ma20_prev
-                    _ma20_ok = _ma20_slope >= 0
-        # MACD 柱连续改善：_macd_momentum_ok 在数据不足时返回 True（放行不误杀），
-        # 但准入闸门要求「数据不足不能当作已确认」，故先显式校验数据充分性再看动能。
+                _ma20_now = finite(technical["ma20"].iloc[-1])
+                _ma20_prev = finite(technical["ma20"].iloc[-(_slope_days + 1)])
+                if _ma20_now is not None and _ma20_prev is not None and _ma20_prev > 0:
+                    _ma20_ok = ((_ma20_now - _ma20_prev) / _ma20_prev) >= 0
+        _above_ma60 = False
+        if "close" in technical.columns and len(technical) >= 60:
+            _ma60 = technical["close"].rolling(60).mean().iloc[-1]
+            _above_ma60 = pd.notna(_ma60) and float(technical["close"].iloc[-1]) >= float(_ma60)
         _n_mom = max(1, int(getattr(config, "MACD_MOMENTUM_DAYS", 3)))
-        _macd_ok = False
+        _macd_improving = False
         if "macd_histogram" in technical.columns and len(technical) > _n_mom:
-            if not technical["macd_histogram"].iloc[-(_n_mom + 1):].isna().any():
-                _macd_ok = _macd_momentum_ok(technical, config)
-        _stabilized = _ma20_ok or _macd_ok
-        if not _stabilized:
+            _hist = pd.to_numeric(technical["macd_histogram"].iloc[-(_n_mom + 1):], errors="coerce")
+            if np.isfinite(_hist.to_numpy()).all():
+                _macd_improving = _macd_momentum_ok(technical, config)
+        _no_new_low = False
+        _low_n = max(2, int(getattr(config, "STABILIZATION_NO_NEW_LOW_LOOKBACK", 5)))
+        _prior_n = max(_low_n, int(getattr(config, "STABILIZATION_PRIOR_LOW_LOOKBACK", 20)))
+        if _macd_improving and "low" in technical.columns and len(technical) >= _low_n + _prior_n:
+            _lows = pd.to_numeric(technical["low"], errors="coerce")
+            _recent = _lows.iloc[-_low_n:]
+            _prior = _lows.iloc[-(_low_n + _prior_n):-_low_n]
+            _no_new_low = bool(np.isfinite(_recent.to_numpy()).all() and np.isfinite(_prior.to_numpy()).all()
+                               and (_recent > 0).all() and (_prior > 0).all()
+                               and float(_recent.min()) >= float(_prior.min()))
+        if _ma20_ok and _above_ma60:
+            stabilization_level = "strong"
+        elif _ma20_ok or (_macd_improving and _no_new_low):
+            stabilization_level = "medium"
+        elif _macd_improving:
+            stabilization_level = "weak"
+        else:
             return None, "FAIL_STABILIZATION"
+        if stabilization_level == "weak":
+            missing.append("stabilization_weak")
+    else:
+        stabilization_level = "disabled"
+    timing["stabilization_level"] = stabilization_level
+    # 最终层级已知后再应用质量/综合分下限；弱确认即使分数足够也只能 pending。
+    _min_quality = float(getattr(config, "MIN_QUALITY_SCORE", 0.0) or 0.0)
+    if _min_quality > 0 and quality["status"] == "verified" and quality_score < _min_quality:
+        return None, "FAIL_QUALITY_FLOOR"
+    effective_missing = (list(missing) if dual_valuation_guard else
+                         [t for t in missing if t != "valuation_pb"])
+    tech_floor = float(getattr(config, "MIN_TECHNICAL_SCORE_FORMAL", 0.0) or 0.0)
+    if tech_score < tech_floor:
+        missing.append("technical_weak")
+        effective_missing.append("technical_weak")
+    formal_eligible = not effective_missing
+    min_qv = float(getattr(config, "MIN_QV_SCORE", 0.0) or 0.0)
+    if min_qv > 0 and formal_eligible and score < min_qv:
+        return None, "FAIL_QV_SCORE"
     # quality_value 波动率风控：放在止跌/KDJ/MACD准入之后，只有已通过其它
     # 资格层、仅 ATR 超限的标的才进入 volatile_out 观察池。
     # 技术路径的 ATR 层保持在 evaluate() 原有实现中，两个开关互不影响。
@@ -3529,6 +3693,18 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
                     hits=",".join(_signal_hits(d)), rsi=d.get("rsi14"),
                     vol_ratio=d.get("daily_vol_ratio")))
             return None, "FAIL_VOLATILE"
+    stab_level = str(timing.get("stabilization_level") or "unknown")
+    if stab_level == "strong":
+        tags.append("止跌强确认")
+    elif stab_level == "medium":
+        tags.append("止跌中确认")
+    elif stab_level == "weak":
+        tags.append("止跌弱确认·待核验")
+    tags[0] = "优质低估低位" if formal_eligible else "低位观察候选"
+    if structure:
+        tags.append("横盘结构确认")
+    if op_status != "not_required":
+        tags.append(summarize_operating(operating, op_status))
     surface = bool(getattr(config, "SURFACE_TIMING_READ", True))
     if surface:
         tags.append(timing["label"])
@@ -3551,10 +3727,9 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
         fund_status="verified" if quality["status"] == "verified" and debt is not None else "partial",
         weekly_status="not_required", missing_tags=",".join(dict.fromkeys(missing)),
         # 技术分短板：低于门槛降为 pending（基本面好但入场时机未到，跟踪观察）
-        tier=("pending" if effective_missing
-              or (float(getattr(config, "MIN_TECHNICAL_SCORE_FORMAL", 0.0) or 0.0) > 0
-                  and tech_score < float(getattr(config, "MIN_TECHNICAL_SCORE_FORMAL", 0.0)))
-              else "formal"),
+        tier="formal" if formal_eligible else "pending",
+        operating_status=op_status, operating_summary=summarize_operating(operating, op_status),
+        stabilization_level=stabilization_level, bottom_structure=structure,
         rank_score=rank_score,
         quality_score=quality_score, valuation_score=round(valuation_score, 2),
         position_250=round(position, 4), pe_ttm=pe, pb_mrq=pb,
@@ -3622,7 +3797,9 @@ def _screen_quality_pool(config: StrategyConfig, cache: CacheManager, market_env
         fund = get_fundamentals(code, cache, config)
         if not _is_financial_stock(code, name, config):
             fund = enrich_annual_fundamentals(code, fund, config, as_of=pre.date)
-            fund = enrich_forward_growth(code, fund, config, cache)  # 前瞻确认（#4b）
+            if not config.REQUIRE_RECENT_OPERATING:
+                fund = enrich_forward_growth(code, fund, config, cache)  # legacy 单项净利同比
+        fund = enrich_recent_operating(code, fund, config, cache, as_of=pre.date)
         return evaluator(daily, code, name, config, market_env, fund,
                          **eval_kwargs)
     results, processed, timed_out = run_concurrent_screen(stocks, screen, config, logger)
