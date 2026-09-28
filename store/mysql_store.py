@@ -91,7 +91,9 @@ CREATE TABLE IF NOT EXISTS stock_tracking (
     unique_close_date DATE GENERATED ALWAYS AS (CASE WHEN legacy_duplicate = 0 THEN close_date ELSE NULL END) STORED,
     close_price   DECIMAL(10, 3)  NOT NULL COMMENT '目标交易日收盘价（元）',
     return_value  DECIMAL(10, 3)  NOT NULL COMMENT '收益值 = close_price - 推荐时收盘价（元）',
-    return_pct    DECIMAL(8, 3)   NOT NULL COMMENT '收益率 = return_value / 推荐时收盘价 × 100（%）',
+    return_pct    DECIMAL(8, 3)   NOT NULL COMMENT '累计收益率 = return_value / 推荐时收盘价 × 100（%）',
+    weekly_return_pct DECIMAL(8, 3) NULL COMMENT '周收益率 = (当日收盘价 - 5日前收盘价) / 5日前收盘价 × 100（%）',
+    monthly_return_pct DECIMAL(8, 3) NULL COMMENT '月收益率 = (当日收盘价 - 20日前收盘价) / 20日前收盘价 × 100（%）',
     created_at    DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '写入时间',
     PRIMARY KEY (id),
     KEY idx_rec_week (rec_id, week_no),
@@ -113,6 +115,12 @@ _RECOMMENDATION_ALTERS = {
     "rec_tier": "ADD COLUMN rec_tier VARCHAR(8) NULL COMMENT '推荐层级 formal/pending' AFTER weekly_status",
     "strategy": "ADD COLUMN strategy VARCHAR(16) NOT NULL DEFAULT 'bottom_fishing' COMMENT '策略来源 bottom_fishing/volume_breakout' AFTER rec_tier",
     "missing_tags": "ADD COLUMN missing_tags VARCHAR(255) NULL COMMENT '缺失项标签（逗号分隔）' AFTER rec_tier",
+}
+
+# 追踪表补列：周收益率、月收益率
+_TRACKING_ALTERS = {
+    "weekly_return_pct": "ADD COLUMN weekly_return_pct DECIMAL(8, 3) NULL COMMENT '周收益率 = (当日收盘价 - 5日前收盘价) / 5日前收盘价 × 100（%）' AFTER return_pct",
+    "monthly_return_pct": "ADD COLUMN monthly_return_pct DECIMAL(8, 3) NULL COMMENT '月收益率 = (当日收盘价 - 20日前收盘价) / 20日前收盘价 × 100（%）' AFTER weekly_return_pct",
 }
 
 # 策略来源合法值（落库前校验，防止脏数据污染按策略分列的追踪/归因）
@@ -216,6 +224,11 @@ def _ensure_tracking_schema(conn) -> None:
             for name, definition in additions.items():
                 if name not in columns:
                     cur.execute(f"ALTER TABLE stock_tracking ADD COLUMN {name} {definition}")
+            # 补列：周收益率、月收益率
+            for col, alter in _TRACKING_ALTERS.items():
+                if col not in columns:
+                    cur.execute(f"ALTER TABLE stock_tracking {alter}")
+                    logger.info("stock_tracking 已补充列: %s", col)
             cur.execute("SELECT DISTINCT INDEX_NAME FROM information_schema.STATISTICS "
                         "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'stock_tracking'")
             indexes = {r[0] for r in cur.fetchall()}
@@ -243,7 +256,12 @@ def _f(v: Any) -> Optional[float]:
 
 
 def save_recommendations(df: Optional[pd.DataFrame], strategy: str = STRATEGY_BOTTOM_FISHING) -> int:
-    """将选股结果写入 stock_recommendation，(rec_date, code, strategy) 重复时忽略。
+    """将选股结果写入 stock_recommendation，(rec_date, code, strategy) 重复时检查入库时间。
+
+    重复记录处理规则：
+    - 库中不存在 → 正常入库
+    - 库中存在且 created_at 超过30天 → 删除旧记录后重新入库
+    - 库中存在且 created_at 未超过30天 → 跳过不入库
 
     strategy：策略来源（bottom_fishing / volume_breakout）。同一股票同日可被两套
     策略分别推荐并存，周度追踪与归因按来源分列。返回新插入行数。
@@ -264,9 +282,13 @@ def save_recommendations(df: Optional[pd.DataFrame], strategy: str = STRATEGY_BO
         strategy = STRATEGY_BOTTOM_FISHING
 
     rows = []
+    keys = []  # 用于查询已存在记录的 (rec_date, code, strategy) 组合
     for _, r in df.iterrows():
+        rec_date_str = str(r["date"])
+        code_str = str(r["code"])
+        keys.append((rec_date_str, code_str, strategy))
         rows.append((
-            str(r["date"]), str(r["code"]), str(r["name"]), _f(r["close"]),
+            rec_date_str, code_str, str(r["name"]), _f(r["close"]),
             _f(r.get("score")), str(r.get("grade", "") or "") or None,
             _f(r.get("daily_score")), _f(r.get("rsi")), _f(r.get("rsi7")), _f(r.get("rsi21")),
             _f(r.get("vol_ratio")), _f(r.get("turnover_ratio")),
@@ -281,20 +303,77 @@ def save_recommendations(df: Optional[pd.DataFrame], strategy: str = STRATEGY_BO
             str(r.get("missing_tags", "") or "") or None,
         ))
 
-    sql = """
-        INSERT IGNORE INTO stock_recommendation
+    insert_sql = """
+        INSERT INTO stock_recommendation
         (rec_date, code, name, rec_close, score, grade, daily_score, rsi, rsi7, rsi21,
          vol_ratio, turnover_ratio, stop_loss, take_profit, rr_ratio, market_env, has_divergence,
          signals_hit, fund_status, weekly_status, rec_tier, strategy, missing_tags)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     """
+    # 查询已存在记录的 created_at，判断是否超过30天
+    check_sql = """
+        SELECT rec_date, code, strategy, created_at
+        FROM stock_recommendation
+        WHERE (rec_date, code, strategy) IN ({})
+    """.format(", ".join(["(%s, %s, %s)"] * len(keys)))
+
+    delete_sql = """
+        DELETE FROM stock_recommendation
+        WHERE rec_date = %s AND code = %s AND strategy = %s
+    """
+
     try:
         conn = _connect()
         try:
             _ensure_tables(conn)
             with conn.cursor() as cur:
-                inserted = cur.executemany(sql, rows)
-            logger.info("推荐结果已落库[%s]：新增 %d 条（共提交 %d 条，重复自动忽略）", strategy, inserted or 0, len(rows))
+                # 查询已存在的记录及其入库时间
+                existing_records = {}
+                if keys:
+                    flat_keys = []
+                    for k in keys:
+                        flat_keys.extend(k)
+                    cur.execute(check_sql, flat_keys)
+                    for row in cur.fetchall():
+                        rec_date, code, strat, created_at = row
+                        existing_records[(str(rec_date), str(code), str(strat))] = created_at
+
+                # 筛选需要删除的过期记录（超过30天）
+                now = datetime.now()
+                expired_keys = []
+                skipped_count = 0
+                for key, created_at in existing_records.items():
+                    if isinstance(created_at, datetime):
+                        age_days = (now - created_at).days
+                    else:
+                        # 兼容字符串格式
+                        created_dt = pd.Timestamp(created_at).to_pydatetime()
+                        age_days = (now - created_dt).days
+                    if age_days > 30:
+                        expired_keys.append(key)
+                        logger.debug("记录 %s 已过期(%d天)，将重新入库", key, age_days)
+                    else:
+                        skipped_count += 1
+                        logger.debug("记录 %s 未过期(%d天)，跳过入库", key, age_days)
+
+                # 删除过期记录
+                for key in expired_keys:
+                    cur.execute(delete_sql, key)
+
+                # 过滤掉未过期的已存在记录，只插入新记录和已过期的记录
+                rows_to_insert = []
+                for i, key in enumerate(keys):
+                    if key not in existing_records or key in expired_keys:
+                        rows_to_insert.append(rows[i])
+
+                inserted = 0
+                if rows_to_insert:
+                    inserted = cur.executemany(insert_sql, rows_to_insert)
+
+            logger.info(
+                "推荐结果已落库[%s]：新增 %d 条（共提交 %d 条，跳过 %d 条未过期记录）",
+                strategy, inserted or 0, len(rows), skipped_count
+            )
             return int(inserted or 0)
         finally:
             conn.close()
@@ -370,7 +449,13 @@ def fetch_rec_codes_for_date(rec_date: str) -> set[str]:
 def save_tracking(rec_id: int, rec_date: Any, code: str, week_no: int,
                   close_date: str, close_price: float, rec_close: float,
                   holding_trade_days: int | None = None) -> bool:
-    """同推荐同收盘日幂等；可选固定期限保持旧调用兼容，未知期限不猜测。"""
+    """同推荐同收盘日幂等；可选固定期限保持旧调用兼容，未知期限不猜测。
+
+    同时计算并存储周收益率和月收益率：
+    - 周收益率 = (当日收盘价 - 5个交易日前收盘价) / 5个交易日前收盘价 × 100%
+    - 月收益率 = (当日收盘价 - 20个交易日前收盘价) / 20个交易日前收盘价 × 100%
+    若无法获取历史价格（如首次追踪），则对应收益率为 NULL。
+    """
     if not is_configured():
         return False
 
@@ -386,10 +471,55 @@ def save_tracking(rec_id: int, rec_date: Any, code: str, week_no: int,
     track_date = date.today().strftime("%Y-%m-%d")
     rec_date_str = rec_date.strftime("%Y-%m-%d") if isinstance(rec_date, (date, datetime)) else str(rec_date)
 
+    # 计算周收益率和月收益率：查询该推荐的历史追踪记录
+    weekly_return_pct = None
+    monthly_return_pct = None
+    try:
+        conn = _connect()
+        try:
+            conn.ping(reconnect=True)
+            _ensure_tables(conn)
+            with conn.cursor() as cur:
+                # 查询该推荐的所有历史追踪记录，按 holding_trade_days 排序
+                cur.execute("""
+                    SELECT holding_trade_days, close_price
+                    FROM stock_tracking
+                    WHERE rec_id = %s AND legacy_duplicate = 0
+                    ORDER BY holding_trade_days ASC
+                """, (int(rec_id),))
+                history = cur.fetchall()
+
+                # 构建 holding_trade_days -> close_price 映射
+                price_map = {row[0]: float(row[1]) for row in history if row[0] is not None}
+
+                current_holding = holding_trade_days if holding_trade_days is not None else int(week_no) * 5
+
+                # 周收益率：5个交易日前的收盘价
+                if current_holding >= 5:
+                    prev_week_holding = current_holding - 5
+                    if prev_week_holding in price_map:
+                        prev_price = price_map[prev_week_holding]
+                        if prev_price > 0:
+                            weekly_return_pct = round((float(close_price) / prev_price - 1) * 100, 3)
+
+                # 月收益率：20个交易日前的收盘价
+                if current_holding >= 20:
+                    prev_month_holding = current_holding - 20
+                    if prev_month_holding in price_map:
+                        prev_price = price_map[prev_month_holding]
+                        if prev_price > 0:
+                            monthly_return_pct = round((float(close_price) / prev_price - 1) * 100, 3)
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.debug("计算周/月收益率时查询历史记录失败(%s): %s", code, e)
+        # 不影响主流程，继续插入记录
+
     sql = """
         INSERT IGNORE INTO stock_tracking
-        (rec_id, rec_date, code, week_no, track_date, close_date, close_price, return_value, return_pct, holding_trade_days)
-        SELECT %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+        (rec_id, rec_date, code, week_no, track_date, close_date, close_price, return_value, return_pct,
+         holding_trade_days, weekly_return_pct, monthly_return_pct)
+        SELECT %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
         FROM DUAL WHERE NOT EXISTS (
             SELECT 1 FROM stock_tracking WHERE rec_id = %s AND close_date = %s
         )
@@ -404,6 +534,7 @@ def save_tracking(rec_id: int, rec_date: Any, code: str, week_no: int,
                     int(rec_id), rec_date_str, str(code), int(week_no),
                     track_date, str(close_date), round(float(close_price), 3),
                     return_value, return_pct, holding_trade_days,
+                    weekly_return_pct, monthly_return_pct,
                     int(rec_id), close_date,
                 ))
             return bool(inserted)
@@ -419,7 +550,8 @@ def get_attribution_rows(days: int = 90) -> list[dict]:
 
     返回逐条明细（一条 = 某推荐的第某周观测），字段：
     rec_date / code / name / grade / has_divergence / market_env / score / daily_score
-    / week_no / return_pct / track_date / close_date / holding_trade_days / holding_calendar_days；
+    / week_no / return_pct / weekly_return_pct / monthly_return_pct / track_date / close_date
+    / holding_trade_days / holding_calendar_days；
     固定期限聚合由调用方完成，旧行 holding_trade_days=NULL，不从旧 week_no 推断。
     仅返回至少有一次追踪记录的推荐（尚未被追踪的新推荐不参与归因）。
     """
@@ -430,6 +562,7 @@ def get_attribution_rows(days: int = 90) -> list[dict]:
     sql = """
         SELECT r.id, r.rec_date, r.code, r.name, r.grade, r.has_divergence, r.market_env,
                r.score, r.daily_score, r.strategy, t.week_no, t.return_pct,
+               t.weekly_return_pct, t.monthly_return_pct,
                t.id AS tracking_id, t.track_date, t.close_date, t.holding_trade_days,
                DATEDIFF(t.close_date, r.rec_date) AS holding_calendar_days,
                t.legacy_duplicate

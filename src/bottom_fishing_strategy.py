@@ -144,8 +144,8 @@ class StrategyConfig:
     # 合并净利润与经营现金流均为正；关闭后退回仅看三年合计现金转换率。
     QUALITY_REQUIRE_ANNUAL_NET_PROFIT_POSITIVE: bool = True
     QUALITY_REQUIRE_ANNUAL_CASHFLOW_POSITIVE: bool = True
-    LOW_POSITION_LOOKBACK: int = 250
-    LOW_POSITION_MAX: float = 0.40
+    LOW_POSITION_LOOKBACK: int = 250     # 低位闸门回看交易日数
+    LOW_POSITION_MAX: float = 0.40       # 百分位排名上限（0.40 = 收盘价处于250日序列后40%以内）
     QUALITY_SCORE_WEIGHT: float = 0.50
     VALUATION_SCORE_WEIGHT: float = 0.35
     TECHNICAL_SCORE_WEIGHT: float = 0.15
@@ -233,26 +233,22 @@ class StrategyConfig:
 
     # ===== 综合分下限（#3：宁缺毋滥）=====
     # quality_value 综合分 = 0.50×质量 + 0.35×估值 + 0.15×技术（0~100）。
-    # 此前只用于排序、无下限：只要有票通过硬闸门就凑满 MAX_PICKS。开启后综合分 <
-    # MIN_QV_SCORE 的候选直接否决（FAIL_QV_SCORE），弱市自然收敛到少推/不推。
-    # 设 0 关闭该闸门（恢复改动前行为）。
+    # 综合分 < MIN_QV_SCORE 的候选直接否决（FAIL_QV_SCORE），弱市自然收敛到少推/不推。
+    # 设 0 关闭该闸门。
     #
-    # 评分口径决定了「恰好压线达标」的公司拿不到 60 分——
-    #   · 质量分：_dimension_score 在阈值处恰好给 50 分。三档同时压线的最小可达
-    #     质量分就是 50（如 3 年 ROE=(5,10,10)：中位 10=阈值、最低 5=阈值、
-    #     现金转换 0.8=阈值，实测 status=verified 而 quality_score=50）。
-    #   · 估值分（仅 PE）：行业口径在分位 0.60（=闸门上限）处给 40 分；
-    #     绝对口径在 PE=25（=闸门上限）处同样给 40 分（锚点对齐，见 _valuation_pe_score）。
-    #   于是三道闸门全部恰好达标的公司：
-    #     · 行业口径：0.5×50 + 0.35×40 + 0.15×技术分 = 39.0 + 0.15×技术分 ≤ 54.0
-    #     · 绝对口径：0.5×50 + 0.35×40 + 0.15×技术分 = 39.0 + 0.15×技术分 ≤ 54.0
-    #   两者都不足 60 —— 即「压线合格」100% 被本下限淘汰，硬闸门的阈值形同虚设。
-    #   反解过线所需（0.5q+0.35v+0.15t ≥ 60）：
-    #     · 两口径（v=40）：q=50 需 t≥140（不可达）；q=70 需 ≥73；q=90 需 ≥7
-    #   运行时可读：qv_floor_equivalence() / describe_qv_floor() 会随配置实时算出门槛并
-    #   打进漏斗日志；其算术已固化为 test_recommendation_upgrades.TestScoreFloorEquivalence。
-    # 调低该值时务必先跑 `python backtest.py ab --mode quality_value`。
-    MIN_QV_SCORE: float = 60.0
+    # 【重要】下限必须与硬闸门阈值对齐，否则硬闸门形同虚设：
+    #   · 质量分：_dimension_score 在阈值处恰好给 50 分（三档同时压线 → quality_score=50）。
+    #   · 估值分（仅 PE）：行业/绝对口径在各自准入上限处均锚定 40 分。
+    #   · 三道闸门全部恰好达标的综合分 = 0.5×50 + 0.35×40 + 0.15×技术分
+    #     = 39.0 + 0.15×技术分，上限 54.0（技术满分100时）。
+    #   若 MIN_QV_SCORE > 54，则「压线合格」100% 被淘汰，硬闸门阈值失去实际意义。
+    #   当前设为 40：压线合格（质量50+估值40+技术≥0 → 综合分≥39）即可通过，
+    #   硬闸门重新拿回准入控制权；综合分下限退化为「极弱候选兜底过滤」。
+    #   如需提高准入门槛，应上调硬闸门阈值（QUALITY_MEDIAN_ROE_MIN 等），
+    #   而非抬高本下限——后者会让配置文件中声明的阈值变成误导性文档。
+    # 运行时可读：qv_floor_equivalence() / describe_qv_floor() 会随配置实时算出等效门槛。
+    # 调整前务必先跑 `python backtest.py ab --mode quality_value`。
+    MIN_QV_SCORE: float = 40.0
 
     # ===== P0：入场时机判读（左侧/右侧 + 止跌确认；仅加标签展示，绝不改推荐口径）=====
     # quality_value（生产默认）旁路了全部技术择时闸门（weekly=not_required、技术仅 15%
@@ -314,16 +310,21 @@ class StrategyConfig:
     # DIF 背离最低幅度（价格单位；0=严格更高即可），RSI 背离沿用 DAILY_RSI_DIVERGENCE_THRESHOLD
     DAILY_MACD_DIVERGENCE_THRESHOLD: float = 0.0
 
-    FIXED_STOP_LOSS_PCT: float = 5.0
-    FIXED_TAKE_PROFIT_PCT: float = 10.0
+    # ===== 止损/止盈（价值策略口径）=====
+    # 价值投资的盈利来源是「价格向内在价值回归」，时间尺度为季度到年度，
+    # 幅度通常 30-100%。固定百分比止损止盈应与此匹配，而非短线交易框架的窄幅参数。
+    # 过窄的止损（如5%）会在价值回归启动前被正常波动震出；过窄的止盈（如10%）
+    # 只吃到估值修复的零头，系统性截断盈利、压低盈亏比。
+    FIXED_STOP_LOSS_PCT: float = 15.0   # ATR 缺失时的兜底止损；给价值股呼吸空间
+    FIXED_TAKE_PROFIT_PCT: float = 30.0  # 至少吃到估值修复的主体部分
     ATR_PERIOD: int = 14
-    ATR_STOP_MULT: float = 2.0
+    ATR_STOP_MULT: float = 3.0          # 动态止损 = 入场价 - 3×ATR14；3倍覆盖正常波动
     USE_ATR_STOP: bool = True
     # 波动率风控：ATR 占现价百分比超过该值直接否决（FAIL_VOLATILE）。
-    # 该阈值与旧「RR≥1.5」数学等价（2×ATR止损+10%止盈下 RR≥1.5 ⟺ ATR≤3.33%现价），
-    # 但语义直白、且 ATR 缺失时不再隐含放行（旧实现 RR 恒 2.0 永不否决）。
+    # 与止损倍数对齐：3×ATR 止损 + 30% 止盈下 RR≥2.0 ⟺ ATR ≤ 10% 现价。
+    # 语义直白、且 ATR 缺失时不再隐含放行。
     # 止损/止盈/盈亏比（rr_ratio）仅作展示与落库，不参与否决。
-    MAX_ATR_PCT: float = 3.33
+    MAX_ATR_PCT: float = 10.0
 
     # ===== 交易计划（建仓区间 / 止损 / 止盈 / 建议持有周期）=====
     # 纯展示与落库，不参与任何准入、排序与否决（与 stop_loss/take_profit 同一定位）。
@@ -486,8 +487,8 @@ class StrategyConfig:
     # 且穷举可达组合可知 trend_turn 是事实上的必要条件（缺它时唯一通路是
     # rsi_rebound+放量企稳满分+multi_resonance 精确凑到 60 分），评分几乎不提供区分度。
     # 于是 _rank_signals 大量并列，实际决定 Top5 的是 rr_ratio——而
-    # rr_ratio = 0.10×entry / (2×ATR) = 0.05/ATR%，是「固定止盈除以 ATR 止损」的
-    # 代数残留，从未被设计为排序键；再并列就落到 code 字母序。
+    # rr_ratio = FIXED_TAKE_PROFIT_PCT×entry / (ATR_STOP_MULT×ATR)，是「固定止盈除以
+    # ATR 止损」的代数残留，从未被设计为排序键；再并列就落到 code 字母序。
     # 质量分把布尔闸门内的连续信息重新引入排序（这些列 compute_daily_signals 已全部算出，
     # 零额外取数）。RANK_QUALITY_WEIGHT=0 可完全退回旧行为。
     # 注意：权重 >3 时可能跨分数档重排（65 与 68 的档差仅 3 分），这是有意为之——
@@ -1837,9 +1838,9 @@ def describe_trade_plan(row: dict, config: Optional[StrategyConfig] = None) -> l
 
     价位来源：
       - 建仓区间：信号日收盘价 × (1 ± ENTRY_BAND_PCT%)，次日开盘执行（见 config 注释）；
-      - 止损/止盈：直接取 row，口径由各自策略决定——优质低估低位=2×ATR 或固定 -5%
-        搭配固定 +10%；放量突破=突破位−1×ATR 与固定 -6% 取更紧者、固定 +15% 与
-        ATR 目标取更近者；
+      - 止损/止盈：直接取 row，口径由各自策略决定——优质低估低位=3×ATR 或固定 -15%
+        搭配固定 +30%（价值策略口径，给估值修复留足空间）；放量突破=突破位−1×ATR
+        与固定 -6% 取更紧者、固定 +15% 与 ATR 目标取更近者；
       - 建议持有周期：HOLD_DAYS_HINT_MIN ~ MAX，与周度追踪窗口（推荐后第 5/10/15/20
         个交易日）对齐，第 20 个交易日是到期离场判定日。
 
@@ -3219,10 +3220,14 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
         return None, "FAIL_HALT_GAP"
     last = df.iloc[-1]
     close = float(last["close"])
-    lo, hi = float(window["low"].min()), float(window["high"].max())
-    if hi <= lo:
-        return None, "FAIL_DATA"
-    position = (close - lo) / (hi - lo)
+    # ===== 低位闸门：百分位排名替代 min-max 归一化 =====
+    # 旧口径 (close - 250日最低) / (250日最高 - 250日最低) 对极端值敏感：
+    # 250日内若有一天闪崩/涨停，整个分母被拉大/缩小，position 失真；
+    # 且不区分下跌趋势 vs 横盘震荡（两者 position 可能相同但含义截然不同）。
+    # 新口径：当前收盘价在250日收盘价序列中的百分位排名（0=最低，1=最高）。
+    # 优点：不受单日极端值影响、分布均匀、跨股票可比、对近期价格结构更敏感。
+    closes_window = window["close"].values
+    position = float((closes_window < close).sum()) / len(closes_window)
     if position > config.LOW_POSITION_MAX:
         return None, "FAIL_POSITION"
     missing = [] if latest_trade_date is not None else ["market_date"]
