@@ -146,9 +146,20 @@ class StrategyConfig:
     QUALITY_REQUIRE_ANNUAL_CASHFLOW_POSITIVE: bool = True
     LOW_POSITION_LOOKBACK: int = 250     # 低位闸门回看交易日数
     LOW_POSITION_MAX: float = 0.40       # 百分位排名上限（0.40 = 收盘价处于250日序列后40%以内）
-    QUALITY_SCORE_WEIGHT: float = 0.50
-    VALUATION_SCORE_WEIGHT: float = 0.35
-    TECHNICAL_SCORE_WEIGHT: float = 0.15
+    # ===== 综合评分权重 =====
+    # 技术面从 15% 提高到 25%：让有底部形态的股票排到前面，避免"价值陷阱"因
+    # 质量/估值满分而占据推荐名额。质量仍是核心（45%），估值次之（30%）。
+    QUALITY_SCORE_WEIGHT: float = 0.45
+    VALUATION_SCORE_WEIGHT: float = 0.30
+    TECHNICAL_SCORE_WEIGHT: float = 0.25
+    # ===== 横盘筑底加分（排序微调，不参与准入）=====
+    # 在低位待得越久，"下跌中继"的概率越低、"真底部"的概率越高。
+    # 距250日低点 ≥ CONSOLIDATION_DAYS_MIN 天时，给 rank_score 加 CONSOLIDATION_BONUS。
+    # 线性插值：低点当天=0分，≥CONSOLIDATION_DAYS_MAX 天=满分 CONSOLIDATION_BONUS。
+    # 设 0 关闭。该因子只影响排序，不改变哪些股票通过闸门。
+    CONSOLIDATION_DAYS_MIN: int = 30     # 开始加分的最低天数
+    CONSOLIDATION_DAYS_MAX: int = 120    # 满分的天数上限
+    CONSOLIDATION_BONUS: float = 5.0     # 最大加分值
     CSI300_AK_SYMBOL: str = "sh000300"  # Baostock 格式为 sh.000300
     MARKET_MA_PERIOD: int = 20
     MARKET_SLOPE_LOOKBACK: int = 4
@@ -232,18 +243,17 @@ class StrategyConfig:
     FORWARD_NI_YOY_WARN: float = 0.0
 
     # ===== 综合分下限（#3：宁缺毋滥）=====
-    # quality_value 综合分 = 0.50×质量 + 0.35×估值 + 0.15×技术（0~100）。
+    # quality_value 综合分 = 0.45×质量 + 0.30×估值 + 0.25×技术（0~100）。
     # 综合分 < MIN_QV_SCORE 的候选直接否决（FAIL_QV_SCORE），弱市自然收敛到少推/不推。
     # 设 0 关闭该闸门。
     #
     # 【重要】下限必须与硬闸门阈值对齐，否则硬闸门形同虚设：
     #   · 质量分：_dimension_score 在阈值处恰好给 50 分（三档同时压线 → quality_score=50）。
     #   · 估值分（仅 PE）：行业/绝对口径在各自准入上限处均锚定 40 分。
-    #   · 三道闸门全部恰好达标的综合分 = 0.5×50 + 0.35×40 + 0.15×技术分
-    #     = 39.0 + 0.15×技术分，上限 54.0（技术满分100时）。
-    #   若 MIN_QV_SCORE > 54，则「压线合格」100% 被淘汰，硬闸门阈值失去实际意义。
-    #   当前设为 40：压线合格（质量50+估值40+技术≥0 → 综合分≥39）即可通过，
-    #   硬闸门重新拿回准入控制权；综合分下限退化为「极弱候选兜底过滤」。
+    #   · 三道闸门全部恰好达标的综合分 = 0.45×50 + 0.30×40 + 0.25×技术分
+    #     = 34.5 + 0.25×技术分，上限 59.5（技术满分100时）。
+    #   若 MIN_QV_SCORE > 59.5，则「压线合格」100% 被淘汰。
+    #   当前设为 40：压线合格（综合分≥34.5）即可通过，硬闸门拥有准入控制权。
     #   如需提高准入门槛，应上调硬闸门阈值（QUALITY_MEDIAN_ROE_MIN 等），
     #   而非抬高本下限——后者会让配置文件中声明的阈值变成误导性文档。
     # 运行时可读：qv_floor_equivalence() / describe_qv_floor() 会随配置实时算出等效门槛。
@@ -251,8 +261,8 @@ class StrategyConfig:
     MIN_QV_SCORE: float = 40.0
 
     # ===== P0：入场时机判读（左侧/右侧 + 止跌确认；仅加标签展示，绝不改推荐口径）=====
-    # quality_value（生产默认）旁路了全部技术择时闸门（weekly=not_required、技术仅 15%
-    # 权重不否决、QV_ENFORCE_KDJ_MACD_VETO 默认 False），唯一位置约束是 250 日 position≤0.40。
+    # quality_value（生产默认）的技术面权重为 25%（不否决、QV_ENFORCE_KDJ_MACD_VETO
+    # 默认 False），止跌确认闸门（QV_STABILIZATION_GATE）是唯一的技术准入条件。
     # 后果：一只利润下滑、股价处于低位、MACD 仍在加速下跌的深度价值股能顺利通过全部闸门
     # 被正式推荐——典型价值陷阱/接飞刀。开启后为每条推荐计算「左侧/右侧 + 是否仍在下跌」
     # 的时机读数并写入决策简报，把择时判断显式交回人工（不改「哪些股票通过」）。
@@ -261,9 +271,11 @@ class StrategyConfig:
     # ===== 止跌确认闸门（全市场环境生效）=====
     # 背景：quality_value 旁路了全部技术择时闸门，深度价值股可能在任何市场环境下
     # 于下跌途中被正式推荐（价值陷阱/接飞刀）。开启后：**所有市场环境**的 formal 推荐
-    # 必须满足最低止跌证据之一：「当日收盘价 ≥ MA20」或「MACD 柱连续 MACD_MOMENTUM_DAYS
-    # 日改善」，否则否决（FAIL_STABILIZATION）。
-    # 不额外要求 RSI 反弹、KDJ 金叉或 MA60 站稳。
+    # 必须满足最低止跌证据之一：
+    #   (a) 当日收盘价 ≥ MA20 **且** MA20 近 STABILIZATION_MA20_SLOPE_DAYS 日斜率 ≥ 0
+    #       （MA20 走平或上行才算有效站上；MA20 仍在下行时的"站上"只是下跌反抽）
+    #   (b) MACD 柱连续 MACD_MOMENTUM_DAYS(=3) 日改善（过滤1-2日反抽噪声）
+    # 否则否决（FAIL_STABILIZATION）。
     # 用于准入的指标数据不足时，不把「无法确认止跌」当成已确认——数据不足视为未止跌。
     #
     # 兼容说明：此开关前身为 QV_BEAR_TIMING_GATE（仅熊市生效）。现扩展到全市场环境，
@@ -272,6 +284,9 @@ class StrategyConfig:
     # 避免旧配置静默改变含义。
     # 显式设 False 可关闭该闸门。
     QV_STABILIZATION_GATE: bool = True
+    # MA20 斜率回看天数：计算 MA20 近 N 日的变化率，≥0 才算"走平或上行"。
+    # 5 日约一周，足够区分"MA20 拐头"与"单日噪声"。
+    STABILIZATION_MA20_SLOPE_DAYS: int = 5
     # deprecated：旧配置名，仅为向后兼容保留。构造时传入、或构造后赋值（写穿）均会
     # 覆盖 QV_STABILIZATION_GATE；保持 None 表示「未指定」，不抹掉新配置项的值。
     QV_BEAR_TIMING_GATE: Optional[bool] = None
@@ -409,8 +424,8 @@ class StrategyConfig:
     POSITION_IN_RANGE_MAX: float = 0.50
     # MACD 动能确认：要求 MACD 柱当日较昨日改善（绿柱缩短或红柱放大）
     REQUIRE_MACD_MOMENTUM: bool = True
-    # MACD 柱需连续改善的天数（1=仅当日较昨日；2=连续两日改善，过滤单日反抽）
-    MACD_MOMENTUM_DAYS: int = 2
+    # MACD 柱需连续改善的天数（3=连续三日改善，过滤下跌中继的1-2日反抽噪声）
+    MACD_MOMENTUM_DAYS: int = 3
     # KDJ 确认：要求 KDJ 处于金叉状态（K>D）且 K 值不高于该上限（避免高位接力）
     REQUIRE_KDJ_GOLDEN: bool = True
     KDJ_K_MAX: float = 55.0
@@ -3358,6 +3373,19 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
         # 线性映射：rs 在 [-30, +30] 百分点范围内映射到 [-rs_cap, +rs_cap]
         rs_adj = float(np.clip(rs / 30.0 * rs_cap, -rs_cap, rs_cap))
     rank_score = round(score + rs_adj, 3)
+    # ===== 规则6：横盘筑底加分（排序微调，不参与准入）=====
+    # 距250日低点天数越长，"下跌中继"概率越低。已在 assess_entry_timing 中算出
+    # days_since_low，这里直接复用 timing 结果，零额外取数。
+    _cons_bonus = 0.0
+    _days_low = timing.get("days_since_low")
+    _cb_max = float(getattr(config, "CONSOLIDATION_BONUS", 0.0) or 0.0)
+    if _cb_max > 0 and _days_low is not None:
+        _d_min = max(0, int(getattr(config, "CONSOLIDATION_DAYS_MIN", 30)))
+        _d_max = max(_d_min + 1, int(getattr(config, "CONSOLIDATION_DAYS_MAX", 120)))
+        if _days_low >= _d_min:
+            _progress = min(1.0, (_days_low - _d_min) / max(1, _d_max - _d_min))
+            _cons_bonus = round(_cb_max * _progress, 3)
+    rank_score = round(rank_score + _cons_bonus, 3)
     # 综合分下限（#3：宁缺毋滥）。低于 MIN_QV_SCORE 的候选不推荐——弱市自然收敛到少推/不推，
     # 不再「只要有票过硬闸门就凑满 MAX_PICKS」。设 0 关闭该闸门。
     # 仅对「将要成为正式推荐」（missing 为空）的候选生效：待核验候选的估值分因数据缺失被
@@ -3420,16 +3448,26 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
     # 始终计算（止跌闸门与 P5 简报都要用）；SURFACE_TIMING_READ 只控制是否加标签/出简报。
     timing = assess_entry_timing(technical, config)
     # ===== 规则1：止跌确认闸门（QV_STABILIZATION_GATE，全市场环境生效）=====
-    # 正式推荐须满足以下条件之一：当日收盘价 ≥ MA20，或 MACD 柱连续 MACD_MOMENTUM_DAYS 日改善。
-    # 不额外要求 RSI 反弹、KDJ 金叉或 MA60 站稳。
+    # 正式推荐须满足以下条件之一：
+    #   (a) 当日收盘价 ≥ MA20 **且** MA20 近 N 日斜率 ≥ 0（走平或上行才算有效站上）
+    #   (b) MACD 柱连续 MACD_MOMENTUM_DAYS(=3) 日改善
+    # MA20 仍在下行时的"站上"只是下跌反抽，不算止跌证据。
     # 用于准入的指标数据不足时，不把「无法确认止跌」当成已确认——数据不足视为未止跌。
     # 兼容：旧配置名 QV_BEAR_TIMING_GATE 通过 __setattr__/__post_init__ 迁移到本开关。
     if getattr(config, "QV_STABILIZATION_GATE", True):
-        # 现价站上 MA20（MA20 缺失 → below_ma20 为 None → 不视为已确认）
-        _ma20_ok = timing.get("below_ma20") is False
+        # 现价站上 MA20 且 MA20 走平/上行（MA20 缺失 → 不视为已确认）
+        _ma20_ok = False
+        if timing.get("below_ma20") is False and "ma20" in technical.columns:
+            _slope_days = max(1, int(getattr(config, "STABILIZATION_MA20_SLOPE_DAYS", 5)))
+            if len(technical) >= _slope_days + 1:
+                _ma20_now = technical["ma20"].iloc[-1]
+                _ma20_prev = technical["ma20"].iloc[-(_slope_days + 1)]
+                if not pd.isna(_ma20_now) and not pd.isna(_ma20_prev) and _ma20_prev > 0:
+                    _ma20_slope = (_ma20_now - _ma20_prev) / _ma20_prev
+                    _ma20_ok = _ma20_slope >= 0
         # MACD 柱连续改善：_macd_momentum_ok 在数据不足时返回 True（放行不误杀），
         # 但准入闸门要求「数据不足不能当作已确认」，故先显式校验数据充分性再看动能。
-        _n_mom = max(1, int(getattr(config, "MACD_MOMENTUM_DAYS", 2)))
+        _n_mom = max(1, int(getattr(config, "MACD_MOMENTUM_DAYS", 3)))
         _macd_ok = False
         if "macd_histogram" in technical.columns and len(technical) > _n_mom:
             if not technical["macd_histogram"].iloc[-(_n_mom + 1):].isna().any():
