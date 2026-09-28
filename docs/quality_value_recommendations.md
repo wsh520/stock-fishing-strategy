@@ -9,7 +9,7 @@
    **PB 职责（本轮调整）**：PB 不再单独否决——略高于绝对上限(3.0)或行业分位上限只作**异常识别与风险说明**，并继续展示；`PB≤0`（净资产为负/数据异常）仍按异常否决；PB 缺失只标注缺项 `valuation_pb`，不伪装成已核验，也不因缺少这一**辅助**指标把其他核心证据完整的股票降为 pending。**注意这不是「所有高 PB 无条件通过」**：年度盈利质量、PE、近期业绩、低位、止跌条件仍须各自通过。
 3. 价格处于最近250根有效成交日线最高/最低区间的下40%。至少250根；最新零量/零成交额、日期滞后、不合法OHLC否决。取数窗口从120增为600自然日。中期低位不代表低估，必须同时通过前两条。**停牌缺口**：相邻 K 线自然日间隔 > MAX_BAR_GAP_DAYS(12) 判定期间曾停牌 → FAIL_HALT_GAP 否决（沿用 REQUIRE_NO_HALT_GAP；K 线跨缺口时全部滚动指标失真）。
 4. 前瞻确认（#4b）：REQUIRE_FORWARD_CONFIRMATION=True 时，用 Baostock query_growth_data 最新报告期净利润同比(YOYNI)做刹车，同比 < FORWARD_NI_YOY_MIN(**-10%**) → FAIL_FORWARD 否决（对治「trailing 年报漂亮、当年正在崩」的价值陷阱；**恰好等于 -10% 不触发**）；同比落在 `[FORWARD_NI_YOY_MIN, FORWARD_NI_YOY_WARN)`（即 **[-10%, 0%)**）不否决，只在决策简报打「业绩下滑预警」黄标。成长数据缺失、季度无效、过旧或在决策日之后 → 记「forward」缺项 → pending（FORWARD_MISSING_AS_PENDING=True，**当前默认**，与《最小修复说明》一致）；显式置 False 可恢复「缺失放行」（刹车仅在数据可得时生效）。报告期门槛：1–4 月可使用上一年三季报或已披露年报，5–8 月至少当年 Q1，9–10 月至少 Q2，11–12 月至少 Q3。仅主源 Baostock 提供，AkShare 兜底日按缺失处理。
-5. 综合分下限（#3）：MIN_QV_SCORE=60，综合分 < 60 的 formal 候选否决（FAIL_QV_SCORE）。仅对「将要成为正式推荐」（missing 为空）的候选生效——pending 的估值分因数据缺失被记为 0、综合分被人为压低，对其套下限无意义。设 0 关闭。**资格判定始终使用不含相对强度微调的综合分**。
+5. 综合分下限（#3）：MIN_QV_SCORE=50，综合分 < 50 的 formal 候选否决（FAIL_QV_SCORE）。仅对「将要成为正式推荐」（missing 为空）的候选生效——pending 的估值分因数据缺失被记为 0、综合分被人为压低，对其套下限无意义。设 0 关闭。**资格判定始终使用不含相对强度微调的综合分**。
 6. **止跌确认闸门（本轮调整）**：`QV_STABILIZATION_GATE`（库级默认 True，前身为仅熊市生效的 `QV_BEAR_TIMING_GATE`）。**全市场环境**的正式推荐须满足其一：当日收盘价 ≥ MA20，或 MACD 柱连续 `MACD_MOMENTUM_DAYS`(2) 日改善；否则 FAIL_STABILIZATION。**不额外要求 RSI 反弹、KDJ 金叉或 MA60 站稳**。用于准入的指标数据不足（MA20 不可得 / MACD 柱含 NaN）**不视为已确认**。旧配置名 `QV_BEAR_TIMING_GATE` 经 `__setattr__`/`__post_init__` 写穿迁移，构造传入与构造后赋值都继续生效，不会静默失去作用。
 7. **相对强度（本轮新增，仅排序与提示）**：`relative_strength` = 同一起止日期下「个股区间涨跌幅 − 沪深300区间涨跌幅」（百分点，`RS_LOOKBACK`=60）。指数日线复用主流程 `get_index_daily` 结果，按**共有交易日**对齐、只用决策日及之前数据。**不设硬性准入线**：以 `RS_WEIGHT`(=3.0) 为上限调整 `rank_score`（正式候选间小幅排序），明显跑输（≤ -10pp）时打风险提示标签；指数缺失/对齐不足 → 字段为 None、排序中性，不给「强势/弱势」结论。
 8. 保留已知商誉超限排雷及负债率<=70%核验。金融企业依旧按现有名称/代码识别，输出financial_review并留待行业专项核验，不套普通企业现金转换率与前瞻确认。行业识别仍需后续完善，不能据此声称覆盖全部金融子行业。
@@ -21,11 +21,11 @@
 - 急跌熔断：沪深300 近 MARKET_CRASH_LOOKBACK(5) 个交易日累计跌幅 ≤ MARKET_CRASH_HALT_PCT(-4%) → 本次运行不推荐。
 - 推荐数量按 regime 收缩：牛 MAX_PICKS(5) / 中性 NEUTRAL_MAX_PICKS(4) / 熊 BEAR_MAX_PICKS(2)，由 resolve_max_picks 解析后作为 max_picks 传入 _screen_quality_pool 截取；unknown 经 _effective_regime 折叠为熊。
 
-quality_value 现在默认增加 ATR/收盘价波动率硬闸门：`QV_ATR_GUARD=True`，上限复用 `MAX_ATR_PCT=3.33%`；ATR 缺失视为不可核验（`FAIL_DATA`），超限为 `FAIL_VOLATILE`，可用 `QV_ATR_GUARD=False` 回退旧口径。20日位置、短期涨幅、RSI上限、KDJ确认、周线确认仍只作用于 technical 路径。`QV_VALUATION_DUAL_GUARD` 默认关闭；显式开启后 PB 高于绝对/行业上限会否决，PB 缺失会进入 pending。
+quality_value 现在默认增加 ATR/收盘价波动率硬闸门：`QV_ATR_GUARD=True`，上限复用 `MAX_ATR_PCT=10%`；ATR 缺失视为不可核验（`FAIL_DATA`），超限为 `FAIL_VOLATILE`，可用 `QV_ATR_GUARD=False` 回退旧口径。20日位置、短期涨幅、RSI上限、KDJ确认、周线确认仍只作用于 technical 路径。`QV_VALUATION_DUAL_GUARD` 默认关闭；显式开启后 PB 高于绝对/行业上限会否决，PB 缺失会进入 pending。
 
 ## 排序与标签
 
-score=0.50*quality_score+0.35*valuation_score+0.15*daily_score，各项0至100。质量分为连续ROE中位数/最低ROE/现金转换率分数，权重50%/25%/25%；各维度达到准入阈值为50分，默认25%/15%/1.5饱和100分。扣非盈利是硬条件，不重复计分。
+score=0.45*quality_score+0.30*valuation_score+0.25*daily_score，各项0至100。质量分为连续ROE中位数/最低ROE/现金转换率分数，权重50%/25%/25%；各维度达到准入阈值为50分，默认25%/15%/1.5饱和100分。扣非盈利是硬条件，不重复计分。
 
 **估值分（本轮重构，仅 PE）**：估值分以**实际用于准入的 PE 口径**为准，行业分位与绝对 PE 两条口径在各自准入上限处**锚定相同分值**：行业 PE 分位 = 0.60（=闸门上限）→ 40 分（`100×(1-0.60)`）；绝对 PE = 25（=MAX_PE_TTM 上限）→ 同样 40 分（`40 + 60×(1-pe/25)`）；更便宜时连续增加，限制在 0~100。这样同一只「压线合格」的股票不会因为数据源或行业样本状态变化而被截然不同的评分规则处理。PE 缺失 → 0 分。**PB 不参与估值评分**（继续展示并用于异常识别/风险说明），避免通过评分重新制造高 PB 硬否决。缺项候选分数仅用于待核验顺序。
 
@@ -50,16 +50,15 @@ formal要求年度、负债率、PE及行情日期均已核验；pending单列�
 **本轮进一步把该闸门从「仅熊市」扩展到「全市场环境」并更名为 `QV_STABILIZATION_GATE`**：旧名 `QV_BEAR_TIMING_GATE` 通过 `__setattr__`/`__post_init__` **写穿迁移**——`StrategyConfig(QV_BEAR_TIMING_GATE=False)` 与 `config.QV_BEAR_TIMING_GATE = False` 两种写法都继续生效（后者若只靠 `__post_init__` 会静默失效，等于旧配置被悄悄改义）；`QV_BEAR_TIMING_GATE=None`（未指定）不覆盖新配置项。需要关掉时显式 `config.QV_STABILIZATION_GATE = False`。
 
 **2. 综合分下限的等效门槛量化公开**
-`MIN_QV_SCORE=60` 严格强于三道硬闸门之和——评分口径使「恰好压线达标」的公司拿不到 60 分：
+`MIN_QV_SCORE=50` 高于 formal 硬门槛组合的理论最低分，可拦截质量、估值和技术均仅压线的候选：
 
 | 评分项 | 在闸门恰好压线处的取值 |
 |---|---|
-| 质量分（0.50） | 三档同时压线的**最小可达值 = 50**（`_dimension_score` 在阈值处给 50；如 3 年 ROE=(5,10,10) + 现金转换 0.8 → 实测 `verified` 而 `quality_score=50`） |
-| 估值分（0.35，仅 PE） | 行业口径分位上限 0.60 处 = **40**；绝对口径 PE=25 上限处**同样** = **40**（锚点对齐，见 `_valuation_pe_score`）；PB 不参与估值评分 |
+| 质量分（0.45） | 三档同时压线的**最小可达值 = 50** |
+| 估值分（0.30，仅 PE） | 行业口径分位上限 0.60 处 = **40**；绝对口径 PE=25 上限处**同样** = **40** |
+| formal 技术分（0.25） | `MIN_TECHNICAL_SCORE_FORMAL=45` |
 
-因此压线合格候选的综合分上限两种口径都是 **54.0**，均 < 60。反解过线所需技术分（v=40）：质量分 50 时不可达（≥140）；质量分 70 时需 ≥73；质量分 90 时需 ≥7。
-副作用：PE 逐 bar 缺失（AkShare 兜底日）估值分为 0 且候选降为 pending → formal 会归零，与 `FORWARD_MISSING_AS_PENDING=True` 是两个独立叠加的零推荐机制。
-实现：`qv_floor_equivalence()` / `describe_qv_floor()` 随配置实时算出门槛并打进漏斗日志；算术固化为 `test_recommendation_upgrades.TestScoreFloorEquivalence` 与 `test_quality_value_hardening.TestValuationScoring`。
+因此 formal 候选在三项最低门槛下的理论综合分约为 **45.75**；默认下限 50 会实际筛掉边界候选。`qv_floor_equivalence()` / `describe_qv_floor()` 随配置实时计算并写入日志。
 
 **3. 降级与口径回退显式声明**
 - **数据源降级**（Baostock 熔断、全程 AkShare）：零推荐时卡片标题写「数据源不足，本次无正式推荐」而非「今日无信号」，正文点明「原因是数据源，不是市场」。
@@ -88,4 +87,4 @@ test_quality_value_hardening 覆盖本轮六项调整的边界：止跌确认闸
 
 全部为离线合成 fixture：不访问网络、不连接数据库、不做全市场荐股、不发送通知。**这些测试只证明「逻辑按要求实现」，不构成荐股胜率提高的证据**；胜率变化须由 `backtest.py ab --mode quality_value` 之类的样本内/样本外回测另行评估，且仍不等于未来实盘收益。
 
-注：test_quality_recommendations 的合格样本 fixture 已上调（年度 ROE 18/20/22、PE8/PB0.9），使其综合分稳过生产默认下限 MIN_QV_SCORE=60；test_momentum_gates 的 quality_value 节关闭该下限（MIN_QV_SCORE=0）以隔离 KDJ/MACD 闸门归因。
+注：test_quality_recommendations 的合格样本 fixture 已上调（年度 ROE 18/20/22、PE8/PB0.9），使其综合分稳过生产默认下限 MIN_QV_SCORE=50；test_momentum_gates 的 quality_value 节关闭该下限（MIN_QV_SCORE=0）以隔离 KDJ/MACD 闸门归因。

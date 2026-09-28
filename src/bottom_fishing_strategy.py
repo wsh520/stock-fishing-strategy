@@ -260,12 +260,11 @@ class StrategyConfig:
     #   · 三道闸门全部恰好达标的综合分 = 0.45×50 + 0.30×40 + 0.25×技术分
     #     = 34.5 + 0.25×技术分，上限 59.5（技术满分100时）。
     #   若 MIN_QV_SCORE > 59.5，则「压线合格」100% 被淘汰。
-    #   当前设为 40：压线合格（综合分≥34.5）即可通过，硬闸门拥有准入控制权。
-    #   如需提高准入门槛，应上调硬闸门阈值（QUALITY_MEDIAN_ROE_MIN 等），
-    #   而非抬高本下限——后者会让配置文件中声明的阈值变成误导性文档。
+    #   当前设为 50：高于 formal 候选在质量/估值/技术最低门槛下的理论下限，
+    #   使综合分下限真正能淘汰「三项都仅勉强达标」的候选。
+    #   如需关闭，显式设为 0。
     # 运行时可读：qv_floor_equivalence() / describe_qv_floor() 会随配置实时算出等效门槛。
-    # 调整前务必先跑 `python backtest.py ab --mode quality_value`。
-    MIN_QV_SCORE: float = 40.0
+    MIN_QV_SCORE: float = 50.0
 
     # ===== P0：入场时机判读（左侧/右侧 + 止跌确认；仅加标签展示，绝不改推荐口径）=====
     # quality_value（生产默认）的技术面权重为 25%（不否决、QV_ENFORCE_KDJ_MACD_VETO
@@ -745,11 +744,12 @@ def _cache_path(config: StrategyConfig, name: str) -> str:
 
 def _cache_fresh_today(path: str) -> bool:
     if not os.path.exists(path): return False
-    return datetime.fromtimestamp(os.path.getmtime(path)).date() == datetime.now().date()
+    return datetime.fromtimestamp(os.path.getmtime(path), BEIJING_TZ).date() == _beijing_now().date()
 
 def _cache_fresh(path: str, ttl_days: float) -> bool:
     if not os.path.exists(path): return False
-    return datetime.now() - datetime.fromtimestamp(os.path.getmtime(path)) < timedelta(days=ttl_days)
+    cached_at = datetime.fromtimestamp(os.path.getmtime(path), BEIJING_TZ)
+    return _beijing_now() - cached_at < timedelta(days=ttl_days)
 
 def _read_cache_csv(path: str, dtype: Optional[dict] = None) -> Optional[pd.DataFrame]:
     try:
@@ -851,7 +851,7 @@ def _fetch_hist_bs(code: str, period: str, start: str, end: str, config: Strateg
     return df
 
 def _window_dates(bars: int, unit: str) -> tuple[str, str]:
-    end = datetime.now()
+    end = _beijing_now()
     delta = timedelta(weeks=bars) if unit == "weeks" else timedelta(days=bars)
     return (end - delta).strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
 
@@ -944,7 +944,7 @@ def _annualize_roe(roe_ytd: float, quarter: int) -> float:
 def _fetch_fundamentals_bs(code: str, config: Optional[StrategyConfig] = None) -> Optional[dict]:
     config = config or StrategyConfig()
     bs_code = _format_bs_code(code)
-    quarters = _quarter_candidates(datetime.now(), n=config.FUND_LOOKBACK_QUARTERS)
+    quarters = _quarter_candidates(_beijing_now(), n=config.FUND_LOOKBACK_QUARTERS)
     path = ""
     if config.USE_CACHE:
         # 缓存名带起始季度标签：财报窗口滚动后自动失效，避免复用上一季的旧数据。
@@ -1019,7 +1019,7 @@ def _fetch_growth_bs(code: str, config: Optional[StrategyConfig] = None) -> Opti
     if not _BS_AVAILABLE:
         return None
     bs_code = _format_bs_code(code)
-    quarters = _quarter_candidates(datetime.now(), n=config.FUND_LOOKBACK_QUARTERS)
+    quarters = _quarter_candidates(_beijing_now(), n=config.FUND_LOOKBACK_QUARTERS)
     path = ""
     if config.USE_CACHE:
         path = _cache_path(config, f"growth_v1_{bs_code}_{quarters[0][0]}Q{quarters[0][1]}.json")
@@ -1079,7 +1079,7 @@ def _fetch_stock_pool_bs(config: Optional[StrategyConfig] = None) -> list[dict]:
             _bs_guard("bs_all_stock")
             # 非交易日（周末/节假日）query_all_stock 返回空，逐日前退找最近交易日
             for i in range(10):
-                day = (datetime.now() - timedelta(days=i)).strftime("%Y-%m-%d")
+                day = (_beijing_now() - timedelta(days=i)).strftime("%Y-%m-%d")
                 with bs_lock:
                     rs = bs.query_all_stock(day=day)
                 if rs.error_code != '0':
@@ -1393,8 +1393,8 @@ def _fetch_weekly_dual(code: str, config: StrategyConfig) -> Optional[pd.DataFra
         df = _fetch_weekly_bs(code, weeks=config.WEEKLY_BARS, config=config)
     if df is None and _AK_AVAILABLE:
         symbol = _ak_symbol(code)
-        start = (datetime.now() - timedelta(weeks=config.WEEKLY_BARS)).strftime("%Y%m%d")
-        end = datetime.now().strftime("%Y%m%d")
+        start = (_beijing_now() - timedelta(weeks=config.WEEKLY_BARS)).strftime("%Y%m%d")
+        end = _beijing_now().strftime("%Y%m%d")
         raw = _fetch_with_retry(
             lambda: ak.stock_zh_a_hist(symbol=symbol, period="weekly", start_date=start, end_date=end, adjust=config.ADJUST),
             config.MAX_RETRY, f"ak_weekly({symbol})"
@@ -1583,11 +1583,12 @@ def _apply_regime_hysteresis(result: dict, config: StrategyConfig) -> dict:
     raw = str(result.get("regime", "unknown")).lower()
     path = _cache_path(config, "market_regime_state.json")
     state = _read_cache_json(path) or {}
-    today = datetime.now().strftime(_DATE_FMT)
+    today = _beijing_now().strftime(_DATE_FMT)
     updated = state.get("updated")
     if updated:
         try:
-            if (datetime.now() - datetime.strptime(str(updated), _DATE_FMT)).days > 10:
+            updated_day = datetime.strptime(str(updated), _DATE_FMT).replace(tzinfo=BEIJING_TZ)
+            if (_beijing_now() - updated_day).days > 10:
                 state = {}
         except (TypeError, ValueError):
             state = {}
@@ -3404,7 +3405,9 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
     # 两个入口共享同一标签；避免第二入口去重后丢失突破提示。
     from src.volume_breakout_strategy import VolumeBreakoutConfig, evaluate_breakout
     breakout_config = VolumeBreakoutConfig(**{**asdict(config), "RECOMMENDATION_MODE": "technical"})
-    breakout, _ = evaluate_breakout(df, code, name, breakout_config, market_env, None)
+    breakout, _ = evaluate_breakout(
+        df, code, name, breakout_config, market_env, fund_data,
+        latest_trade_date=latest_trade_date)
     if breakout is not None:
         tags.append("放量突破")
     # 入选依据补充：行业相对估值分位（#4a）与当年成长（#4b），便于人工裁量时一眼看清

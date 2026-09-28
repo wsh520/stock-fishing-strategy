@@ -16,7 +16,7 @@
 | 估值（行业相对 PE，#4a） | 默认 `USE_INDUSTRY_RELATIVE_VALUATION=True`：**PE** 在其**所属行业当日横截面**的分位 ≤60%（`VALUATION_INDUSTRY_PERCENTILE_MAX`）才算便宜；行业数据缺失或行业内可比样本 <5（`VALUATION_INDUSTRY_MIN_PEERS`）时**自动回退**绝对 PE 上限 `0<PE TTM≤25`。PE≤0 一律否决、PE 缺失只列待核验。**PB 自本轮起不再单独否决**（高于绝对/行业上限只作异常识别与风险说明，且不进入估值评分）；`PB≤0` 仍按净资产异常否决，PB 缺失只标注缺项、不把核心证据完整的股票降为 pending |
 | 前瞻确认（#4b） | `REQUIRE_FORWARD_CONFIRMATION=True`：Baostock `query_growth_data` 最新报告期净利润同比 < `FORWARD_NI_YOY_MIN`(**-10%**) → `FAIL_FORWARD` 否决（对治「trailing 年报漂亮、当年正在崩」的价值陷阱；恰好等于 -10% 不触发）。报告期须有效且不晚于决策日（1–4 月允许上年三季报/已披露年报，5–8 月至少当年 Q1，9–10 月至少 Q2，11–12 月至少 Q3）；缺失、季度无效或过旧 → 记 `forward` 缺项降级为**待核验**（`FORWARD_MISSING_AS_PENDING=True`，与 [最小修复说明](docs/minimal_repairs.md) 一致；显式设 False 可恢复「缺失放行」）。同比落在 `[FORWARD_NI_YOY_MIN, FORWARD_NI_YOY_WARN)` 即 **[-10%, 0%)** 时**不否决**，仅在决策简报风险项打「业绩下滑预警」黄标 |
 | 价格位置 | 至少250根有效日线，当前收盘价在250日收盘价序列中的百分位排名≤40%（不受单日极端值影响）；取数窗口600自然日 |
-| 综合分下限（#3） | `MIN_QV_SCORE=40`：综合分（0.45×质量+0.30×估值+0.25×技术）<40 的 **formal 候选**否决（`FAIL_QV_SCORE`），弱市自然少推/不推；仅对 formal 生效，pending 不受其累；设 0 关闭。该值与硬闸门阈值对齐——压线合格（综合分≥34.5）即可通过，硬闸门拥有实际准入控制权 |
+| 综合分下限（#3） | `MIN_QV_SCORE=50`：综合分（0.45×质量+0.30×估值+0.25×技术）<50 的 **formal 候选**否决（`FAIL_QV_SCORE`），弱市自然少推/不推；仅对 formal 生效，pending 不受其累；设 0 关闭。该值高于质量、估值与 formal 技术门槛组合的理论下限，能实际拦截三项仅勉强达标的候选。 |
 | 维度短板门槛 | `MIN_QUALITY_SCORE=50`：质量分 < 50 → `FAIL_QUALITY_FLOOR` 直接否决（差公司再便宜也是价值陷阱，防止估值满分拉高综合分的假象）。`MIN_TECHNICAL_SCORE_FORMAL=45`：技术分 < 45 → 降为 pending（基本面好但入场时机未到，跟踪观察但不正式推荐） |
 | 止跌确认闸门 | `QV_STABILIZATION_GATE`：**库级默认 `True`，对全部市场环境生效**。正式推荐必须满足最低止跌证据之一——(a)「当日收盘价 ≥ MA20 **且** MA20 近5日斜率≥0（走平或上行才算有效站上；MA20下行时的"站上"只是下跌反抽）」或 (b)「MACD 柱连续 `MACD_MOMENTUM_DAYS`(=3) 日改善（过滤1-2日反抽噪声）」——否则 `FAIL_STABILIZATION` 否决。用于准入的指标数据不足时**不视为已确认** |
 | 相对强度（排序微调 + 风险提示） | `RS_LOOKBACK`(=60)：同一起止日期下「个股区间涨跌幅 − 沪深300区间涨跌幅」（百分点）。指数日线复用主流程已取得的 `get_index_daily` 结果，按**共有交易日**对齐，只使用决策日及之前的数据。**不设硬性准入线**：以 `RS_WEIGHT`(=3.0) 为上限小幅调整 `rank_score`，资格判定仍用不含该调整的综合分；明显跑输（≤`RS_UNDERPERFORM_WARN`=-10pp）时打风险提示标签。指数缺失/对齐数据不足 → `relative_strength=None`、排序中性，不给「强势/弱势」结论 |
@@ -26,7 +26,7 @@
 
 ### ✅ 综合分下限与硬闸门对齐
 
-`MIN_QV_SCORE=40` 已与硬闸门阈值对齐。评分口径（0.45×质量+0.30×估值+0.25×技术）下「恰好压线达标」的综合分 = 0.45×50 + 0.30×40 + 0.25×技术分 = 34.5 + 0.25×技术分，下限40意味着压线合格即可通过，**硬闸门拥有实际准入控制权**。如需提高准入门槛，应上调硬闸门阈值（如 `QUALITY_MEDIAN_ROE_MIN`），而非抬高综合分下限。运行时 `describe_qv_floor()` 会随配置实时算出等效门槛并打进漏斗日志。调整前务必先跑 `python backtest.py ab --mode quality_value`。
+`MIN_QV_SCORE=50` 已设置在 formal 候选理论最低分之上，使综合分闸门能够实际区分“三项均压线”的候选。运行时 `describe_qv_floor()` 会随配置实时算出等效门槛并打进漏斗日志。调整前务必先跑 `python backtest.py ab --mode quality_value`。
 
 **市场级刹车（#2，已对 quality_value 生效）**：此前 quality_value 在 `main()` 提前 return，绕过了组合层风控；现已把**急跌熔断**（沪深300 近5日累计 ≤ `MARKET_CRASH_HALT_PCT`(-4%) → 当日不推荐）与**推荐数量按 regime 收缩**（牛 `MAX_PICKS`=5 / 中性 `NEUTRAL_MAX_PICKS`=4 / 熊 `BEAR_MAX_PICKS`=2，由 `resolve_max_picks` 解析）移到分支之前，两种模式共用。quality_value 还默认启用 ATR/收盘价≤`MAX_ATR_PCT`(10%) 波动率闸门（与3×ATR止损+30%止盈下RR≥2.0对齐），`QV_ATR_GUARD=False` 可关闭；technical 继续使用自己的 ATR 闸门。
 
