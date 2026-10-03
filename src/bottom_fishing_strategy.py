@@ -315,6 +315,39 @@ class StrategyConfig:
     # 覆盖 QV_STABILIZATION_GATE；保持 None 表示「未指定」，不抹掉新配置项的值。
     QV_BEAR_TIMING_GATE: Optional[bool] = None
 
+    # ===== P0：止跌闸门判据重构（risk_only 模式，默认关闭=保持原 strict 口径）=====
+    # 实测诊断（798 只本地缓存，2025-12-24~2026-09-18）结论：
+    #   strict 口径下 180 只估值合格候选被止跌闸门砍掉 145 只（80.6%），其中 140 只
+    #   **唯一**的败因是「收盘在 MA20 下方」；而 MACD 改善证据只占 23/180(12.8%)。
+    #   即该闸门实际近乎等价于「必须站上 MA20」——这是一条追高/择时条件，却被当成
+    #   安全否决项在用，且与左侧低吸策略的立意直接冲突。
+    # risk_only 把判据拆成两件事，各自归位：
+    #   1) 否决只保留**真正的危险形态**：MACD 深度弱势且仍在恶化
+    #      （复用 macd_not_deeply_weak，与突破策略层 3.8 同一实现、同一阈值，
+    #        不新造第二套口径）。深度弱势必须与「仍在恶化」取合取，否则匀速上行
+    #        形态会被系统性误杀（见 MACD_WEAK_* 设计说明）。
+    #   2) 「站上 MA20」从否决项**降级为标签**：站上→strong/medium 标签，
+    #      未站上但无危险证据→watch 层（missing 降级为 pending，只观察不推荐），
+    #      不再直接淘汰。
+    # medium 层新增一条左侧通道：站上 MA60 且近 N 日未创新低——中期趋势已转正的
+    # 短期回调形态，此前仅因 MA20 的 5 日斜率口径被误杀。
+    # 三种取值：strict（默认，原口径）/ risk_only（新口径）/ disabled（闸门关闭）。
+    QV_STABILIZATION_MODE: str = "strict"
+    # risk_only 下 watch 层的 pending 标记（加入 missing → 不进正式推荐，仅进观察池）。
+    QV_STABILIZATION_WATCH_PENDING: bool = True
+
+    # ===== P1：250日低位分位进排序权重（默认 0=关闭，只影响排序不影响准入）=====
+    # 实测 Spearman 秩相关（n=180，单截面）：
+    #   250日分位 ρ=−0.35（全部因子里区分度最强，且方向为「越低越好」）
+    #   技术分 ρ=−0.08~−0.13（弱负）、PE 分位 ρ≈−0.03（几乎无区分度）
+    # 也就是说 LOW_POSITION_MAX 只把 60% 的股票按 0/1 砍掉，砍完就把这个
+    # 最强因子的连续信息完全丢弃了（通过者 position 恒 ∈ [0, 0.40]，
+    # 通过与否二值化，剩下的区分度无从体现）。
+    # 本项把闸门内的连续位置重新引回排序：得分 = 权重 × (1 − position/LOW_POSITION_MAX)
+    #   position=0（250日最低点）→ 满分；position=LOW_POSITION_MAX（压线）→ 0 分。
+    # 与 CONSOLIDATION_BONUS / RS_WEIGHT 同属「排序微调」，不参与任何准入判定。
+    QV_POSITION_RANK_WEIGHT: float = 0.0
+
     # ===== 近 60 日相对沪深300强度（排序微调 + 风险提示，不设硬性准入线）=====
     # 定义：同一起止日期下，个股区间涨跌幅 − 沪深300区间涨跌幅（百分点）。
     # 只使用决策当日及之前的数据；起止日期必须对齐。
@@ -3107,6 +3140,13 @@ def qv_floor_equivalence(config: StrategyConfig) -> dict:
                 min_quality = float(probe["quality_score"])
     except Exception:  # noqa: BLE001  纯审计信息，任何失败都不影响选股
         min_quality = 50.0
+    # 关键修正：进入综合分计算的 verified 候选必须先过 MIN_QUALITY_SCORE 硬门，
+    # 因此「压线合格样本」的质量分不是评分锚点 50，而是 max(评分锚点, 质量硬门)。
+    # 不取 max 会让 MIN_QUALITY_SCORE=60 时仍按 50 算上限，把上限算低、审计结论偏乐观
+    # （曾导致 P2 的等效门槛被低估约 5 分）。质量硬门为 0（关闭）时行为与旧版一致。
+    _q_floor = float(getattr(config, "MIN_QUALITY_SCORE", 0.0) or 0.0)
+    if _q_floor > min_quality:
+        min_quality = _q_floor
     # 两种口径在各自准入上限处锚定相同估值分（_valuation_pe_score 设计）
     v_anchor = 100.0 * (1.0 - float(getattr(config, "VALUATION_INDUSTRY_PERCENTILE_MAX", 0.60)))
     v_industry = v_anchor
@@ -3610,11 +3650,38 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
             _progress = min(1.0, (_days_low - _d_min) / max(1, _d_max - _d_min))
             _cons_bonus = round(_cb_max * _progress, 3)
     rank_score = round(rank_score + _cons_bonus, 3)
+    # ===== P1：250日低位分位进排序（不参与准入）=====
+    # LOW_POSITION_MAX 把 position 二值化在 [0, LOW_POSITION_MAX] 内，闸门内剩下的
+    # 连续区分度被丢弃；而实测 Spearman 显示 position 是全部因子里区分度最强的
+    # （ρ=−0.35，方向越低越好），远强于技术分（−0.08~−0.13）与 PE 分位（≈−0.03）。
+    # 这里把闸门内的连续位置映射回 [0, QV_POSITION_RANK_WEIGHT] 加到 rank_score：
+    #   得分 = 权重 × (1 − position / LOW_POSITION_MAX)
+    # position=0（250日最低）拿满分，position=LOW_POSITION_MAX（恰好压线）拿 0 分。
+    # 权重默认 0（关闭），A/B 验证后再考虑是否设为正值。
+    _pos_w = float(getattr(config, "QV_POSITION_RANK_WEIGHT", 0.0) or 0.0)
+    _pos_score = 0.0
+    if _pos_w > 0:
+        _cap = float(getattr(config, "LOW_POSITION_MAX", 0.0) or 0.0)
+        if _cap > 0:
+            _pos_ratio = min(max(position / _cap, 0.0), 1.0)
+            _pos_score = _pos_w * (1.0 - _pos_ratio)
+    rank_score = round(rank_score + _pos_score, 3)
     # ===== 规则1：止跌确认分层（QV_STABILIZATION_GATE）=====
     # strong：站上MA20且MA20不下行，同时站上MA60；
     # medium：MA20确认，或MACD柱改善且近N日没有新低；
     # weak：MACD柱改善但近N日仍创新低，只保留为待核验观察；
     # none：指标缺失或没有改善，直接淘汰。MACD和低点数据不足绝不放行。
+    #
+    # 【P0 / QV_STABILIZATION_MODE】
+    #   "strict"（默认）：上述原口径，逐字保持不变。
+    #   "risk_only"：否决权收归「MACD 深度弱势且仍在恶化」这一条真正的危险形态，
+    #     「站上 MA20」降级为标签（未站上但无危险证据 → watch 层，按配置转 pending
+    #     或直接放行），medium 新增「站上 MA60 且未创新低」左侧通道。
+    #   "disabled"：闸门整体关闭，止跌不参与判定（等价于把 QV_STABILIZATION_GATE
+    #     设为 False，但保留 watch/strong 标签，便于 A/B 分离「标签」与「否决」）。
+    _stab_mode = str(getattr(config, "QV_STABILIZATION_MODE", "strict") or "strict").strip().lower()
+    if _stab_mode not in ("strict", "risk_only", "disabled"):
+        _stab_mode = "strict"
     stabilization_level = "confirmed"
     if getattr(config, "QV_STABILIZATION_GATE", True):
         _ma20_ok = False
@@ -3635,26 +3702,49 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
             _hist = pd.to_numeric(technical["macd_histogram"].iloc[-(_n_mom + 1):], errors="coerce")
             if np.isfinite(_hist.to_numpy()).all():
                 _macd_improving = _macd_momentum_ok(technical, config)
+        # 无新低判定不再依赖 _macd_improving：risk_only 需要把「未创新低」当作
+        # 独立的止跌证据单独使用。strict 下该结果仍只被 `_macd_improving and _no_new_low`
+        # 消费，故提前计算不改变 strict 口径。
         _no_new_low = False
         _low_n = max(2, int(getattr(config, "STABILIZATION_NO_NEW_LOW_LOOKBACK", 5)))
         _prior_n = max(_low_n, int(getattr(config, "STABILIZATION_PRIOR_LOW_LOOKBACK", 20)))
-        if _macd_improving and "low" in technical.columns and len(technical) >= _low_n + _prior_n:
+        if "low" in technical.columns and len(technical) >= _low_n + _prior_n:
             _lows = pd.to_numeric(technical["low"], errors="coerce")
             _recent = _lows.iloc[-_low_n:]
             _prior = _lows.iloc[-(_low_n + _prior_n):-_low_n]
             _no_new_low = bool(np.isfinite(_recent.to_numpy()).all() and np.isfinite(_prior.to_numpy()).all()
                                and (_recent > 0).all() and (_prior > 0).all()
                                and float(_recent.min()) >= float(_prior.min()))
-        if _ma20_ok and _above_ma60:
-            stabilization_level = "strong"
-        elif _ma20_ok or (_macd_improving and _no_new_low):
-            stabilization_level = "medium"
-        elif _macd_improving:
-            stabilization_level = "weak"
+        if _stab_mode == "risk_only":
+            # 危险形态：MACD 深度弱势 AND 仍在恶化（复用 KDJ/MACD 闸门同一实现）。
+            # 只有这一种形态被否决——即「下跌仍在加速」的接飞刀形态。
+            if not macd_not_deeply_weak(technical, config.MACD_WEAK_DAYS,
+                                        config.MACD_WEAK_HIST_PCT):
+                return None, "FAIL_STABILIZATION"
+            if _ma20_ok and _above_ma60:
+                stabilization_level = "strong"
+            elif _ma20_ok or (_above_ma60 and _no_new_low) or (_macd_improving and _no_new_low):
+                stabilization_level = "medium"
+            elif _macd_improving:
+                stabilization_level = "weak"
+            else:
+                # 无止跌证据、但也没有危险证据 → 降级为观察层而非淘汰。
+                stabilization_level = "watch"
+                if bool(getattr(config, "QV_STABILIZATION_WATCH_PENDING", True)):
+                    missing.append("stabilization_watch")
+        elif _stab_mode == "disabled":
+            stabilization_level = "disabled"
         else:
-            return None, "FAIL_STABILIZATION"
-        if stabilization_level == "weak":
-            missing.append("stabilization_weak")
+            if _ma20_ok and _above_ma60:
+                stabilization_level = "strong"
+            elif _ma20_ok or (_macd_improving and _no_new_low):
+                stabilization_level = "medium"
+            elif _macd_improving:
+                stabilization_level = "weak"
+            else:
+                return None, "FAIL_STABILIZATION"
+            if stabilization_level == "weak":
+                missing.append("stabilization_weak")
     else:
         stabilization_level = "disabled"
     timing["stabilization_level"] = stabilization_level
@@ -3698,6 +3788,9 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
         tags.append("止跌强确认")
     elif stab_level == "medium":
         tags.append("止跌中确认")
+    elif stab_level == "watch":
+        # risk_only 模式新增：无止跌证据但也无危险证据，纯观察层（不推荐）。
+        tags.append("无止跌证据")
     elif stab_level == "weak":
         tags.append("止跌弱确认·待核验")
     tags[0] = "优质低估低位" if formal_eligible else "低位观察候选"
