@@ -146,9 +146,50 @@ class StrategyConfig:
     QUALITY_REQUIRE_ANNUAL_CASHFLOW_POSITIVE: bool = True
     LOW_POSITION_LOOKBACK: int = 250     # 低位闸门回看交易日数
     LOW_POSITION_MAX: float = 0.40       # 百分位排名上限（0.40 = 收盘价处于250日序列后40%以内）
-    # ===== 综合评分权重 =====
+    # ===== 综合评分权重（三项之和必须为 1.0，由 _validate_score_weights 硬校验）=====
     # 技术面从 15% 提高到 25%：让有底部形态的股票排到前面，避免"价值陷阱"因
     # 质量/估值满分而占据推荐名额。质量仍是核心（45%），估值次之（30%）。
+    #
+    # 【P4：估值权重再分配套件（默认全 0 = 不改变现状）】
+    # 实测（评估日 2026-06-04，n=168，前瞻窗口取真实后续行情）：
+    #   ρ(PE, 未来收益) = −0.44(F5) / −0.25(F10) / −0.07(F20) / −0.09(F60)
+    #   是全部因子里唯一有区分度的（负号 = 越便宜越好）；
+    #   技术分 ρ=+0.26/+0.07/+0.05/+0.03、250日分位 ρ≈+0.02~+0.15。
+    #
+    # **为什么不给 PE 加独立的排序权重**（曾评估并否决）：
+    #   实测 ρ(PE, valuation_score) = −1.0000 —— PE 绝对值与 _valuation_pe_score
+    #   在绝对口径下是线性负映射，**完全共线**。PE 的连续信息已被
+    #   VALUATION_SCORE_WEIGHT(0.30) × valuation_score 完整编码过一次，
+    #   再加一层排序权重是纯粹的重复计算，只会放大估值分的实际影响而
+    #   不提供新信息。正确做法是**调高估值在综合分里的权重**。
+    #
+    # 为什么仍不动默认值（保持 0.45/0.30/0.25）：
+    #   · PE 的区分度**只在 F5 显著**（−0.44），到 F20 衰减到 −0.07，
+    #     分组差异仅 +0.08pp（噪声）。短窗有效更可能是波动而非 alpha。
+    #   · 样本只有 168 只、单一时点，且处于全市场下跌区间（多数候选 F20 为负），
+    #     无法区分「便宜股真的更好」与「超跌反弹」。
+    #   · Top15 权重敏感性实测：提高估值权重 F5 从 +1.67 → +2.37（有改善），
+    #     但 F20 从 −3.01 → −3.33（略差），与上述判断一致。
+    #
+    # 【P4 的实际效果比预期更紧，上线前必须知道这一点】
+    # 估值权重是从**技术权重**挪来的，而综合分压线上限 = qw×质量 + vw×估值 + tw×100
+    # 里 tw×100 这一项的绝对值最大（0.25×100=25 → 0.10×100=10），所以上限不升反降：
+    #   现状(0.45/0.30/0.25)：压线上限 59.5，过线所需技术分 ≥62
+    #   P4 (0.45/0.45/0.10)：压线上限 50.5，过线所需技术分 ≥95
+    # 即 P4 是**双重收紧**：技术分门槛抬高 33 分，且 50.5 距 MIN_QV_SCORE=50 只剩
+    # 0.5 分 —— 「三道硬闸门全部压线合格」的候选几乎不可能靠综合分过线，
+    # MIN_QV_SCORE 开始接近成为主导闸门。跑 A/B 时若候选数骤降，
+    # 要先分清是「估值筛掉了差公司」还是「分数线被技术权重压低挤掉了」，别直接
+    # 归因为前者。用 describe_qv_floor(config) 可实时看到这两个数字。
+    #
+    # 下面是**预注册**的权重组合，供 A/B 与 `backtest.py --set` 使用；
+    # 建议先积累更长样本（覆盖上涨/震荡/下跌三种市况）再决定是否上线。
+    # 若最终上线，需同时复核 MIN_QV_SCORE 是否要跟着下调。
+    #   P4_VALUATION_WEIGHT=0.45 / P4_TECHNICAL_WEIGHT=0.10（质量保持 0.45）
+    P4_VALUATION_WEIGHT: Optional[float] = None
+    P4_TECHNICAL_WEIGHT: Optional[float] = None
+    # 生效后的实际权重（默认即现状；设置 P4_* 时由 _validate_score_weights 覆写，
+    # 质量权重自动吸收差额以保持三项和为 1.0）
     QUALITY_SCORE_WEIGHT: float = 0.45
     VALUATION_SCORE_WEIGHT: float = 0.30
     TECHNICAL_SCORE_WEIGHT: float = 0.25
@@ -649,10 +690,65 @@ class StrategyConfig:
         object.__setattr__(self, name, value)
 
     def __post_init__(self):
-        """兜底：dataclass 构造结束时再同步一次旧配置名（幂等，与 __setattr__ 同语义）。"""
+        """构造结束时同步旧配置名，并校验综合分三项权重之和（坑 1 防护）。
+
+        ① 旧配置名迁移：QV_BEAR_TIMING_GATE → QV_STABILIZATION_GATE（幂等，与 __setattr__ 同语义）。
+        ② 权重和校验：QUALITY/VALUATION/TECHNICAL 三项之和必须为 1.0。
+           为什么必须硬校验而不是只写在注释里：
+             综合分 = qw×质量 + vw×估值 + tw×技术，而 MIN_QV_SCORE 是**绝对分数线**。
+             权重和 <1 会把综合分整体下移，使「三道硬闸门全部压线合格」的候选
+             被系统性淘汰——实测把 TECHNICAL 0.25→0.10 而不补偿时，压线合格上限
+             从 59.5 掉到 44.5（低于默认下限 50），合格者 100% 全灭。
+             那种情况下测的是「降分数线」而非「换权重」，A/B 结论会被彻底污染，
+             而配置本身看不出异常（三个数都是合法正数）。
+           容忍 1e-6 浮点误差；仅在偏差超限时抛错，快速失败优于静默错配。
+           权重全为 0（显式关闭综合分）也视为非法，避免 MIN_QV_SCORE 失去意义。
+        """
         legacy = self.QV_BEAR_TIMING_GATE
         if legacy is not None:
             object.__setattr__(self, "QV_STABILIZATION_GATE", bool(legacy))
+        self._validate_score_weights()
+
+    def _validate_score_weights(self) -> None:
+        """应用 P4 权重套件并校验综合分三项权重之和为 1.0。
+
+        P4 语义：P4_VALUATION_WEIGHT / P4_TECHNICAL_WEIGHT 是**预注册的重分配目标值**
+        （非增量）。设置后，技术权重取该目标值，估值权重取该目标值，
+        质量权重吸收差额以保持三项和为 1.0 —— 这样调用方只需指定「估值要多少、
+        技术要多少」两个数，不必自己心算补差，从根上避免坑 1（权重和失衡）。
+        两个都为 None（默认）时完全不改动权重。
+        """
+        pv = getattr(self, "P4_VALUATION_WEIGHT", None)
+        pt = getattr(self, "P4_TECHNICAL_WEIGHT", None)
+        if pv is not None or pt is not None:
+            tw = float(pt) if pt is not None else float(self.TECHNICAL_SCORE_WEIGHT)
+            vw = float(pv) if pv is not None else float(self.VALUATION_SCORE_WEIGHT)
+            qw = 1.0 - vw - tw
+            if qw < 0:
+                raise ValueError(
+                    f"P4 权重套件无解：P4_VALUATION_WEIGHT={vw} + P4_TECHNICAL_WEIGHT={tw} "
+                    f"已超过 1.0，质量权重会变成 {qw:.4f}（负数）。\n"
+                    f"  请把估值/技术目标权重之和调到 <1.0，例如 0.45 + 0.10。")
+            object.__setattr__(self, "QUALITY_SCORE_WEIGHT", round(qw, 6))
+            object.__setattr__(self, "VALUATION_SCORE_WEIGHT", round(vw, 6))
+            object.__setattr__(self, "TECHNICAL_SCORE_WEIGHT", round(tw, 6))
+        qw = float(self.QUALITY_SCORE_WEIGHT)
+        vw = float(self.VALUATION_SCORE_WEIGHT)
+        tw = float(self.TECHNICAL_SCORE_WEIGHT)
+        total = qw + vw + tw
+        if abs(total - 1.0) > 1e-6:
+            raise ValueError(
+                f"综合分三项权重之和必须为 1.0，当前为 {total:.4f}"
+                f"（质量 {qw} + 估值 {vw} + 技术 {tw}）。\n"
+                f"  原因：MIN_QV_SCORE={float(getattr(self, 'MIN_QV_SCORE', 0.0)):.0f} 是绝对分数线，\n"
+                f"  权重和 <1 会整体下移综合分，使三道硬闸门全部压线合格的候选被系统性淘汰\n"
+                f"  （实测 TECHNICAL 0.25→0.10 不补偿时，上限 59.5→44.5 < 下限 50，合格者全灭）。\n"
+                f"  修法二选一：\n"
+                f"   · 手动把差额补给另外两项，保持和为 1.0"
+                f"（例：TECHNICAL 0.10 配 QUALITY 0.55 / VALUATION 0.35）；\n"
+                f"   · 或改用 P4 预注册套件：只设 P4_VALUATION_WEIGHT / P4_TECHNICAL_WEIGHT，\n"
+                f"     质量权重会自动吸收差额（推荐，不会算错）。\n"
+                f"  若确实要整体放宽分数线，请显式下调 MIN_QV_SCORE，而不是让权重和失衡。")
 
 # ===========================================================================
 # CacheManager
@@ -3153,6 +3249,8 @@ def qv_floor_equivalence(config: StrategyConfig) -> dict:
     # 因此「压线合格样本」的质量分不是评分锚点 50，而是 max(评分锚点, 质量硬门)。
     # 不取 max 会让 MIN_QUALITY_SCORE=60 时仍按 50 算上限，把上限算低、审计结论偏乐观
     # （曾导致 P2 的等效门槛被低估约 5 分）。质量硬门为 0（关闭）时行为与旧版一致。
+    # 同时保留评分锚点原值 anchor_quality，供坑 2 的「抬质量硬门连带放松技术面」审计用。
+    anchor_quality = min_quality
     _q_floor = float(getattr(config, "MIN_QUALITY_SCORE", 0.0) or 0.0)
     if _q_floor > min_quality:
         min_quality = _q_floor
@@ -3170,6 +3268,7 @@ def qv_floor_equivalence(config: StrategyConfig) -> dict:
             return None
         return (floor - qw * quality_score - vw * valuation_score) / tw
 
+    req_tech = _req_tech(min_quality, v_industry)
     return {
         "floor": floor,
         "min_verified_quality": round(min_quality, 2),
@@ -3177,8 +3276,16 @@ def qv_floor_equivalence(config: StrategyConfig) -> dict:
         "valuation_absolute_at_cap": round(v_absolute, 2),
         "ceiling_industry": round(_ceiling(v_industry), 2),
         "ceiling_absolute": round(_ceiling(v_absolute), 2),
-        "req_tech_industry": _req_tech(min_quality, v_industry),
+        "req_tech_industry": req_tech,
         "req_tech_absolute": _req_tech(min_quality, v_absolute),
+        # 【坑 2 防护】抬 MIN_QUALITY_SCORE 的连带效应：质量基线抬高 → 综合分基线抬高
+        # → 「过线所需技术分」下降。也就是说 P2 单独上线并非单纯收紧，而是
+        # 「质量↑ / 技术↓」。req_tech_anchor_only 给出「若不抬质量硬门」时的所需技术分
+        # （权重与下限均不变，仅质量分取评分锚点），两者之差即放松幅度，可被断言审计。
+        "req_tech_anchor_only": _req_tech(anchor_quality, v_industry),
+        "quality_weight": qw,
+        "valuation_weight": vw,
+        "technical_weight": tw,
     }
 
 
@@ -3196,12 +3303,25 @@ def describe_qv_floor(config: StrategyConfig) -> str:
     verdict = ("低于下限 → 该下限严格强于三道硬闸门，压线合格者 100% 被淘汰"
                if e["ceiling_industry"] < e["floor"] else
                "不低于下限 → 压线合格者能否过线取决于技术分，本下限只拦综合分不足的候选")
+    # 【坑 2 防护】把「抬质量硬门连带放松技术面」这一副作用显式打出来。
+    # MIN_QUALITY_SCORE 抬高 → 压线质量分抬高 → 综合分基线抬高 → 所需技术分下降。
+    # 即 P2 单独上线是「质量↑/技术↓」而非单纯收紧。只在确有偏差时才追加说明，
+    # 避免默认口径下刷屏。
+    side = ""
+    rt, rt_anchor = e.get("req_tech_industry"), e.get("req_tech_anchor_only")
+    if (isinstance(rt, float) and isinstance(rt_anchor, float)
+            and rt_anchor - rt > 0.5):
+        side = (f"；⚠ 质量硬门 {_fmt(e['min_verified_quality'])} 已抬高连带放松技术面"
+                f"（所需技术分 {_fmt(rt_anchor)} → {_fmt(rt)}，"
+                f"放松 {rt_anchor - rt:.0f} 分）——本项非单纯收紧，"
+                f"若要同时收紧技术须配技术分降权（注意三项权重和须保持 1.0）")
     return (
-        f"综合分下限 {e['floor']:.0f}｜压线合格样本质量分仅 {e['min_verified_quality']:.1f}，"
+        f"综合分下限 {e['floor']:.0f}｜压线合格样本质量分 {e['min_verified_quality']:.1f}，"
         f"估值分（仅PE）在行业/绝对口径压线处均锚定 {e['valuation_industry_at_cap']:.0f}，"
         f"其综合分上限为 {e['ceiling_industry']:.1f}"
         f"（{verdict}）；"
         f"要过线所需技术分：{_fmt(e['req_tech_industry'])}"
+        f"{side}"
     )
 
 

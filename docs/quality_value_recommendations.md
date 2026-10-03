@@ -118,14 +118,63 @@
 | PE(TTM) | **−0.46** | −0.13 | −0.04 | −0.23 | **最强**（越便宜越好） |
 
 **结论：PE 是当前唯一有稳定区分度的因子，但它只用于闸门（绝对 PE≤25 / 行业分位≤60%）
-与综合分（`VALUATION_SCORE_WEIGHT=0.30`），尚未作为连续排序权重使用。
-这是下一步优化最值得动的方向。**
+与综合分（`VALUATION_SCORE_WEIGHT=0.30`）。**
+
+### P4：估值权重再分配（预注册，默认**未启用**）
+
+`diag_pe_value.py` 的实测把「PE 该怎么用」这个问题回答清楚了：
+
+| 关系 | 实测值 | 含义 |
+|---|---|---|
+| ρ(PE, `valuation_score`) | **−1.0000** | PE 与估值分在绝对口径下是线性负映射，**完全共线** |
+| ρ(PE, 未来收益 F5) | −0.44 | 区分度最强，但只在短窗 |
+| ρ(PE, 未来收益 F20) | −0.07 | 衰减到噪声 |
+
+**因此「给 PE 加一层独立的排序权重」是重复计算，已否决** —— PE 的连续信息已被
+`VALUATION_SCORE_WEIGHT × valuation_score` 完整编码过一次，再叠一层只会放大估值分的
+实际影响而不提供新信息。正确做法是**调高估值在综合分里的权重**。
+
+落地为两个预注册配置项（`P4_VALUATION_WEIGHT` / `P4_TECHNICAL_WEIGHT`，
+默认均为 `None` = 完全不改变现状），它们是**重分配目标值**而非增量，质量权重自动吸收
+差额以保持三项和为 1.0：
+
+```python
+StrategyConfig(P4_VALUATION_WEIGHT=0.45, P4_TECHNICAL_WEIGHT=0.10)
+# → 质量 0.45 / 估值 0.45 / 技术 0.10
+```
+
+已注册 4 个 A/B 变体供 `python backtest.py ab --variants` 使用：
+`p4_v45_t10`、`p4_v40_t20`、`p4_v50_t10`、`p4_v40_t10`。
+
+**P4 的实际效果是双重收紧，比预期更严。** 估值权重是从技术权重挪来的，而压线上限
+`qw×质量 + vw×估值 + tw×100` 里 `tw×100` 绝对值最大（0.25×100=25 → 0.10×100=10），
+所以上限不升反降：
+
+| 权重（质量/估值/技术） | 压线合格上限 | 过线所需技术分 |
+|---|---|---|
+| 现状 0.45/0.30/0.25 | 59.5 | ≥62 |
+| P4 0.45/0.45/0.10 | 50.5 | **≥95** |
+
+50.5 距 `MIN_QV_SCORE=50` 只剩 0.5 分 —— 「三道硬闸门全部压线合格」的候选几乎不可能靠
+综合分过线，`MIN_QV_SCORE` 开始接近成为主导闸门。跑 A/B 时若候选数骤降，要先分清是
+「估值筛掉了差公司」还是「分数线被技术权重压低挤掉了」，用 `describe_qv_floor(config)`
+实时看这两个数字。**若最终上线，需同时复核 `MIN_QV_SCORE` 是否要跟着下调。**
+
+**当前状态：P4 不上线。** 区分度只在 F5 显著、F20 衰减到噪声，Top15 权重敏感性实测
+F5 从 +1.67 → +2.37（改善）但 F20 从 −3.01 → −3.33（略差）；样本仅 168 只、单一时点，
+且处于全市场下跌区间，无法区分「便宜股真的更好」与「超跌反弹」。
 
 > 方法论警示：统计「未来 N 日收益」时不要用 `df.iloc[-1 + h]` —— 负索引会变成
 > 正索引取到**历史**价格，且 `len(df) > h` 守卫恒成立不报错。本项目曾因此得出
 > 完全相反的结论。正确做法见 `diag_predictive.py` 的 `EVAL_OFFSET`：
 > 评估日从末根前移，前瞻窗口取真实后续行情；设 `EVAL_OFFSET=0` 时
 > 所有前瞻收益必须全为 NaN，可作自检。
+
+> 上面两个权重硬约束现已由代码强制：`_validate_score_weights` 在 `__post_init__` 里
+> 校验三项权重之和，≠1.0 直接抛 `ValueError`（含根因与两条修法），因此
+> `asdict(config)` 回灌等路径也无法绕过；「抬质量硬门连带放松技术面」由
+> `qv_floor_equivalence` 的 `req_tech_anchor_only` 量化，并由 `describe_qv_floor`
+> 在偏差 >0.5 分时显式告警（默认口径不刷屏）。回归见 `test_score_weight_p4.py`。
 
 `rank_score=score+相对沪深300强度微调（最多±3）+经结构确认的横盘加分（最多5）+低位分位权重（默认0）`，仅改变通过者先后。正式候选按rank_score、质量分、估值分降序，再按代码升序；排序不能挽救未通过资格的股票。行业分散、市场数量收缩和急跌熔断继续生效。
 
@@ -143,6 +192,12 @@ python -B -m unittest discover -s tests -p test_strategy_revision.py -v
 python -B -m unittest discover -s tests -p test_breakout_verification_offline.py -v
 python -B -m unittest test_fundamental_quality test_quality_recommendations test_quality_value_hardening test_recommendation_upgrades test_minimal_quality_repairs -q
 python -B test_entry_filters.py
+python -B test_score_weight_p4.py
 ```
 
 旧年度/估值/单项前瞻测试显式关闭新多维模块并使用legacy评分，隔离其原有职责；新增策略测试使用默认分组和多维核验，覆盖两阶段初筛、终审不误晋级、代码/日期隔离、观察优先、底部结构及兼容权重。测试使用合成数据与mock，不发送通知、不连接数据库。结果证明规则行为，不证明收益改善。
+
+`test_score_weight_p4.py` 覆盖 P4 套件与两个权重坑的防护：默认口径零回归、权重和≠1 必抛
+`ValueError`（含 `asdict` 回灌路径与浮点容差）、P4 自动补差与无解拦截、字符串入参
+（`backtest.py --set` 路径）、技术权重为 0 时的优雅降级、`VolumeBreakoutConfig` 继承链
+不回归，以及「P4 默认不上线」这一决策的固化。

@@ -186,13 +186,21 @@ check("P3: 综合分确实随权重改变（技术分降权后分数不同）",
 # 那样测到的就不是「换权重」而是「降分数线」，A/B 结论会被彻底污染。
 _e_p3_ok = m.qv_floor_equivalence(m.StrategyConfig(
     TECHNICAL_SCORE_WEIGHT=0.10, QUALITY_SCORE_WEIGHT=0.55, VALUATION_SCORE_WEIGHT=0.35))
-_e_p3_bad = m.qv_floor_equivalence(m.StrategyConfig(TECHNICAL_SCORE_WEIGHT=0.10))
 check(f"P3: 补偿后权重和=1，压线合格上限 {_e_p3_ok['ceiling_industry']:.1f} ≥ 下限 "
       f"{_e_p3_ok['floor']:.0f}（压线合格者不被系统性淘汰）",
       _e_p3_ok["ceiling_industry"] >= _e_p3_ok["floor"])
-check(f"P3: 不补偿则上限 {_e_p3_bad['ceiling_industry']:.1f} < 下限 "
-      f"{_e_p3_bad['floor']:.0f}（证明补偿是必需的）",
-      _e_p3_bad["ceiling_industry"] < _e_p3_bad["floor"])
+# 2026-10 第三轮：坑 1 已升级为构造期硬校验（_validate_score_weights 抛 ValueError），
+# 所以「不补偿」这个状态现在**构造不出来**——原本靠算术演示「上限 44.5 < 下限 50」
+# 的断言，改为断言它被拦住。数值论证保留在 ValueError 的错误文案里。
+try:
+    m.StrategyConfig(TECHNICAL_SCORE_WEIGHT=0.10)
+    _p3_bad_blocked = False
+    _p3_bad_ceiling = float("nan")
+except ValueError as _e:
+    _p3_bad_blocked = True
+    _p3_bad_ceiling = None
+check("P3: 不补偿（权重和=0.85）在构造期即被硬校验拦住，不再可能流入选股口径",
+      _p3_bad_blocked)
 
 # ===========================================================================
 # 6) qv_floor_equivalence 的质量分下限必须跟随 MIN_QUALITY_SCORE（P2 的审计前提）
@@ -217,10 +225,6 @@ check(f"审计: P2 使所需技术分从 {_e_base['req_tech_industry']:.0f} 降�
       _e_p2["req_tech_industry"] < _e_base["req_tech_industry"])
 
 # ===========================================================================
-_ok = sum(1 for _, ok in _RESULTS if ok)
-print(f"\n{_ok}/{len(_RESULTS)} 通过")
-
-# ===========================================================================
 # 7) 上线决策固化：P0/P1 当前**不建议**开启（实测未证明有收益）
 # ===========================================================================
 # 评估日 2026-06-04、n=168、前瞻窗口取真实后续行情（非历史价）的实测结论：
@@ -237,5 +241,13 @@ check("决策: P1 权重默认 0（分位几乎无区分度，不上线）",
 check("决策: P3 技术分权重默认 0.25（实测技术分 ρ=+0.21~+0.26 正向，降权与数据相悖）",
       _cfg_final.TECHNICAL_SCORE_WEIGHT == 0.25)
 
+# ===========================================================================
+# 汇总必须放在**所有** check() 之后。
+# 2026-10-03 修复：本汇总原先位于第 7 节之前，_ok 在第 7 节追加 3 项断言前就已定型，
+# 末尾 `if _ok != len(_RESULTS)` 于是拿 30 比 33，永远误报失败并抛 SystemExit(1)，
+# 看起来像「有测试挂了」实则全部通过 —— 比没有门禁更糟（会掩盖真实失败）。
+# ===========================================================================
+_ok = sum(1 for _, ok in _RESULTS if ok)
+print(f"\n{_ok}/{len(_RESULTS)} 通过")
 if _ok != len(_RESULTS):
     raise SystemExit(1)

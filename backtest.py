@@ -1490,6 +1490,15 @@ AB_VARIANTS: dict[str, dict[str, dict]] = {
         "p03": {"QV_STABILIZATION_MODE": "risk_only",
                 "TECHNICAL_SCORE_WEIGHT": 0.10,
                 "QUALITY_SCORE_WEIGHT": 0.55, "VALUATION_SCORE_WEIGHT": 0.35},
+        # ===== P4：估值权重再分配（PE 是唯一有区分度的因子，但不能加独立排序权重）====
+        # 实测 ρ(PE, valuation_score) = −1.0（绝对口径下线性负映射，完全共线），
+        # 所以正确做法是调高估值在综合分里的权重，而不是叠一层排序权重。
+        # 这里用 P4 预注册套件：只写估值/技术目标值，质量权重自动补差，
+        # 从根上避免「权重和失衡导致压线合格者全灭」这个坑。
+        "p4_v45_t10": {"P4_VALUATION_WEIGHT": 0.45, "P4_TECHNICAL_WEIGHT": 0.10},
+        "p4_v40_t20": {"P4_VALUATION_WEIGHT": 0.40, "P4_TECHNICAL_WEIGHT": 0.20},
+        "p4_v50_t10": {"P4_VALUATION_WEIGHT": 0.50, "P4_TECHNICAL_WEIGHT": 0.10},
+        "p4_v40_t10": {"P4_VALUATION_WEIGHT": 0.40, "P4_TECHNICAL_WEIGHT": 0.10},
     },
     "technical": {
         "baseline": {},                                            # MACD 连 3 日改善 + KDJ 金叉 K≤55 且 K 上行
