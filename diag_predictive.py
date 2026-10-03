@@ -1,7 +1,16 @@
 """诊断3（只读）：检验技术分/止跌闸门是否真的预测了后续表现。
 
-方法：对低位+估值通过的 180 只样本，按当前技术分分组，统计未来 20/60 日收益。
-若高分组与低分组无单调差异 ⇒ 技术分不具备排序价值（这是纯样本内观察，不做回测撮合）。
+方法：对低位+估值通过的样本，按当前技术分分组，统计未来 5/10/20/60 日收益。
+若高分组与低分组无单调差异 ⇒ 技术分不具备排序价值（纯样本内观察，不做回测撮合）。
+
+【重要修正 · 2026-10-03】本脚本原版的前瞻收益计算有索引 bug：
+    rec[f"fwd{h}"] = (float(df.iloc[-1 + h]["close"]) / close - 1) * 100
+`df.iloc[-1 + 5]` 实为 `df.iloc[4]` —— 取到的是**2024 年的历史价格**，不是未来。
+配套的 `if len(df) > h` 守卫也永远成立（460 > 5），因此不会抛错，
+但会让所有前瞻收益看起来「有值」，据此得出的「技术分负向」「保留组更差」
+等结论全部无效。现改为：评估日从末根前移 EVAL_OFFSET 根，
+使前瞻窗口落在真实存在的数据上。改任何前瞻统计脚本时都应先用 EVAL_OFFSET=0
+自检一次 —— 正确实现下此时所有前瞻收益必须全为 NaN。
 """
 import os
 import sys
@@ -17,6 +26,9 @@ from src.bottom_fishing_strategy import (  # noqa: E402
 )
 
 DAILY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backtest_cache", "daily")
+# 评估日相对末根前移的交易日数：留出 60 日前瞻窗口 + 少量缓冲。
+# 设为 0 则末根评估，此时无未来数据，所有前瞻收益必然为 NaN（可用于自检）。
+EVAL_OFFSET = 75
 
 
 def load(code):
@@ -38,9 +50,15 @@ def main():
     files = sorted(f[:-4] for f in os.listdir(DAILY) if f.endswith(".csv"))
     recs = []
     for code in files:
-        df = load(code)
-        if df is None or df.empty or len(df) < max(cfg.LOW_POSITION_LOOKBACK, cfg.MIN_DAYS):
+        full = load(code)
+        if full is None or full.empty:
             continue
+        # 评估日 = 末根前移 EVAL_OFFSET 根。其后必须留有 >=60 根，否则无前瞻窗口。
+        eval_i = len(full) - 1 - EVAL_OFFSET
+        if eval_i < max(cfg.LOW_POSITION_LOOKBACK, cfg.MIN_DAYS):
+            continue
+        df = full.iloc[:eval_i + 1].reset_index(drop=True)   # 指标只用评估日及之前
+        future = full["close"].to_numpy(float)               # 前瞻收益用评估日之后
         w = df.tail(cfg.LOW_POSITION_LOOKBACK)
         if not np.isfinite(w[["open", "high", "low", "close", "volume", "amount"]].to_numpy(float)).all():
             continue
@@ -94,16 +112,20 @@ def main():
             lvl = "none"
 
         last = df.iloc[-1]
-        rec = dict(code=code, tech=ts, stab=lvl, pos=pos, pe=pe)
+        rec = dict(code=code, tech=ts, stab=lvl, pos=pos, pe=pe,
+                   eval_date=str(last["date"]))
         for h in (5, 10, 20, 60):
-            if len(df) > h:
-                rec[f"fwd{h}"] = (float(df.iloc[-1 + h]["close"]) / close - 1) * 100
-            else:
-                rec[f"fwd{h}"] = np.nan
+            # 评估日之后第 h 根：索引 eval_i + h。越界即为「无未来数据」→ NaN。
+            j = eval_i + h
+            rec[f"fwd{h}"] = (float(future[j]) / close - 1) * 100 if j < len(future) else np.nan
         recs.append(rec)
 
     d = pd.DataFrame(recs)
-    print(f"样本：{len(d)} 只（低位+估值通过，末根 2026-09-18）\n")
+    if d.empty:
+        print("无样本通过低位+估值前置筛选，无法做前瞻统计。")
+        return
+    print(f"样本：{len(d)} 只（低位+估值通过；评估日 {d['eval_date'].min()} ~ "
+          f"{d['eval_date'].max()}，末根 {EVAL_OFFSET} 根前）\n")
 
     print("=== 按【止跌分层】分组的未来收益中位数(%) ===")
     g = d.groupby("stab")[["fwd5", "fwd10", "fwd20", "fwd60"]].median()
