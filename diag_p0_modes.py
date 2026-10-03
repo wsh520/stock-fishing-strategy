@@ -27,6 +27,9 @@ from src.bottom_fishing_strategy import (  # noqa: E402
 
 DAILY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backtest_cache", "daily")
 HORIZONS = (5, 10, 20, 60)
+# 评估日相对末根前移的交易日数：留出 60 日前瞻窗口。
+# 设 0 则所有前瞻收益必为 NaN（正确实现的自检方式，见 diag_predictive.py 的同类修正）。
+EVAL_OFFSET = 75
 
 
 def load(code):
@@ -124,9 +127,15 @@ def main():
     rows = []
     n_seen = 0
     for code in files:
-        df = load(code)
-        if df is None or df.empty or len(df) < max(cfg.LOW_POSITION_LOOKBACK, cfg.MIN_DAYS):
+        full = load(code)
+        if full is None or full.empty:
             continue
+        # 评估日 = 末根前移 EVAL_OFFSET 根：指标只用评估日及之前，前瞻收益用其之后。
+        eval_i = len(full) - 1 - EVAL_OFFSET
+        if eval_i < max(cfg.LOW_POSITION_LOOKBACK, cfg.MIN_DAYS):
+            continue
+        df = full.iloc[:eval_i + 1].reset_index(drop=True)
+        future = full["close"].to_numpy(float)
         w = df.tail(cfg.LOW_POSITION_LOOKBACK)
         if not np.isfinite(w[["open", "high", "low", "close", "volume", "amount"]].to_numpy(float)).all():
             continue
@@ -154,16 +163,22 @@ def main():
         if atr_v / close * 100.0 > cfg.MAX_ATR_PCT + 1e-12:
             continue
         s_lv, r_lv, el = classify(tech, df, cfg, close)
-        closes = df["close"].to_numpy(float)
-        i = len(closes) - 1
         rec = {"code": code, "strict": s_lv, "risk_only": r_lv,
-               "pos": pos, "tech": float(d["daily_score"])}
-        rec.update({f"f{h}": fwd(closes, i, h) for h in HORIZONS})
+               "pos": pos, "tech": float(d["daily_score"]), "pe": pe,
+               "eval_date": str(df.iloc[-1]["date"])}
+        for h in HORIZONS:
+            j = eval_i + h
+            rec[f"f{h}"] = ((future[j] / close - 1) * 100.0) if j < len(future) else None
         rec.update({f"el_{k}": v for k, v in el.items()})
         rows.append(rec)
 
     d = pd.DataFrame(rows)
-    print(f"总样本 {n_seen} 只 → 低位+估值+ATR 后剩 {len(d)} 只\n")
+    if d.empty:
+        print("无样本通过前置筛选。")
+        return
+    print(f"行情层样本 {n_seen} 只 → 低位+估值+ATR 后剩 {len(d)} 只")
+    print(f"评估日 {d['eval_date'].min()} ~ {d['eval_date'].max()}"
+          f"（末根前移 {EVAL_OFFSET} 根，为前瞻窗口留出真实数据）\n")
     print("=" * 78)
     print("P0 三口径放行数量对比（止跌闸门是 quality_value 下唯一的技术准入）")
     print("=" * 78)
@@ -198,22 +213,19 @@ def main():
             print(line)
 
     print("\n" + "=" * 78)
-    print("P1 检验：250日分位 vs 未来收益（Spearman ρ，取值应显著为负=越低越好）")
+    print("P1 检验：各因子 vs 未来收益（Spearman ρ）")
     print("=" * 78)
+    print("对照基准（修正前误以为 250日分位最强，实为 PE；此处一并列出）")
     for name, keep_lv in (("strict", ("strong", "medium", "weak")),
                           ("risk_only", ("strong", "medium", "weak"))):
         sub = d[d[name].isin(keep_lv)]
         print(f"\n【{name} 通过者 n={len(sub)}】")
-        for h in HORIZONS:
-            s = sub[["pos", f"f{h}"]].dropna()
-            if len(s) > 5:
-                print(f"   ρ(position, F{h}) = {spearman(s['pos'], s[f'f{h}']):+.3f}"
-                      f"   n={len(s)}")
-        # 技术分对照
-        for h in (20, 60):
-            s = sub[["tech", f"f{h}"]].dropna()
-            if len(s) > 5:
-                print(f"   ρ(tech_score, F{h}) = {spearman(s['tech'], s[f'f{h}']):+.3f}  (对照)")
+        for col, label in (("pos", "position250"), ("tech", "tech_score"), ("pe", "PE")):
+            line = f"   {label:12s}"
+            for h in HORIZONS:
+                s = sub[[col, f"f{h}"]].dropna()
+                line += f"  ρ(F{h})={spearman(s[col], s[f'f{h}']):+.3f}" if len(s) > 5 else f"  ρ(F{h})=  n/a"
+            print(line + f"   n={len(sub.dropna(subset=['f20']))}")
 
     print("\n" + "=" * 78)
     print("P1 可行性：在各层内，分位能否把前瞻收益高的样本排到前面")

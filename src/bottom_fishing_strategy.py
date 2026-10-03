@@ -316,11 +316,11 @@ class StrategyConfig:
     QV_BEAR_TIMING_GATE: Optional[bool] = None
 
     # ===== P0：止跌闸门判据重构（risk_only 模式，默认关闭=保持原 strict 口径）=====
-    # 实测诊断（798 只本地缓存，2025-12-24~2026-09-18）结论：
-    #   strict 口径下 180 只估值合格候选被止跌闸门砍掉 145 只（80.6%），其中 140 只
-    #   **唯一**的败因是「收盘在 MA20 下方」；而 MACD 改善证据只占 23/180(12.8%)。
-    #   即该闸门实际近乎等价于「必须站上 MA20」——这是一条追高/择时条件，却被当成
-    #   安全否决项在用，且与左侧低吸策略的立意直接冲突。
+    # 横截面实测（本地缓存 798 只）：strict 口径下 180 只估值合格候选被止跌闸门砍掉
+    # 145 只（80.6%），其中 140 只**唯一**的败因是「收盘在 MA20 下方」；
+    # 而 MACD 改善证据只占 23/180(12.8%)。
+    # 即该闸门实际近乎等价于「必须站上 MA20」——这是一条追高/择时条件，却被当成
+    # 安全否决项在用，与左侧低吸策略的立意存在张力。
     # risk_only 把判据拆成两件事，各自归位：
     #   1) 否决只保留**真正的危险形态**：MACD 深度弱势且仍在恶化
     #      （复用 macd_not_deeply_weak，与突破策略层 3.8 同一实现、同一阈值，
@@ -332,20 +332,29 @@ class StrategyConfig:
     # medium 层新增一条左侧通道：站上 MA60 且近 N 日未创新低——中期趋势已转正的
     # 短期回调形态，此前仅因 MA20 的 5 日斜率口径被误杀。
     # 三种取值：strict（默认，原口径）/ risk_only（新口径）/ disabled（闸门关闭）。
+    #
+    # 【前瞻实测：不建议上线，默认保持 strict】
+    #   评估日 2026-06-04、n=168、前瞻窗口取真实后续行情（非历史价）：
+    #   · 放行量几乎不变：strict 74/180(41.1%) vs risk_only 76/180(42.2%)。
+    #     risk_only 的实际效果只是把一部分「淘汰」改成「观察」，并未放宽准入。
+    #   · 止跌闸门保留组 vs 剔除组的未来收益中位数在 F5/F10/F20/F60 **全部更优**
+    #     （+2.59/+3.83/+5.44/+4.24 个百分点）⇒ 该闸门在做剔除而非选优，
+    #     放宽它缺乏数据支持。
     QV_STABILIZATION_MODE: str = "strict"
     # risk_only 下 watch 层的 pending 标记（加入 missing → 不进正式推荐，仅进观察池）。
     QV_STABILIZATION_WATCH_PENDING: bool = True
 
     # ===== P1：250日低位分位进排序权重（默认 0=关闭，只影响排序不影响准入）=====
-    # 实测 Spearman 秩相关（n=180，单截面）：
-    #   250日分位 ρ=−0.35（全部因子里区分度最强，且方向为「越低越好」）
-    #   技术分 ρ=−0.08~−0.13（弱负）、PE 分位 ρ≈−0.03（几乎无区分度）
-    # 也就是说 LOW_POSITION_MAX 只把 60% 的股票按 0/1 砍掉，砍完就把这个
-    # 最强因子的连续信息完全丢弃了（通过者 position 恒 ∈ [0, 0.40]，
-    # 通过与否二值化，剩下的区分度无从体现）。
-    # 本项把闸门内的连续位置重新引回排序：得分 = 权重 × (1 − position/LOW_POSITION_MAX)
-    #   position=0（250日最低点）→ 满分；position=LOW_POSITION_MAX（压线）→ 0 分。
+    # 动机：LOW_POSITION_MAX 把 position 二值化在 [0, 0.40]，通过者 position 恒落在
+    # 该区间内，闸门内剩余的连续区分度被丢弃。本项把它引回排序：
+    #   得分 = 权重 × (1 − position / LOW_POSITION_MAX)
+    # position=0（250日最低点）→ 满分；position=LOW_POSITION_MAX（压线）→ 0 分。
     # 与 CONSOLIDATION_BONUS / RS_WEIGHT 同属「排序微调」，不参与任何准入判定。
+    #
+    # 【前瞻实测：不建议开启】
+    #   250日分位与未来收益几乎无相关性：ρ(F5)=−0.05 / ρ(F10)=+0.12 / ρ(F20)=+0.02 /
+    #   ρ(F60)=+0.07（n=168）。同批样本中技术分 ρ=+0.21~+0.26、PE ρ(F5)=−0.46，
+    #   两者区分度都明显高于分位。保留实现便于日后有更长样本时重新评估。
     QV_POSITION_RANK_WEIGHT: float = 0.0
 
     # ===== 近 60 日相对沪深300强度（排序微调 + 风险提示，不设硬性准入线）=====
@@ -3652,12 +3661,10 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
     rank_score = round(rank_score + _cons_bonus, 3)
     # ===== P1：250日低位分位进排序（不参与准入）=====
     # LOW_POSITION_MAX 把 position 二值化在 [0, LOW_POSITION_MAX] 内，闸门内剩下的
-    # 连续区分度被丢弃；而实测 Spearman 显示 position 是全部因子里区分度最强的
-    # （ρ=−0.35，方向越低越好），远强于技术分（−0.08~−0.13）与 PE 分位（≈−0.03）。
-    # 这里把闸门内的连续位置映射回 [0, QV_POSITION_RANK_WEIGHT] 加到 rank_score：
+    # 连续区分度被丢弃；本项把它映射回 [0, QV_POSITION_RANK_WEIGHT] 加到 rank_score：
     #   得分 = 权重 × (1 − position / LOW_POSITION_MAX)
     # position=0（250日最低）拿满分，position=LOW_POSITION_MAX（恰好压线）拿 0 分。
-    # 权重默认 0（关闭），A/B 验证后再考虑是否设为正值。
+    # 权重默认 0（关闭）；实测该分位与未来收益几乎无相关性，暂不建议开启。
     _pos_w = float(getattr(config, "QV_POSITION_RANK_WEIGHT", 0.0) or 0.0)
     _pos_score = 0.0
     if _pos_w > 0:
@@ -3672,11 +3679,13 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
     # weak：MACD柱改善但近N日仍创新低，只保留为待核验观察；
     # none：指标缺失或没有改善，直接淘汰。MACD和低点数据不足绝不放行。
     #
-    # 【P0 / QV_STABILIZATION_MODE】
+    # 【P0 / QV_STABILIZATION_MODE】（实测未证明有收益，默认 strict；保留用于 A/B）
     #   "strict"（默认）：上述原口径，逐字保持不变。
     #   "risk_only"：否决权收归「MACD 深度弱势且仍在恶化」这一条真正的危险形态，
     #     「站上 MA20」降级为标签（未站上但无危险证据 → watch 层，按配置转 pending
     #     或直接放行），medium 新增「站上 MA60 且未创新低」左侧通道。
+    #     实测放行量与 strict 几乎相同（76 vs 74 / 180），且保留组前瞻收益优于剔除组，
+    #     故默认不上线。
     #   "disabled"：闸门整体关闭，止跌不参与判定（等价于把 QV_STABILIZATION_GATE
     #     设为 False，但保留 watch/strong 标签，便于 A/B 分离「标签」与「否决」）。
     _stab_mode = str(getattr(config, "QV_STABILIZATION_MODE", "strict") or "strict").strip().lower()
