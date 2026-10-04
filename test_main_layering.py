@@ -115,6 +115,29 @@ def main() -> int:
           pend.get("600002", {}).get("tier") == "pending"
           and pend.get("600002", {}).get("weekly_status") == "unverified")
 
+    # 周一的最新已收盘周线是上周五，不能要求它覆盖本周一。
+    m.get_index_daily = lambda config, cache=None: index_df(end="2025-06-30")
+    m.get_daily_data = lambda code, config, cache=None: daily_df(end="2025-06-30")
+    monday_cfg = m.StrategyConfig(RECOMMENDATION_MODE="technical")
+    monday_cfg.FETCH_DELAY = 0.0
+    monday_cfg.MAX_WORKERS = 1
+    monday_cfg.CACHE_DIR = _TMP_CACHE.name
+    monday_pending: list[dict] = []
+    monday_df = m.main(config=monday_cfg, cache=m.CacheManager(), pending_out=monday_pending)
+    check("周一使用上周收盘周线: 财务完整者仍是正式推荐",
+          monday_df is not None and len(monday_df) == 1
+          and monday_df.iloc[0]["code"] == "600000"
+          and monday_df.iloc[0]["weekly_status"] == "confirmed")
+    m._fetch_weekly_dual = lambda code, config: (
+        None if code == "600002" else weekly_df(end="2025-06-20"))
+    stale_pending: list[dict] = []
+    stale_df = m.main(config=monday_cfg, cache=m.CacheManager(), pending_out=stale_pending)
+    check("周一两周前的周线: 不进入正式推荐",
+          (stale_df is None or stale_df.empty)
+          and any(r["code"] == "600000" and r["weekly_status"] == "unverified"
+                  for r in stale_pending))
+    _stub_sources()
+
     # ===== 场景 2：周线开关全关（disabled 路径 + 无周线时仍做财务终审） =====
     cfg2 = m.StrategyConfig(RECOMMENDATION_MODE="technical")
     cfg2.FETCH_DELAY = 0.0

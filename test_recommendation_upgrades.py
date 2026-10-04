@@ -260,8 +260,8 @@ class TestIndustryRelativeValuation(unittest.TestCase):
 
     def test_context_fallbacks(self):
         cfg = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False)
-        snap = {"银行": {"pe": np.sort(np.array([5., 6., 7., 8., 9., 10.])),
-                         "pb": np.sort(np.array([.5, .6, .7, .8, .9, 1.0]))}}
+        snap = {"银行": {"pe": np.arange(5., 15.),
+                         "pb": np.arange(5., 15.) / 10}}
         # 关闭 → None
         off = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False, USE_INDUSTRY_RELATIVE_VALUATION=False)
         self.assertIsNone(m._industry_valuation_context(snap, "银行", 8., .8, off))
@@ -269,14 +269,17 @@ class TestIndustryRelativeValuation(unittest.TestCase):
         self.assertIsNone(m._industry_valuation_context({}, "银行", 8., .8, cfg))
         self.assertIsNone(m._industry_valuation_context(snap, "", 8., .8, cfg))
         self.assertIsNone(m._industry_valuation_context(snap, "地产", 8., .8, cfg))
-        # 样本不足（< MIN_PEERS=5）→ None
-        thin = {"银行": {"pe": np.array([5., 6., 7.]), "pb": np.array([.5, .6, .7])}}
-        self.assertIsNone(m._industry_valuation_context(thin, "银行", 6., .6, cfg))
-        # 正常 → 返回分位
+        # 9 只仍不足以启用行业分位；PE/PB 各自独立检查样本数。
+        thin = {"银行": {"pe": snap["银行"]["pe"][:9], "pb": snap["银行"]["pb"][:9]}}
+        self.assertIsNone(m._industry_valuation_context(thin, "银行", 8., .8, cfg))
+        mixed = {"银行": {"pe": snap["银行"]["pe"][:9], "pb": snap["银行"]["pb"]}}
+        self.assertIsNone(m._industry_valuation_context(mixed, "银行", 8., .8, cfg)["pe_pct"])
+        # 10 只满足默认样本门槛。
         ctx = m._industry_valuation_context(snap, "银行", 8., .8, cfg)
         self.assertEqual(ctx["mode"], "industry")
-        self.assertAlmostEqual(ctx["pe_pct"], 4 / 6)
-        self.assertAlmostEqual(ctx["pb_pct"], 4 / 6)
+        self.assertEqual(ctx["peers"], 10)
+        self.assertAlmostEqual(ctx["pe_pct"], 4 / 10)
+        self.assertAlmostEqual(ctx["pb_pct"], 4 / 10)
 
     def test_industry_cheap_passes_despite_high_absolute_pe(self):
         # PE=40（> 绝对上限 25）但行业内分位 0.30（便宜）→ 行业模式放行
