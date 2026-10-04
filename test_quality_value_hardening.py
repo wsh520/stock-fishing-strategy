@@ -415,8 +415,8 @@ class TestPePbResponsibilities(unittest.TestCase):
         # PE 是唯一估值准入口径 → 「行业口径生效」以 pe_pct 可得为准：
         # 行业 PE 样本不足（仅 PB 分位可得）时实际回退绝对 PE 上限，必须标为 absolute。
         cfg = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", )
-        thin_pe = {"工业": {"pe": np.array([8.0, 10.0, 12.0]),                    # < MIN_PEERS(5)
-                            "pb": np.array([0.8, 1.0, 1.2, 1.4, 1.6, 1.8])}}
+        thin_pe = {"工业": {"pe": np.array([8.0, 10.0, 12.0]),                    # < MIN_PEERS(10)
+                            "pb": np.arange(0.8, 2.8, 0.2)}}
         ctx = m._industry_valuation_context(thin_pe, "工业", 12.0, 1.2, cfg)
         self.assertIsNotNone(ctx)
         self.assertIsNone(ctx["pe_pct"])
@@ -424,8 +424,8 @@ class TestPePbResponsibilities(unittest.TestCase):
         tagged = m._tag_valuation_mode(frame, thin_pe, {"600000": "工业"}, cfg)
         self.assertEqual(tagged["valuation_mode"].tolist(), ["absolute"])
         # 对照：PE 样本充足 → 行业口径
-        full = {"工业": {"pe": np.array([8.0, 10.0, 12.0, 14.0, 16.0, 18.0]),
-                         "pb": np.array([0.8, 1.0, 1.2, 1.4, 1.6, 1.8])}}
+        full = {"工业": {"pe": np.arange(8.0, 28.0, 2.0),
+                         "pb": np.arange(0.8, 2.8, 0.2)}}
         tagged2 = m._tag_valuation_mode(frame, full, {"600000": "工业"}, cfg)
         self.assertEqual(tagged2["valuation_mode"].tolist(), ["industry"])
 
@@ -766,6 +766,23 @@ class TestHaltGapOnQualityValue(unittest.TestCase):
         gapped["date"] = dates_with_gap(len(gapped), gap_at=40, gap_days=40)
         self.assertFalse(m.has_halt_gap(base, cfg))
         self.assertTrue(m.has_halt_gap(gapped, cfg))
+
+
+class TestLowPositionTies(unittest.TestCase):
+    def test_flat_prices_are_not_automatically_at_the_bottom(self):
+        cfg = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, USE_CACHE=False)
+        sig, reason = ev(mk_df(np.full(300, 10.0)), cfg=cfg)
+        self.assertIsNone(sig)
+        self.assertEqual(reason, "FAIL_POSITION")
+
+    def test_tied_prices_at_a_genuine_low_still_qualify(self):
+        cfg = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, USE_CACHE=False,
+                               MIN_QV_SCORE=0, MIN_TECHNICAL_SCORE_FORMAL=0)
+        # The last 250 bars contain 199 higher closes and 51 tied lows.
+        prices = np.r_[np.full(249, 20.0), np.full(51, 10.0)]
+        sig, reason = ev(mk_df(prices), cfg=cfg)
+        self.assertEqual(reason, "PASS")
+        self.assertAlmostEqual(sig.position_250, 51 / 2 / 250)
 
 
 if __name__ == "__main__":

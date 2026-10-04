@@ -145,7 +145,7 @@ class StrategyConfig:
     QUALITY_REQUIRE_ANNUAL_NET_PROFIT_POSITIVE: bool = True
     QUALITY_REQUIRE_ANNUAL_CASHFLOW_POSITIVE: bool = True
     LOW_POSITION_LOOKBACK: int = 250     # 低位闸门回看交易日数
-    LOW_POSITION_MAX: float = 0.40       # 百分位排名上限（0.40 = 收盘价处于250日序列后40%以内）
+    LOW_POSITION_MAX: float = 0.40       # 250日收盘价中秩分位上限；并列价格按中间名次计
     # ===== 综合评分权重 =====
     # 技术面从 15% 提高到 25%：让有底部形态的股票排到前面，避免"价值陷阱"因
     # 质量/估值满分而占据推荐名额。质量仍是核心（45%），估值次之（30%）。
@@ -232,7 +232,7 @@ class StrategyConfig:
     # 不额外增加取数成本）；回测/单测未提供快照时同样走绝对阈值回退。
     USE_INDUSTRY_RELATIVE_VALUATION: bool = True
     VALUATION_INDUSTRY_PERCENTILE_MAX: float = 0.60
-    VALUATION_INDUSTRY_MIN_PEERS: int = 5
+    VALUATION_INDUSTRY_MIN_PEERS: int = 10
 
     # ===== 前瞻确认：当年成长未恶化（#4b）=====
     # 年度质量（最近3个完整年报）与 PE/PB 都是「后视镜」：一家公司当年基本面刚崩，
@@ -3009,7 +3009,7 @@ def _industry_valuation_context(snapshot: Optional[dict], industry: str,
     if not bucket:
         return None
     pe_arr, pb_arr = bucket.get("pe"), bucket.get("pb")
-    min_peers = int(getattr(config, "VALUATION_INDUSTRY_MIN_PEERS", 5))
+    min_peers = int(getattr(config, "VALUATION_INDUSTRY_MIN_PEERS", 10))
     pe_pct = _percentile_of(pe_arr, pe) if (pe is not None and pe_arr is not None
                                             and len(pe_arr) >= min_peers) else None
     pb_pct = _percentile_of(pb_arr, pb) if (pb is not None and pb_arr is not None
@@ -3033,7 +3033,7 @@ def _tag_valuation_mode(frame: pd.DataFrame, snapshot: Optional[dict],
     """
     modes: list[str] = []
     reasons: dict[str, int] = {}
-    min_peers = int(getattr(config, "VALUATION_INDUSTRY_MIN_PEERS", 5))
+    min_peers = int(getattr(config, "VALUATION_INDUSTRY_MIN_PEERS", 10))
     for _, row in frame.iterrows():
         code = str(row.get("code"))
         industry = (industry_map or {}).get(code, "") or ""
@@ -3405,10 +3405,12 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
     # 旧口径 (close - 250日最低) / (250日最高 - 250日最低) 对极端值敏感：
     # 250日内若有一天闪崩/涨停，整个分母被拉大/缩小，position 失真；
     # 且不区分下跌趋势 vs 横盘震荡（两者 position 可能相同但含义截然不同）。
-    # 新口径：当前收盘价在250日收盘价序列中的百分位排名（0=最低，1=最高）。
-    # 优点：不受单日极端值影响、分布均匀、跨股票可比、对近期价格结构更敏感。
-    closes_window = window["close"].values
-    position = float((closes_window < close).sum()) / len(closes_window)
+    # 当前收盘价的中秩分位（全部同价时为 50%，唯一最低价约为 0%）。
+    # 相比区间最高/最低价归一化，对单日极端值不敏感。
+    # 中秩分位：全部同价时为 50%，而不是被误算成 0% 的历史最低位。
+    closes_window = window["close"].to_numpy(dtype=float)
+    position = float(((closes_window < close).sum() +
+                      0.5 * (closes_window == close).sum()) / len(closes_window))
     if position > config.LOW_POSITION_MAX:
         return None, "FAIL_POSITION"
     missing = [] if latest_trade_date is not None else ["market_date"]
@@ -4179,9 +4181,12 @@ def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] 
                 if weekly_ok and config.REQUIRE_WEEKLY_MACD_STABLE:
                     if not _weekly_macd_data_ok(wk, config): weekly_status = "unverified"
                     weekly_ok = check_weekly_macd(wk, config)
-                if weekly_status == "confirmed" and latest_trade_date is not None \
-                        and not _weekly_fresh_enough(wk, latest_trade_date):
-                    weekly_status = "unverified"   # 周线截止过旧（如停牌），不足以为当前趋势背书
+                if weekly_status == "confirmed" and latest_trade_date is not None:
+                    weekly_cutoff = pd.Timestamp(latest_trade_date)
+                    if config.WEEKLY_REQUIRE_CLOSED_BAR:
+                        weekly_cutoff -= pd.Timedelta(days=(weekly_cutoff.weekday() - 4) % 7)
+                    if not _weekly_fresh_enough(wk, weekly_cutoff.strftime(_DATE_FMT)):
+                        weekly_status = "unverified"  # 已收盘周线过旧，不足以为当前趋势背书
                 if not weekly_ok:
                     weekly_dropped += 1
                     continue
