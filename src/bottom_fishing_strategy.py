@@ -146,9 +146,60 @@ class StrategyConfig:
     QUALITY_REQUIRE_ANNUAL_CASHFLOW_POSITIVE: bool = True
     LOW_POSITION_LOOKBACK: int = 250     # 低位闸门回看交易日数
     LOW_POSITION_MAX: float = 0.40       # 250日收盘价中秩分位上限；并列价格按中间名次计
-    # ===== 综合评分权重 =====
+    # ===== 综合评分权重（三项之和必须为 1.0，由 _validate_score_weights 硬校验）=====
     # 技术面从 15% 提高到 25%：让有底部形态的股票排到前面，避免"价值陷阱"因
     # 质量/估值满分而占据推荐名额。质量仍是核心（45%），估值次之（30%）。
+    #
+    # 【P4：估值权重再分配套件（默认全 0 = 不改变现状）】
+    # 实测（评估日 2026-06-04，n=168，前瞻窗口取真实后续行情）：
+    #   ρ(PE, 未来收益) = −0.44(F5) / −0.25(F10) / −0.07(F20) / −0.09(F60)
+    #   是全部因子里唯一有区分度的（负号 = 越便宜越好）；
+    #   技术分 ρ=+0.26/+0.07/+0.05/+0.03、250日分位 ρ≈+0.02~+0.15。
+    #
+    # **为什么不给 PE 加独立的排序权重**（曾评估并否决）：
+    #   实测 ρ(PE, valuation_score) = −1.0000 —— PE 绝对值与 _valuation_pe_score
+    #   在绝对口径下是线性负映射，**完全共线**。PE 的连续信息已被
+    #   VALUATION_SCORE_WEIGHT(0.30) × valuation_score 完整编码过一次，
+    #   再加一层排序权重是纯粹的重复计算，只会放大估值分的实际影响而
+    #   不提供新信息。正确做法是**调高估值在综合分里的权重**。
+    #
+    # 为什么仍不动默认值（保持 0.45/0.30/0.25）：
+    #   · PE 的区分度**只在 F5 显著**（−0.44），到 F20 衰减到 −0.07，
+    #     分组差异仅 +0.08pp（噪声）。短窗有效更可能是波动而非 alpha。
+    #   · 样本只有 168 只、单一时点，且处于全市场下跌区间（多数候选 F20 为负），
+    #     无法区分「便宜股真的更好」与「超跌反弹」。
+    #   · Top15 权重敏感性实测：提高估值权重 F5 从 +1.67 → +2.37（有改善），
+    #     但 F20 从 −3.01 → −3.33（略差），与上述判断一致。
+    #
+    # 【P4 的真实效果：大幅「放宽」，与直觉相反 —— 2026-10-03 实测，已否决】
+    # 估值权重是从技术权重挪来的，但**降技术权重的效果远大于升估值权重**，
+    # 因为两项的实际取值分布严重不对称（本地 798 面板 n=168 实测）：
+    #   · 技术分 daily_score：中位 0、P75=30、P95=40、最大 91.6（绝大多数候选为 0）
+    #   · 估值分 _valuation_pe_score：中位 67.9、P25=58.1（闸门内几乎不会接近低值）
+    # 把 tw 从 0.25 降到 0.10，砍掉的是「0.25×技术分」这个**接近 0 的大头**，
+    # 换来「0.45×估值分」这个**约 30 分的实数** → 综合分整体上移，过线数大增：
+    #   现状 0.45/0.30/0.25：过线 46 只 (27.4%)
+    #   P4  0.45/0.45/0.10：过线 118 只(70.2%)   ← 放宽 2.6 倍，不是收紧
+    # 新增的 72 只**不是更便宜的股票，而是技术分 ≈ 0 的股票**（技术分中位 0、
+    # 均值 3.33），其 PE 中位 12.73 反而比保留组的 10.82 更贵。前瞻对照：
+    #   保留组 A(46)：F5 +0.26 / F20 −3.01 / F60 +3.17
+    #   新增组 C(72)：F5 −2.01 / F20 −3.61 / F60 +1.84
+    # ⇒ P4 在**三个窗口全部更差**，是纯粹的**放宽**（放宽的是技术面而非估值面），
+    #   不是「奖励便宜股」。**P4 因此被否决，不上线。** 见 diag_p4_feasibility.py。
+    #
+    # ⚠ qv_floor_equivalence 报的 40 分锚点是**准入上限处的理论值**，不是实际取值区间：
+    #   它算的是「三道硬闸门全部压线合格」这一最不利情形的天花板，而真实候选的
+    #   估值分远高于 40（中位 67.9）。所以「所需技术分 ≥95」**不能读作「P4 极严」**——
+    #   它只描述理论天花板，实际效果是过线数从 46 涨到 118。
+    #   **判断改权重的影响必须用 diag_p4_feasibility.py 逐档模拟真实分布**，
+    #   只看 qv_floor_equivalence 会得出完全相反的结论（本项目已踩过一次）。
+    #
+    # 下面是**预注册**的权重组合，保留仅为复现实验与对照，不建议启用。
+    #   P4_VALUATION_WEIGHT=0.45 / P4_TECHNICAL_WEIGHT=0.10（质量保持 0.45）
+    P4_VALUATION_WEIGHT: Optional[float] = None
+    P4_TECHNICAL_WEIGHT: Optional[float] = None
+    # 生效后的实际权重（默认即现状；设置 P4_* 时由 _validate_score_weights 覆写，
+    # 质量权重自动吸收差额以保持三项和为 1.0）
     QUALITY_SCORE_WEIGHT: float = 0.45
     VALUATION_SCORE_WEIGHT: float = 0.30
     TECHNICAL_SCORE_WEIGHT: float = 0.25
@@ -314,6 +365,48 @@ class StrategyConfig:
     # deprecated：旧配置名，仅为向后兼容保留。构造时传入、或构造后赋值（写穿）均会
     # 覆盖 QV_STABILIZATION_GATE；保持 None 表示「未指定」，不抹掉新配置项的值。
     QV_BEAR_TIMING_GATE: Optional[bool] = None
+
+    # ===== P0：止跌闸门判据重构（risk_only 模式，默认关闭=保持原 strict 口径）=====
+    # 横截面实测（本地缓存 798 只）：strict 口径下 180 只估值合格候选被止跌闸门砍掉
+    # 145 只（80.6%），其中 140 只**唯一**的败因是「收盘在 MA20 下方」；
+    # 而 MACD 改善证据只占 23/180(12.8%)。
+    # 即该闸门实际近乎等价于「必须站上 MA20」——这是一条追高/择时条件，却被当成
+    # 安全否决项在用，与左侧低吸策略的立意存在张力。
+    # risk_only 把判据拆成两件事，各自归位：
+    #   1) 否决只保留**真正的危险形态**：MACD 深度弱势且仍在恶化
+    #      （复用 macd_not_deeply_weak，与突破策略层 3.8 同一实现、同一阈值，
+    #        不新造第二套口径）。深度弱势必须与「仍在恶化」取合取，否则匀速上行
+    #        形态会被系统性误杀（见 MACD_WEAK_* 设计说明）。
+    #   2) 「站上 MA20」从否决项**降级为标签**：站上→strong/medium 标签，
+    #      未站上但无危险证据→watch 层（missing 降级为 pending，只观察不推荐），
+    #      不再直接淘汰。
+    # medium 层新增一条左侧通道：站上 MA60 且近 N 日未创新低——中期趋势已转正的
+    # 短期回调形态，此前仅因 MA20 的 5 日斜率口径被误杀。
+    # 三种取值：strict（默认，原口径）/ risk_only（新口径）/ disabled（闸门关闭）。
+    #
+    # 【前瞻实测：不建议上线，默认保持 strict】
+    #   评估日 2026-06-04、n=168、前瞻窗口取真实后续行情（非历史价）：
+    #   · 放行量几乎不变：strict 74/180(41.1%) vs risk_only 76/180(42.2%)。
+    #     risk_only 的实际效果只是把一部分「淘汰」改成「观察」，并未放宽准入。
+    #   · 止跌闸门保留组 vs 剔除组的未来收益中位数在 F5/F10/F20/F60 **全部更优**
+    #     （+2.59/+3.83/+5.44/+4.24 个百分点）⇒ 该闸门在做剔除而非选优，
+    #     放宽它缺乏数据支持。
+    QV_STABILIZATION_MODE: str = "strict"
+    # risk_only 下 watch 层的 pending 标记（加入 missing → 不进正式推荐，仅进观察池）。
+    QV_STABILIZATION_WATCH_PENDING: bool = True
+
+    # ===== P1：250日低位分位进排序权重（默认 0=关闭，只影响排序不影响准入）=====
+    # 动机：LOW_POSITION_MAX 把 position 二值化在 [0, 0.40]，通过者 position 恒落在
+    # 该区间内，闸门内剩余的连续区分度被丢弃。本项把它引回排序：
+    #   得分 = 权重 × (1 − position / LOW_POSITION_MAX)
+    # position=0（250日最低点）→ 满分；position=LOW_POSITION_MAX（压线）→ 0 分。
+    # 与 CONSOLIDATION_BONUS / RS_WEIGHT 同属「排序微调」，不参与任何准入判定。
+    #
+    # 【前瞻实测：不建议开启】
+    #   250日分位与未来收益几乎无相关性：ρ(F5)=−0.05 / ρ(F10)=+0.12 / ρ(F20)=+0.02 /
+    #   ρ(F60)=+0.07（n=168）。同批样本中技术分 ρ=+0.21~+0.26、PE ρ(F5)=−0.46，
+    #   两者区分度都明显高于分位。保留实现便于日后有更长样本时重新评估。
+    QV_POSITION_RANK_WEIGHT: float = 0.0
 
     # ===== 近 60 日相对沪深300强度（排序微调 + 风险提示，不设硬性准入线）=====
     # 定义：同一起止日期下，个股区间涨跌幅 − 沪深300区间涨跌幅（百分点）。
@@ -607,10 +700,65 @@ class StrategyConfig:
         object.__setattr__(self, name, value)
 
     def __post_init__(self):
-        """兜底：dataclass 构造结束时再同步一次旧配置名（幂等，与 __setattr__ 同语义）。"""
+        """构造结束时同步旧配置名，并校验综合分三项权重之和（坑 1 防护）。
+
+        ① 旧配置名迁移：QV_BEAR_TIMING_GATE → QV_STABILIZATION_GATE（幂等，与 __setattr__ 同语义）。
+        ② 权重和校验：QUALITY/VALUATION/TECHNICAL 三项之和必须为 1.0。
+           为什么必须硬校验而不是只写在注释里：
+             综合分 = qw×质量 + vw×估值 + tw×技术，而 MIN_QV_SCORE 是**绝对分数线**。
+             权重和 <1 会把综合分整体下移，使「三道硬闸门全部压线合格」的候选
+             被系统性淘汰——实测把 TECHNICAL 0.25→0.10 而不补偿时，压线合格上限
+             从 59.5 掉到 44.5（低于默认下限 50），合格者 100% 全灭。
+             那种情况下测的是「降分数线」而非「换权重」，A/B 结论会被彻底污染，
+             而配置本身看不出异常（三个数都是合法正数）。
+           容忍 1e-6 浮点误差；仅在偏差超限时抛错，快速失败优于静默错配。
+           权重全为 0（显式关闭综合分）也视为非法，避免 MIN_QV_SCORE 失去意义。
+        """
         legacy = self.QV_BEAR_TIMING_GATE
         if legacy is not None:
             object.__setattr__(self, "QV_STABILIZATION_GATE", bool(legacy))
+        self._validate_score_weights()
+
+    def _validate_score_weights(self) -> None:
+        """应用 P4 权重套件并校验综合分三项权重之和为 1.0。
+
+        P4 语义：P4_VALUATION_WEIGHT / P4_TECHNICAL_WEIGHT 是**预注册的重分配目标值**
+        （非增量）。设置后，技术权重取该目标值，估值权重取该目标值，
+        质量权重吸收差额以保持三项和为 1.0 —— 这样调用方只需指定「估值要多少、
+        技术要多少」两个数，不必自己心算补差，从根上避免坑 1（权重和失衡）。
+        两个都为 None（默认）时完全不改动权重。
+        """
+        pv = getattr(self, "P4_VALUATION_WEIGHT", None)
+        pt = getattr(self, "P4_TECHNICAL_WEIGHT", None)
+        if pv is not None or pt is not None:
+            tw = float(pt) if pt is not None else float(self.TECHNICAL_SCORE_WEIGHT)
+            vw = float(pv) if pv is not None else float(self.VALUATION_SCORE_WEIGHT)
+            qw = 1.0 - vw - tw
+            if qw < 0:
+                raise ValueError(
+                    f"P4 权重套件无解：P4_VALUATION_WEIGHT={vw} + P4_TECHNICAL_WEIGHT={tw} "
+                    f"已超过 1.0，质量权重会变成 {qw:.4f}（负数）。\n"
+                    f"  请把估值/技术目标权重之和调到 <1.0，例如 0.45 + 0.10。")
+            object.__setattr__(self, "QUALITY_SCORE_WEIGHT", round(qw, 6))
+            object.__setattr__(self, "VALUATION_SCORE_WEIGHT", round(vw, 6))
+            object.__setattr__(self, "TECHNICAL_SCORE_WEIGHT", round(tw, 6))
+        qw = float(self.QUALITY_SCORE_WEIGHT)
+        vw = float(self.VALUATION_SCORE_WEIGHT)
+        tw = float(self.TECHNICAL_SCORE_WEIGHT)
+        total = qw + vw + tw
+        if abs(total - 1.0) > 1e-6:
+            raise ValueError(
+                f"综合分三项权重之和必须为 1.0，当前为 {total:.4f}"
+                f"（质量 {qw} + 估值 {vw} + 技术 {tw}）。\n"
+                f"  原因：MIN_QV_SCORE={float(getattr(self, 'MIN_QV_SCORE', 0.0)):.0f} 是绝对分数线，\n"
+                f"  权重和 <1 会整体下移综合分，使三道硬闸门全部压线合格的候选被系统性淘汰\n"
+                f"  （实测 TECHNICAL 0.25→0.10 不补偿时，上限 59.5→44.5 < 下限 50，合格者全灭）。\n"
+                f"  修法二选一：\n"
+                f"   · 手动把差额补给另外两项，保持和为 1.0"
+                f"（例：TECHNICAL 0.10 配 QUALITY 0.55 / VALUATION 0.35）；\n"
+                f"   · 或改用 P4 预注册套件：只设 P4_VALUATION_WEIGHT / P4_TECHNICAL_WEIGHT，\n"
+                f"     质量权重会自动吸收差额（推荐，不会算错）。\n"
+                f"  若确实要整体放宽分数线，请显式下调 MIN_QV_SCORE，而不是让权重和失衡。")
 
 # ===========================================================================
 # CacheManager
@@ -3071,6 +3219,16 @@ def _tag_valuation_mode(frame: pd.DataFrame, snapshot: Optional[dict],
 def qv_floor_equivalence(config: StrategyConfig) -> dict:
     """量化 MIN_QV_SCORE 相对三道硬闸门的等效门槛（纯计算，不取数、不联网）。
 
+    ⚠ **本函数只算「理论天花板」，不能用来判断改权重的影响方向**（2026-10-03 教训）。
+    这里的 40 分估值锚点是**准入上限处**的取值，即「三道硬闸门全部压线合格」这一
+    最不利情形。而真实候选的估值分远高于它：本地 798 面板 n=168 实测估值分中位 67.9、
+    P25=58.1，闸门内几乎不会接近 40。因此「压线上限」与「所需技术分」描述的是
+    **天花板**，不是实际过线率。
+    典型教训：P4(0.45/0.45/0.10) 报出的「所需技术分 ≥95」看起来是极严收紧，
+    但真实分布下过线数从 46 只涨到 118 只（放宽 2.6 倍）—— 因为技术分实际中位为 0
+    （降权砍掉的是接近 0 的大头），而估值分实际中位 67.9（升权换来的是实数）。
+    **要评估改权重的影响，必须用 `diag_p4_feasibility.py` 逐档模拟真实分布。**
+
     「恰好压线通过硬闸门」的样本综合分上限 = qw×压线质量分 + vw×压线估值分 + tw×100。
     该上限与下限的大小关系决定闸门的实际严厉度（describe_qv_floor 会动态给出结论）：
     上限低于下限时压线合格者 100% 被淘汰（下限严格强于硬闸门）；否则下限只拦
@@ -3107,6 +3265,15 @@ def qv_floor_equivalence(config: StrategyConfig) -> dict:
                 min_quality = float(probe["quality_score"])
     except Exception:  # noqa: BLE001  纯审计信息，任何失败都不影响选股
         min_quality = 50.0
+    # 关键修正：进入综合分计算的 verified 候选必须先过 MIN_QUALITY_SCORE 硬门，
+    # 因此「压线合格样本」的质量分不是评分锚点 50，而是 max(评分锚点, 质量硬门)。
+    # 不取 max 会让 MIN_QUALITY_SCORE=60 时仍按 50 算上限，把上限算低、审计结论偏乐观
+    # （曾导致 P2 的等效门槛被低估约 5 分）。质量硬门为 0（关闭）时行为与旧版一致。
+    # 同时保留评分锚点原值 anchor_quality，供坑 2 的「抬质量硬门连带放松技术面」审计用。
+    anchor_quality = min_quality
+    _q_floor = float(getattr(config, "MIN_QUALITY_SCORE", 0.0) or 0.0)
+    if _q_floor > min_quality:
+        min_quality = _q_floor
     # 两种口径在各自准入上限处锚定相同估值分（_valuation_pe_score 设计）
     v_anchor = 100.0 * (1.0 - float(getattr(config, "VALUATION_INDUSTRY_PERCENTILE_MAX", 0.60)))
     v_industry = v_anchor
@@ -3121,6 +3288,7 @@ def qv_floor_equivalence(config: StrategyConfig) -> dict:
             return None
         return (floor - qw * quality_score - vw * valuation_score) / tw
 
+    req_tech = _req_tech(min_quality, v_industry)
     return {
         "floor": floor,
         "min_verified_quality": round(min_quality, 2),
@@ -3128,8 +3296,16 @@ def qv_floor_equivalence(config: StrategyConfig) -> dict:
         "valuation_absolute_at_cap": round(v_absolute, 2),
         "ceiling_industry": round(_ceiling(v_industry), 2),
         "ceiling_absolute": round(_ceiling(v_absolute), 2),
-        "req_tech_industry": _req_tech(min_quality, v_industry),
+        "req_tech_industry": req_tech,
         "req_tech_absolute": _req_tech(min_quality, v_absolute),
+        # 【坑 2 防护】抬 MIN_QUALITY_SCORE 的连带效应：质量基线抬高 → 综合分基线抬高
+        # → 「过线所需技术分」下降。也就是说 P2 单独上线并非单纯收紧，而是
+        # 「质量↑ / 技术↓」。req_tech_anchor_only 给出「若不抬质量硬门」时的所需技术分
+        # （权重与下限均不变，仅质量分取评分锚点），两者之差即放松幅度，可被断言审计。
+        "req_tech_anchor_only": _req_tech(anchor_quality, v_industry),
+        "quality_weight": qw,
+        "valuation_weight": vw,
+        "technical_weight": tw,
     }
 
 
@@ -3147,12 +3323,27 @@ def describe_qv_floor(config: StrategyConfig) -> str:
     verdict = ("低于下限 → 该下限严格强于三道硬闸门，压线合格者 100% 被淘汰"
                if e["ceiling_industry"] < e["floor"] else
                "不低于下限 → 压线合格者能否过线取决于技术分，本下限只拦综合分不足的候选")
+    # 【坑 2 防护】把「抬质量硬门连带放松技术面」这一副作用显式打出来。
+    # MIN_QUALITY_SCORE 抬高 → 压线质量分抬高 → 综合分基线抬高 → 所需技术分下降。
+    # 即 P2 单独上线是「质量↑/技术↓」而非单纯收紧。只在确有偏差时才追加说明，
+    # 避免默认口径下刷屏。
+    side = ""
+    rt, rt_anchor = e.get("req_tech_industry"), e.get("req_tech_anchor_only")
+    if (isinstance(rt, float) and isinstance(rt_anchor, float)
+            and rt_anchor - rt > 0.5):
+        side = (f"；⚠ 质量硬门 {_fmt(e['min_verified_quality'])} 已抬高连带放松技术面"
+                f"（所需技术分 {_fmt(rt_anchor)} → {_fmt(rt)}，"
+                f"放松 {rt_anchor - rt:.0f} 分）——本项非单纯收紧，"
+                f"若要同时收紧技术须配技术分降权（注意三项权重和须保持 1.0）")
     return (
-        f"综合分下限 {e['floor']:.0f}｜压线合格样本质量分仅 {e['min_verified_quality']:.1f}，"
+        f"综合分下限 {e['floor']:.0f}｜压线合格样本质量分 {e['min_verified_quality']:.1f}，"
         f"估值分（仅PE）在行业/绝对口径压线处均锚定 {e['valuation_industry_at_cap']:.0f}，"
         f"其综合分上限为 {e['ceiling_industry']:.1f}"
         f"（{verdict}）；"
         f"要过线所需技术分：{_fmt(e['req_tech_industry'])}"
+        f"{side}"
+        f"｜注：以上为「硬闸门全部压线合格」的理论天花板，实际候选估值分远高于锚点，"
+        f"改权重前请用 diag_p4_feasibility.py 模拟真实分布"
     )
 
 
@@ -3405,9 +3596,8 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
     # 旧口径 (close - 250日最低) / (250日最高 - 250日最低) 对极端值敏感：
     # 250日内若有一天闪崩/涨停，整个分母被拉大/缩小，position 失真；
     # 且不区分下跌趋势 vs 横盘震荡（两者 position 可能相同但含义截然不同）。
-    # 当前收盘价的中秩分位（全部同价时为 50%，唯一最低价约为 0%）。
+    # 当前收盘价的中秩分位：全部同价时为 50%，而不是被误算成 0% 的历史最低位。
     # 相比区间最高/最低价归一化，对单日极端值不敏感。
-    # 中秩分位：全部同价时为 50%，而不是被误算成 0% 的历史最低位。
     closes_window = window["close"].to_numpy(dtype=float)
     position = float(((closes_window < close).sum() +
                       0.5 * (closes_window == close).sum()) / len(closes_window))
@@ -3612,11 +3802,38 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
             _progress = min(1.0, (_days_low - _d_min) / max(1, _d_max - _d_min))
             _cons_bonus = round(_cb_max * _progress, 3)
     rank_score = round(rank_score + _cons_bonus, 3)
+    # ===== P1：250日低位分位进排序（不参与准入）=====
+    # LOW_POSITION_MAX 把 position 二值化在 [0, LOW_POSITION_MAX] 内，闸门内剩下的
+    # 连续区分度被丢弃；本项把它映射回 [0, QV_POSITION_RANK_WEIGHT] 加到 rank_score：
+    #   得分 = 权重 × (1 − position / LOW_POSITION_MAX)
+    # position=0（250日最低）拿满分，position=LOW_POSITION_MAX（恰好压线）拿 0 分。
+    # 权重默认 0（关闭）；实测该分位与未来收益几乎无相关性，暂不建议开启。
+    _pos_w = float(getattr(config, "QV_POSITION_RANK_WEIGHT", 0.0) or 0.0)
+    _pos_score = 0.0
+    if _pos_w > 0:
+        _cap = float(getattr(config, "LOW_POSITION_MAX", 0.0) or 0.0)
+        if _cap > 0:
+            _pos_ratio = min(max(position / _cap, 0.0), 1.0)
+            _pos_score = _pos_w * (1.0 - _pos_ratio)
+    rank_score = round(rank_score + _pos_score, 3)
     # ===== 规则1：止跌确认分层（QV_STABILIZATION_GATE）=====
     # strong：站上MA20且MA20不下行，同时站上MA60；
     # medium：MA20确认，或MACD柱改善且近N日没有新低；
     # weak：MACD柱改善但近N日仍创新低，只保留为待核验观察；
     # none：指标缺失或没有改善，直接淘汰。MACD和低点数据不足绝不放行。
+    #
+    # 【P0 / QV_STABILIZATION_MODE】（实测未证明有收益，默认 strict；保留用于 A/B）
+    #   "strict"（默认）：上述原口径，逐字保持不变。
+    #   "risk_only"：否决权收归「MACD 深度弱势且仍在恶化」这一条真正的危险形态，
+    #     「站上 MA20」降级为标签（未站上但无危险证据 → watch 层，按配置转 pending
+    #     或直接放行），medium 新增「站上 MA60 且未创新低」左侧通道。
+    #     实测放行量与 strict 几乎相同（76 vs 74 / 180），且保留组前瞻收益优于剔除组，
+    #     故默认不上线。
+    #   "disabled"：闸门整体关闭，止跌不参与判定（等价于把 QV_STABILIZATION_GATE
+    #     设为 False，但保留 watch/strong 标签，便于 A/B 分离「标签」与「否决」）。
+    _stab_mode = str(getattr(config, "QV_STABILIZATION_MODE", "strict") or "strict").strip().lower()
+    if _stab_mode not in ("strict", "risk_only", "disabled"):
+        _stab_mode = "strict"
     stabilization_level = "confirmed"
     if getattr(config, "QV_STABILIZATION_GATE", True):
         _ma20_ok = False
@@ -3637,26 +3854,49 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
             _hist = pd.to_numeric(technical["macd_histogram"].iloc[-(_n_mom + 1):], errors="coerce")
             if np.isfinite(_hist.to_numpy()).all():
                 _macd_improving = _macd_momentum_ok(technical, config)
+        # 无新低判定不再依赖 _macd_improving：risk_only 需要把「未创新低」当作
+        # 独立的止跌证据单独使用。strict 下该结果仍只被 `_macd_improving and _no_new_low`
+        # 消费，故提前计算不改变 strict 口径。
         _no_new_low = False
         _low_n = max(2, int(getattr(config, "STABILIZATION_NO_NEW_LOW_LOOKBACK", 5)))
         _prior_n = max(_low_n, int(getattr(config, "STABILIZATION_PRIOR_LOW_LOOKBACK", 20)))
-        if _macd_improving and "low" in technical.columns and len(technical) >= _low_n + _prior_n:
+        if "low" in technical.columns and len(technical) >= _low_n + _prior_n:
             _lows = pd.to_numeric(technical["low"], errors="coerce")
             _recent = _lows.iloc[-_low_n:]
             _prior = _lows.iloc[-(_low_n + _prior_n):-_low_n]
             _no_new_low = bool(np.isfinite(_recent.to_numpy()).all() and np.isfinite(_prior.to_numpy()).all()
                                and (_recent > 0).all() and (_prior > 0).all()
                                and float(_recent.min()) >= float(_prior.min()))
-        if _ma20_ok and _above_ma60:
-            stabilization_level = "strong"
-        elif _ma20_ok or (_macd_improving and _no_new_low):
-            stabilization_level = "medium"
-        elif _macd_improving:
-            stabilization_level = "weak"
+        if _stab_mode == "risk_only":
+            # 危险形态：MACD 深度弱势 AND 仍在恶化（复用 KDJ/MACD 闸门同一实现）。
+            # 只有这一种形态被否决——即「下跌仍在加速」的接飞刀形态。
+            if not macd_not_deeply_weak(technical, config.MACD_WEAK_DAYS,
+                                        config.MACD_WEAK_HIST_PCT):
+                return None, "FAIL_STABILIZATION"
+            if _ma20_ok and _above_ma60:
+                stabilization_level = "strong"
+            elif _ma20_ok or (_above_ma60 and _no_new_low) or (_macd_improving and _no_new_low):
+                stabilization_level = "medium"
+            elif _macd_improving:
+                stabilization_level = "weak"
+            else:
+                # 无止跌证据、但也没有危险证据 → 降级为观察层而非淘汰。
+                stabilization_level = "watch"
+                if bool(getattr(config, "QV_STABILIZATION_WATCH_PENDING", True)):
+                    missing.append("stabilization_watch")
+        elif _stab_mode == "disabled":
+            stabilization_level = "disabled"
         else:
-            return None, "FAIL_STABILIZATION"
-        if stabilization_level == "weak":
-            missing.append("stabilization_weak")
+            if _ma20_ok and _above_ma60:
+                stabilization_level = "strong"
+            elif _ma20_ok or (_macd_improving and _no_new_low):
+                stabilization_level = "medium"
+            elif _macd_improving:
+                stabilization_level = "weak"
+            else:
+                return None, "FAIL_STABILIZATION"
+            if stabilization_level == "weak":
+                missing.append("stabilization_weak")
     else:
         stabilization_level = "disabled"
     timing["stabilization_level"] = stabilization_level
@@ -3700,6 +3940,9 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
         tags.append("止跌强确认")
     elif stab_level == "medium":
         tags.append("止跌中确认")
+    elif stab_level == "watch":
+        # risk_only 模式新增：无止跌证据但也无危险证据，纯观察层（不推荐）。
+        tags.append("无止跌证据")
     elif stab_level == "weak":
         tags.append("止跌弱确认·待核验")
     tags[0] = "优质低估低位" if formal_eligible else "低位观察候选"

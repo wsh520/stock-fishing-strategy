@@ -1466,6 +1466,39 @@ AB_VARIANTS: dict[str, dict[str, dict]] = {
         "qv_veto": {"QV_ENFORCE_KDJ_MACD_VETO": True},              # 接入下限否决（连续 2 日走弱）
         "qv_veto_d1": {"QV_ENFORCE_KDJ_MACD_VETO": True, "MACD_WEAK_DAYS": 1},
         "qv_veto_d3": {"QV_ENFORCE_KDJ_MACD_VETO": True, "MACD_WEAK_DAYS": 3},
+        # ===== P0：止跌闸门判据重构 =====
+        # 实测 strict 口径砍掉 80.6% 候选、其中 140/145 只唯一败因是「未站上 MA20」。
+        "p0_risk_only": {"QV_STABILIZATION_MODE": "risk_only"},
+        # 变体：watch 层不降级 pending（放开到与 medium 同级），测量 watch 层的
+        # 「观察 vs 放行」取舍——只放行一部分还是全部放行更优。
+        "p0_watch_pass": {"QV_STABILIZATION_MODE": "risk_only",
+                          "QV_STABILIZATION_WATCH_PENDING": False},
+        # 对照：闸门整体关闭，量化止跌闸门本身的净贡献（若 p0_risk_only ≈ 此变体，
+        # 说明 risk_only 下真正起作用的只有危险否决，标签层几乎不产生筛选力）。
+        "p0_off": {"QV_STABILIZATION_MODE": "disabled"},
+        # ===== P1：250日低位分位进排序（仅排序，准入不变）=====
+        "p1_pos5": {"QV_POSITION_RANK_WEIGHT": 5.0},
+        "p1_pos10": {"QV_POSITION_RANK_WEIGHT": 10.0},
+        # ===== P2：质量硬门上调（verified 样本质量分下限）=====
+        "p2_q60": {"MIN_QUALITY_SCORE": 60.0},
+        # ===== P3：技术分降权（权重和仍为 1，等价于质量/估值占比同步上调）=====
+        # 注意：单纯下调技术权重会使综合分整体下移、MIN_QV_SCORE=50 变成更严的门槛，
+        # 必须同时把差额还给质量/估值，保持三者和为 1，否则测的是「降分」而非「换权重」。
+        "p3_tech10": {"TECHNICAL_SCORE_WEIGHT": 0.10,
+                      "QUALITY_SCORE_WEIGHT": 0.55, "VALUATION_SCORE_WEIGHT": 0.35},
+        # ===== P0+P3 组合（两个口径改动叠加后的联合效果）=====
+        "p03": {"QV_STABILIZATION_MODE": "risk_only",
+                "TECHNICAL_SCORE_WEIGHT": 0.10,
+                "QUALITY_SCORE_WEIGHT": 0.55, "VALUATION_SCORE_WEIGHT": 0.35},
+        # ===== P4：估值权重再分配（PE 是唯一有区分度的因子，但不能加独立排序权重）====
+        # 实测 ρ(PE, valuation_score) = −1.0（绝对口径下线性负映射，完全共线），
+        # 所以正确做法是调高估值在综合分里的权重，而不是叠一层排序权重。
+        # 这里用 P4 预注册套件：只写估值/技术目标值，质量权重自动补差，
+        # 从根上避免「权重和失衡导致压线合格者全灭」这个坑。
+        "p4_v45_t10": {"P4_VALUATION_WEIGHT": 0.45, "P4_TECHNICAL_WEIGHT": 0.10},
+        "p4_v40_t20": {"P4_VALUATION_WEIGHT": 0.40, "P4_TECHNICAL_WEIGHT": 0.20},
+        "p4_v50_t10": {"P4_VALUATION_WEIGHT": 0.50, "P4_TECHNICAL_WEIGHT": 0.10},
+        "p4_v40_t10": {"P4_VALUATION_WEIGHT": 0.40, "P4_TECHNICAL_WEIGHT": 0.10},
     },
     "technical": {
         "baseline": {},                                            # MACD 连 3 日改善 + KDJ 金叉 K≤55 且 K 上行
