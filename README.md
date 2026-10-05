@@ -28,7 +28,7 @@
 
 `MIN_QV_SCORE=50` 已设置在 formal 候选理论最低分之上，使综合分闸门能够实际区分“三项均压线”的候选。运行时 `describe_qv_floor()` 会随配置实时算出等效门槛并打进漏斗日志。调整前务必先跑 `python backtest.py ab --mode quality_value`。
 
-**市场级刹车（#2，已对 quality_value 生效）**：此前 quality_value 在 `main()` 提前 return，绕过了组合层风控；现已把**急跌熔断**（沪深300 近5日累计 ≤ `MARKET_CRASH_HALT_PCT`(-4%) → 当日不推荐）与**推荐数量按 regime 收缩**（牛 `MAX_PICKS`=5 / 中性 `NEUTRAL_MAX_PICKS`=4 / 熊 `BEAR_MAX_PICKS`=2，由 `resolve_max_picks` 解析）移到分支之前，两种模式共用。quality_value 还默认启用 ATR/收盘价≤`MAX_ATR_PCT`(10%) 波动率闸门（与3×ATR止损+30%止盈下RR≥2.0对齐），`QV_ATR_GUARD=False` 可关闭；technical 继续使用自己的 ATR 闸门。
+**市场级刹车（#2，已对 quality_value 生效）**：此前 quality_value 在 `main()` 提前 return，绕过了组合层风控；现已把**急跌熔断**（沪深300 近5日累计 ≤ `MARKET_CRASH_HALT_PCT`(-8%) → 当日不推荐）与**推荐数量按 regime 收缩**（牛 `MAX_PICKS`=5 / 中性 `NEUTRAL_MAX_PICKS`=4 / 熊 `BEAR_MAX_PICKS`=2，由 `resolve_max_picks` 解析）移到分支之前，两种模式共用。quality_value 还默认启用 ATR/收盘价≤`MAX_ATR_PCT`(10%) 波动率闸门（与3×ATR止损+30%止盈下RR≥2.0对齐），`QV_ATR_GUARD=False` 可关闭；technical 继续使用自己的 ATR 闸门。
 
 **regime 双指标确认（P2）**：`MARKET_REGIME_DUAL_INDICATOR=True` 时，在沪深300 MA20 斜率之外叠加第二指标——长期均线 `MARKET_MA_LONG`(=60) 趋势：只有「斜率看多**且**现价与 MA20 均在 MA60 上方」才判 `bull`，「斜率看空且均在 MA60 下方」才判 `bear`，两者不同向一律降级 `neutral`（描述串会显式标注「斜率判 x，MA60 未同向确认，降级中性」）。这是对 regime 抖动的治本手段（滞回只是补丁）；指数样本不足 `MARKET_MA_LONG` 时自动退回单指标，口径与改动前一致。置 False 恢复纯 MA20 斜率判据。
 
@@ -55,7 +55,7 @@
 
 **两个入口现在是真正独立的信号源**（#1）：优质低估低位入口跑 `quality_value` 资格，突破入口跑自己的 `technical` 七层漏斗。此前突破入口也用 `quality_value`，会委派同一套资格判定、产出与前者完全相同，再经组合层去重后突破卡片恒为空——等于花双份成本拿一份结果；改为 `technical` 后突破基于放量形态独立出票。组合层做同股去重与每日总量上限（`DAILY_TOTAL_MAX_PICKS`=7，后运行的突破剔除当日已被优质低估低位推荐的个股）。市场环境为「未知」（指数数据缺失）时，经 `UNKNOWN_AS_BEAR` 折叠为熊市**只作用于推荐数量上限**（优质低估低位侧收缩为 2 只、突破空仓）；准入分数线不因「未知」上浮（门槛上浮只对已确认的 `bear` 生效，且仅 technical 路径有准入分数线）。
 
-**市场级熔断**（`MARKET_CRASH_HALT_PCT`=−4% / `MARKET_CRASH_LOOKBACK`=5）：沪深300 近 5 个交易日累计跌幅越阈 → 优质低估低位入口本次运行直接不推荐——急跌期间全市场同步满足 RSI 超卖 / MA5 拐头 / 创新低底背离，个股级斜率过滤识别不了这种系统性风险。该熔断现置于 `main()` 的 quality_value 分支之前，对默认模式同样生效（#2）；突破入口在熊市本就空仓（`BEAR_MAX_PICKS_BREAKOUT`=0）。
+**市场级熔断**（`MARKET_CRASH_HALT_PCT`=−8% / `MARKET_CRASH_LOOKBACK`=5）：沪深300 近 5 个交易日累计跌幅越阈 → 优质低估低位入口本次运行直接不推荐——急跌期间全市场同步满足 RSI 超卖 / MA5 拐头 / 创新低底背离，个股级斜率过滤识别不了这种系统性风险。该熔断现置于 `main()` 的 quality_value 分支之前，对默认模式同样生效（#2）；突破入口在熊市本就空仓（`BEAR_MAX_PICKS_BREAKOUT`=0）。> 2026-10-05 锚点由 **−4% 放宽至 −8%**（测试新策略用）：沪深300 近 5 日跌 4%~8% 的「急跌但未崩盘」区间不再整日停荐，两套策略共享此阈值（`VolumeBreakoutConfig` 未覆写）。回退只需改 `StrategyConfig.MARKET_CRASH_HALT_PCT` 一处。
 
 ## 策略一：优质低估低位 / 低位企稳（bottom_fishing_strategy.py）
 
@@ -64,7 +64,7 @@
 
 4 层量化过滤体系：
 
-1. **市场环境过滤**：沪深300日线MA20斜率判断牛/熊/中性环境；熊市不扣分定级，而是把准入门槛**上浮 10 分**（`BEAR_GRADE_BOOST`），保证展示分数与等级始终同源；数据不足时明示「未知」（`UNKNOWN_AS_BEAR`：未知经 `_effective_regime` 折叠为熊市，作用于推荐数量上限的收缩；**门槛上浮只对已确认的 `bear` 生效**——`evaluate()` 按原始 regime 判定，与突破策略 `evaluate_breakout()` 用有效 regime 判门槛的做法不同）；**regime 双指标确认**（`MARKET_REGIME_DUAL_INDICATOR`，见上文「regime 双指标确认（P2）」）；**regime 滞回**（`MARKET_REGIME_HYSTERESIS`）：牛/熊/中性切换须连续 2 个交易日同向确认，避免斜率在阈值附近抖动导致 regime 逐日跳变（状态存 `cache/market_regime_state.json`，超 10 天自动重置；**确认计数每个自然日最多推进一次**——同一天内多套策略依次运行读的是同一份收盘数据，若允许重复计数会把「连续 2 个交易日」悄悄缩短为「同日翻转」）；**市场级熔断**（`MARKET_CRASH_HALT_PCT`=−4% / `MARKET_CRASH_LOOKBACK`=5）：沪深300 近 5 个交易日累计跌幅越阈 → 本次运行不推荐（数据不足不触发，避免指数缺数误判）
+1. **市场环境过滤**：沪深300日线MA20斜率判断牛/熊/中性环境；熊市不扣分定级，而是把准入门槛**上浮 10 分**（`BEAR_GRADE_BOOST`），保证展示分数与等级始终同源；数据不足时明示「未知」（`UNKNOWN_AS_BEAR`：未知经 `_effective_regime` 折叠为熊市，作用于推荐数量上限的收缩；**门槛上浮只对已确认的 `bear` 生效**——`evaluate()` 按原始 regime 判定，与突破策略 `evaluate_breakout()` 用有效 regime 判门槛的做法不同）；**regime 双指标确认**（`MARKET_REGIME_DUAL_INDICATOR`，见上文「regime 双指标确认（P2）」）；**regime 滞回**（`MARKET_REGIME_HYSTERESIS`）：牛/熊/中性切换须连续 2 个交易日同向确认，避免斜率在阈值附近抖动导致 regime 逐日跳变（状态存 `cache/market_regime_state.json`，超 10 天自动重置；**确认计数每个自然日最多推进一次**——同一天内多套策略依次运行读的是同一份收盘数据，若允许重复计数会把「连续 2 个交易日」悄悄缩短为「同日翻转」）；**市场级熔断**（`MARKET_CRASH_HALT_PCT`=−8% / `MARKET_CRASH_LOOKBACK`=5）：沪深300 近 5 个交易日累计跌幅越阈 → 本次运行不推荐（数据不足不触发，避免指数缺数误判）
 2. **基本面防雷**：年化ROE/负债率为核心否决项（金融业——银行/保险/券商等负债率天然 80%+，按名称关键词+代码白名单识别并单独放宽阈值）；商誉/扣非为可选否决项，主源 Baostock 不提供，**technical 路径的决赛圈与放量突破策略的终审会用 AkShare 按字段补齐后复核**（`_fill_optional_fundamentals`，只填 None 字段、不覆盖主源）。注意 **quality_value 路径不做这一步**：它由 `evaluate_quality_value` 直接跑年度质量核验（AkShare `stock_financial_abstract`），商誉为空时不否决、只按缺项计。**ROE 口径为线性年化**（Q1×4 / Q2×2 / Q3×4/3 / Q4×1，累计值年化后才与 `MIN_ROE` 年化阈值可比，不再随财报日历漂移）；财报季度按**交易所披露截止日回溯**取「最近已披露季度」（最多回溯 `FUND_LOOKBACK_QUARTERS`=4 季），结果带 `report_period` 标明数据实际所属报告期；基本面磁盘缓存为 `fund_v2_*`（旧 `fund_*` 单季未年化口径已隔离废弃）
 3. **日线技术指标筛选**：底背离（**双低点算法**：与窗口内前一个价格低点比较 RSI/DIF，而非指标自身最小值）+ 趋势转折（MA5拐头/EMA金叉同源合并计分）+ RSI超卖反弹 + **量价质量分**（放量阳线收高位/一般放量上涨/放量冲高回落三档）；流动性过滤（近20日日均成交额 ≥3000万，独立归因 `FAIL_LIQUIDITY`）；入场质量否决（当日涨幅 >5% 追高否决、开盘跳空高开 >2% 否决、近5日累计涨幅 >12% 已反弹一段否决、RSI14 >60 否决、量比 >4 天量否决、MA20 近5日斜率 <-4% 的陡峭下降通道中趋势转折信号不认可、距60日高点回撤 <10% 非底部区域否决、回撤 >70% 崩盘型/价值陷阱否决）；严格确认指标（现价须落在近20日价格区间下半部、MACD 柱须**连续 3 日**改善（`MACD_MOMENTUM_DAYS`=3，与止跌确认闸门共用同一参数）、KDJ 须金叉、K≤55 且 K 值上行）；**数据时效**（个股最新K线与市场最新交易日不一致，即停牌/数据滞后 → 暂不推荐）；**停牌缺口**（相邻 K 线自然日间隔 >12 天判定为期间曾停牌 → 暂不推荐，独立归因 `FAIL_HALT_GAP`：这类股票的 20 日均量/60日高点/ATR 全部跨缺口计算，「60日高点」可能实为数月前的高点）
 4. **波动率风控**：ATR 占现价百分比 >10% 直接否决（`MAX_ATR_PCT` / `FAIL_VOLATILE`——与3×ATR止损+30%止盈下RR≥2.0对齐，语义直白，且修复了旧实现 ATR 缺失时 RR 恒 2.0 永不否决的漏洞）；止损/止盈/盈亏比（3×ATR 或固定 15% 止损、固定 30% 止盈，价值策略口径）**仅作展示与落库，不参与否决**；**决赛圈周线确认**（`REQUIRE_WEEKLY_TREND`：默认 `WEEKLY_MA_BOTH_REQUIRED=False`，即「收盘站上周线 MA10（容忍 `WEEKLY_TOLERANCE`=2%）」或「MA10 上行」**满足其一**即可——真·低位买点常出现在周线 MA10 尚未上行时，双条件会把目标 setup 全滤掉；设 True 恢复「站上**且**上行」严格口径。**且**须周线 MACD 企稳（`REQUIRE_WEEKLY_MACD_STABLE`：柱值翻红或绿柱连续 2 周收窄）。两个开关独立生效、任一启用即拉周线；**只用已收盘周 bar**——末根周线落在本 ISO 周且非周五即剔除，避免半成品 bar 污染口径（判断基准为北京时间）；数据缺失/截止过旧 → 待核验候选，不占正式名额；取满即止）；**行业分散**（同一行业最多 2 只）；**推荐数量按市场环境收缩**（牛 `MAX_PICKS`=5 / 中性 `NEUTRAL_MAX_PICKS`=4 / 熊 `BEAR_MAX_PICKS`=2，未知经 `_effective_regime` 折叠为熊，统一由 `resolve_max_picks` 解析，周线确认取满即止）
@@ -466,7 +466,7 @@ python -m unittest tests.test_backtest_execution tests.test_breakout_verificatio
 | ATR% / 回撤深度 / 20日区间位置 | 日线（排序） | 连续质量分（technical 路径的 `rank_score` 组成；仅决定同批通过者先后，不改准入；`RANK_QUALITY_WEIGHT`=10 可置 0） |
 | 成交额(20日均值) | 日线 | 流动性过滤（<3000万 否决，独立归因 FAIL_LIQUIDITY） |
 | 沪深300 MA20 斜率 + MA60 趋势 | 市场环境 | 牛/熊/中性 regime（`MARKET_REGIME_DUAL_INDICATOR` 默认开启：斜率与 MA60 趋势须同向，否则降级中性；另含连续 2 日确认的滞回机制） |
-| 沪深300 近5日累计涨跌幅 | 市场环境 | 市场级熔断（≤ −4% → 本次运行不推荐，优质低估低位入口） |
+| 沪深300 近5日累计涨跌幅 | 市场环境 | 市场级熔断（≤ −8% → 本次运行不推荐，优质低估低位入口） |
 | 行业分类 | 集中度 | 行业分散（同一行业最多 2 只，避免单一板块押注） |
 | PE 行业内分位 / 绝对 PE 上限 | 估值（口径） | 行业相对估值回退绝对 PE 上限时逐行标注 `valuation_mode`，飞书卡片显式声明本次口径（PB 只作异常识别与风险说明，不参与准入与评分） |
 

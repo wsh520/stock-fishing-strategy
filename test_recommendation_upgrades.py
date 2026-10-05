@@ -9,6 +9,7 @@
   #4b 前瞻确认闸门（当年净利同比恶化否决 / 缺失行为可配）
 """
 import unittest
+from dataclasses import replace
 from unittest.mock import patch
 
 import numpy as np
@@ -361,9 +362,21 @@ class TestQualityValueMarketBrake(unittest.TestCase):
         dates = pd.bdate_range(end=DAY, periods=len(closes)).strftime("%Y-%m-%d")
         return pd.DataFrame({"date": dates, "close": closes})
 
+    def _crashing(self, cfg):
+        """构造一根必定越阈值的指数序列。
+
+        跌幅按 MARKET_CRASH_HALT_PCT 相对构造（阈值再深 1pp），不写死 -10%：
+        2026-10-05 锚点由 −4.0 放宽到 −8.0 后，写死的 -10% 仍能触发但已远离边界，
+        阈值一旦再放宽就会静默失效而不报警。
+        """
+        pct = (cfg.MARKET_CRASH_HALT_PCT - 1.0) / 100.0
+        n = cfg.MARKET_CRASH_LOOKBACK
+        base, last = 100.0, 100.0 * (1.0 + pct)
+        return self._index([base] * (n + 1) + [last])
+
     def test_crash_halt_blocks_quality_value(self):
         cfg = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False)
-        crashing = self._index([100., 100., 100., 100., 100., 100., 90.])  # 近5日 -10%
+        crashing = self._crashing(cfg)
         with patch.object(m, "_bs_login", return_value=True), patch.object(m, "_bs_logout"), \
              patch.object(m, "get_market_environment", return_value={"regime": "neutral"}), \
              patch.object(m, "get_index_daily", return_value=crashing), \
@@ -371,6 +384,22 @@ class TestQualityValueMarketBrake(unittest.TestCase):
             out = m.main(cfg, m.CacheManager())
         self.assertIsNone(out)
         self.assertEqual(screen.call_count, 0)  # 熔断在筛选之前
+
+    def test_halt_threshold_relaxes_the_shutdown_window(self):
+        """锚点放宽（−4% → −8%）后，「跌 4%~8%」区间应恢复选股，而非继续整日停荐。
+
+        固化 2026-10-05 的放宽语义：−6% 在旧锚点下熔断、在新锚点下放行。
+        """
+        cfg = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False)
+        mid = self._index([100.] * (cfg.MARKET_CRASH_LOOKBACK + 1) + [94.0])  # 近5日 -6%
+        self.assertIsNotNone(m.market_crash_halt(mid, replace(cfg, MARKET_CRASH_HALT_PCT=-4.0)))
+        self.assertIsNone(m.market_crash_halt(mid, cfg))
+        with patch.object(m, "_bs_login", return_value=True), patch.object(m, "_bs_logout"), \
+             patch.object(m, "get_market_environment", return_value={"regime": "neutral"}), \
+             patch.object(m, "get_index_daily", return_value=mid), \
+             patch.object(m, "_screen_quality_pool", return_value=pd.DataFrame()) as screen:
+            m.main(cfg, m.CacheManager())
+        self.assertEqual(screen.call_count, 1)  # 已进入筛选，未被熔断拦下
 
     def test_bear_regime_contracts_max_picks(self):
         cfg = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False)

@@ -364,25 +364,43 @@ def _index(closes):
     return pd.DataFrame({"date": pd.date_range("2025-01-01", periods=len(closes)).strftime("%Y-%m-%d"),
                          "close": np.asarray(closes, dtype=float)})
 
-_flat = _index(np.full(30, 4000.0))
+# 熔断阈值是可配置项（2026-10-05 由 −4.0 放宽至 −8.0），因此边界用例一律按
+# cfg.MARKET_CRASH_HALT_PCT 相对构造，绝不写死百分比——否则每次调锚点都要改测试，
+# 而漏改时测试会「恰好通过」或「恰好失败」两种错向都掩盖不了真实行为。
+# market_crash_halt 只读 closes[-1] 与 closes[-1-n]，故中间 bar 仅需凑够长度。
+_HALT = float(cfg.MARKET_CRASH_HALT_PCT)
+_BASE = 4000.0
+
+def _halt_index(pct):
+    """构造一根「近 LOOKBACK 日累计涨跌恰为 pct%」的指数序列。"""
+    n = cfg.MARKET_CRASH_LOOKBACK
+    last = _BASE * (1.0 + pct / 100.0)
+    return _index(np.concatenate([np.full(25, _BASE),
+                                  np.linspace(_BASE, last, n + 1)[1:]]))
+
+_flat = _index(np.full(30, _BASE))
 check("B2: 指数横盘 → 不熔断", m.market_crash_halt(_flat, cfg) is None)
 
-_crash = _index(np.concatenate([np.full(25, 4000.0), [3980.0, 3940.0, 3900.0, 3860.0, 3800.0]]))
+_crash = _halt_index(_HALT - 1.0)                       # 比阈值再深 1pp
 _h = m.market_crash_halt(_crash, cfg)
-check("B2: 近5日 -5% → 触发熔断", _h is not None and _h < cfg.MARKET_CRASH_HALT_PCT)
-check("B2: 熔断返回实际跌幅", _h is not None and _close(_h, (3800.0 / 4000.0 - 1) * 100, 1e-9))
+check(f"B2: 近5日 {_HALT - 1.0:.1f}% → 触发熔断", _h is not None and _h < cfg.MARKET_CRASH_HALT_PCT)
+check("B2: 熔断返回实际跌幅", _h is not None and _close(_h, _HALT - 1.0, 1e-6))
 
-_mild = _index(np.concatenate([np.full(25, 4000.0), [3990.0, 3985.0, 3980.0, 3975.0, 3970.0]]))
+_mild = _index(np.concatenate([np.full(25, _BASE), [3990.0, 3985.0, 3980.0, 3975.0, 3970.0]]))
 check("B2: 近5日 -0.75% → 不熔断", m.market_crash_halt(_mild, cfg) is None)
-# 阈值边界：严格小于才熔断。注意 IEEE754 下 (3840/4000-1)*100 == -4.000000000000004，
-# 并非精确的 -4.0，因此「恰好等于阈值」不可用浮点构造来断言；改为分别验证
-# 明确未越阈值（-3.9%）与明确越阈值（-4.1%）两侧。
-_near = _index(np.concatenate([np.full(25, 4000.0), [3960.0, 3930.0, 3900.0, 3870.0, 3844.0]]))
-check("B2: 近5日 -3.9% 未越阈值 → 不熔断", m.market_crash_halt(_near, cfg) is None)
-_over = _index(np.concatenate([np.full(25, 4000.0), [3960.0, 3920.0, 3880.0, 3860.0, 3836.0]]))
-check("B2: 近5日 -4.1% 越阈值 → 熔断", m.market_crash_halt(_over, cfg) is not None)
-check("B2: 阈值可配置放宽（-4.1% 在 -5% 阈值下不熔断）",
-      m.market_crash_halt(_over, replace(cfg, MARKET_CRASH_HALT_PCT=-5.0)) is None)
+# 阈值边界：严格小于才熔断。两侧各留 0.1pp 余量，避开 IEEE754 下
+# 「恰好等于阈值」不可用浮点精确构造的问题。
+_near = _halt_index(_HALT + 0.1)                        # 未越阈值
+check(f"B2: 近5日 {_HALT + 0.1:.1f}% 未越阈值 → 不熔断", m.market_crash_halt(_near, cfg) is None)
+_over = _halt_index(_HALT - 0.1)                        # 越阈值
+check(f"B2: 近5日 {_HALT - 0.1:.1f}% 越阈值 → 熔断", m.market_crash_halt(_over, cfg) is not None)
+check(f"B2: 阈值可配置收紧（{_HALT - 0.1:.1f}% 在 {_HALT - 1.0:.1f}% 阈值下不熔断）",
+      m.market_crash_halt(_over, replace(cfg, MARKET_CRASH_HALT_PCT=_HALT - 1.0)) is None)
+check(f"B2: 阈值可配置放宽（{_HALT - 1.0:.1f}% 在 {_HALT + 1.0:.1f}% 阈值下仍熔断）",
+      m.market_crash_halt(_crash, replace(cfg, MARKET_CRASH_HALT_PCT=_HALT + 1.0)) is not None)
+check(f"B2: 兜底阈值与 dataclass 默认值同源（改 MARKET_CRASH_HALT_PCT 不漂移）",
+      _close(getattr(cfg, "MARKET_CRASH_HALT_PCT", None),
+             m.StrategyConfig.MARKET_CRASH_HALT_PCT, 0.0))
 check("B2: 数据不足（≤LOOKBACK 根）→ 不熔断", m.market_crash_halt(_index([4000.0, 3000.0]), cfg) is None)
 check("B2: None / 空表 → 不熔断", m.market_crash_halt(None, cfg) is None
       and m.market_crash_halt(pd.DataFrame(), cfg) is None)

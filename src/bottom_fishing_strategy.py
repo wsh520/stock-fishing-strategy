@@ -520,7 +520,9 @@ class StrategyConfig:
     # → 本次运行不推荐。急跌期间全市场同步满足 RSI 超卖 / MA5 拐头 / 创新低底背离，
     # 抄底信号会批量触发，而 MA20_TREND_MIN_SLOPE 是个股级过滤，抓不到系统性风险。
     # 这是组合层风控，也是本次改动中唯一新增的门槛（其余均为排序/数量层）。
-    MARKET_CRASH_HALT_PCT: float = -4.0
+    # 2026-10-05 由 −4.0 放宽至 −8.0（测试新策略）：沪深300 近 5 日跌 4%~8% 的
+    # 「急跌但未崩盘」区间不再整日停荐，允许策略在该区间继续出信号。
+    MARKET_CRASH_HALT_PCT: float = -8.0
     MARKET_CRASH_LOOKBACK: int = 5
     # 组合层：两套策略（优质低估低位 + 放量突破）同一交易日合计推荐数上限，
     # 由后运行的策略在落库前去重并截取（见 run_breakout.py）
@@ -1758,7 +1760,9 @@ def market_crash_halt(index_df: Optional[pd.DataFrame], config: StrategyConfig) 
     数据不足时不触发（返回 None），避免指数缺数时把正常交易日误判为熔断。
     """
     n = int(getattr(config, "MARKET_CRASH_LOOKBACK", 5))
-    threshold = float(getattr(config, "MARKET_CRASH_HALT_PCT", -4.0))
+    # 兜底取 dataclass 默认值而非再写一份字面量：此前这里硬编码 -4.0，
+    # 与 MARKET_CRASH_HALT_PCT 分列两处，改默认值时极易漏改而静默漂移。
+    threshold = float(getattr(config, "MARKET_CRASH_HALT_PCT", StrategyConfig.MARKET_CRASH_HALT_PCT))
     if n <= 0 or index_df is None or index_df.empty or "close" not in index_df.columns:
         return None
     closes = pd.to_numeric(index_df["close"], errors="coerce").dropna().to_numpy(dtype=float)
