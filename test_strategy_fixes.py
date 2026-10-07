@@ -52,7 +52,8 @@ vcfg = vb.VolumeBreakoutConfig(RECOMMENDATION_MODE="technical")
 
 check("配置: SCREEN_TIME_BUDGET_MIN 存在", getattr(cfg, "SCREEN_TIME_BUDGET_MIN", None) == 240.0)
 check("配置: PROGRESS_LOG_EVERY 存在", getattr(cfg, "PROGRESS_LOG_EVERY", None) == 500)
-check("配置: MAX_ATR_PCT=10", getattr(cfg, "MAX_ATR_PCT", None) == 10.0)
+check("配置: MAX_ATR_PCT=6（2026-10-07 由 10 下调，原值在主板池为死闸门）",
+      getattr(cfg, "MAX_ATR_PCT", None) == 6.0)
 check("配置: FUND_LOOKBACK_QUARTERS=4", getattr(cfg, "FUND_LOOKBACK_QUARTERS", None) == 4)
 check("配置: 旧 FUND_QUARTER_LOOKBACK 已移除", not hasattr(cfg, "FUND_QUARTER_LOOKBACK"))
 check("配置: UNKNOWN_AS_BEAR 显式存在", getattr(cfg, "UNKNOWN_AS_BEAR", None) is True)

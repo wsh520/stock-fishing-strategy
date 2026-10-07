@@ -35,3 +35,7 @@ backtest_output/
 .cleanup_backup
 .workbuddy
 backtest_cache_ak/
+
+# 审计/诊断脚本的临时输出（audit_*.out）。脚本本身纳入版本管理（与既有 diag_*.py 一致），
+# 但输出是可再生的中间产物，不入库。CI 日志与backtest_output/ 才是权威留档。
+audit_*.out

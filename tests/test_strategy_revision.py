@@ -71,6 +71,12 @@ class RevisedRecommendationTests(unittest.TestCase):
         self.assertIn("stabilization_weak", signal.missing_tags)
 
     def test_nonfinite_stabilization_evidence_cannot_promote(self):
+        # 注：2026-10-07 起止跌确认层多了「V 值高位保护」（QV_MAX_GAIN_FROM_250D_LOW）。
+        # 本用例把末 25 根 low 人为压到 1.0，等价于「已涨离低点极远」，
+        # 在默认配置下会先被高位保护拦下（返回 None）——那不是本用例要测的东西。
+        # 故显式关闭高位保护，使断言聚焦于「止跌证据为非有限值时不得被提升为 medium」。
+        base = cfg()
+        base.QV_MAX_GAIN_FROM_250D_LOW = None
         original = m.compute_daily_signals
         def output(frame, config, invalid=False):
             result = original(frame, config)
@@ -80,10 +86,31 @@ class RevisedRecommendationTests(unittest.TestCase):
             return result
         frame = mk_df(BELOW_MA20_MACD_UP)
         with patch.object(m, "compute_daily_signals", side_effect=lambda df, c: output(df, c)):
-            self.assertEqual(evaluate(frame=frame)[0].stabilization_level, "medium")
+            self.assertEqual(evaluate(frame=frame, config=base)[0].stabilization_level, "medium")
         with patch.object(m, "compute_daily_signals", side_effect=lambda df, c: output(df, c, True)):
-            signal, reason = evaluate(frame=frame)
+            signal, reason = evaluate(frame=frame, config=base)
             self.assertEqual((reason, signal.tier, signal.stabilization_level), ("PASS", "pending", "weak"))
+
+    def test_overextended_stock_cannot_be_promoted_by_stabilization_only(self):
+        """2026-10-07 新增：高位保护独立于止跌证据生效（回归测试）。
+
+        动机：止跌确认成立（medium）曾足以放行，但该股可能已涨离250 日低点
+        远超 QV_MAX_GAIN_FROM_250D_LOW —— 此时它已不是「低位」，属错推荐。
+        本用例锁定「止跌成立 + 已涨离底部」⇒ FAIL_OVEREXTENDED。
+        """
+        config = cfg()
+        self.assertGreater(config.QV_MAX_GAIN_FROM_250D_LOW, 0)
+        original = m.compute_daily_signals
+        def output(frame, cfg_):
+            result = original(frame, cfg_)
+            # low 压到极低 → 距低点涨幅巨大；close 保持 BELOW_MA20_MACD_UP 的形态
+            result.loc[result.index[-60:], "low"] = result.loc[result.index[-60:], "low"] * 0.25
+            return result
+        frame = mk_df(BELOW_MA20_MACD_UP)
+        with patch.object(m, "compute_daily_signals", side_effect=lambda df, c: output(df, c)):
+            signal, reason = evaluate(frame=frame)
+        self.assertIsNone(signal)
+        self.assertEqual(reason, "FAIL_OVEREXTENDED")
 
     def test_technical_shortfall_remains_pending_before_composite_floor(self):
         signal, reason = evaluate(config=cfg(MIN_TECHNICAL_SCORE_FORMAL=100, MIN_QV_SCORE=100))

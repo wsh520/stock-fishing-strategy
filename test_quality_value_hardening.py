@@ -493,17 +493,31 @@ class TestValuationScoring(unittest.TestCase):
         self.assertNotIn("绝对口径 0", text)
 
     def test_score_weights_and_floor_unchanged(self):
-        # 2026-09 生产口径：技术权重 15%→25%（让有底部形态的排前面），下限收紧到 50
+        # 2026-09 生产口径：技术权重 15%→25%（让有底部形态的排前面）
+        # 2026-10-07：下限由 50 下调至 38（低于压线理论最低分 45.75，
+        # 使该闸门不再等效于「技术分 ≥62」的隐式硬闸门，回归「技术面仅排序」的设计声明）
         self.assertEqual((self.cfg.QUALITY_SCORE_WEIGHT, self.cfg.VALUATION_SCORE_WEIGHT,
                           self.cfg.TECHNICAL_SCORE_WEIGHT), (0.45, 0.30, 0.25))
-        self.assertEqual(self.cfg.MIN_QV_SCORE, 50.0)
-        # 综合分低于下限的 formal 候选仍被否决（本轮不放松资格判定）：
-        # ROE 10/10/10 + PE12 → 0.45×61.6 + 0.30×71.2 ≈ 49.1 < 50
-        cfg = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False, MIN_TECHNICAL_SCORE_FORMAL=0)     # 默认下限 50
-        df, fund = mk_df(HEALTHY, pe=12.0, pb=1.2), mk_fund(roe=(10, 10, 10))
+        self.assertEqual(self.cfg.MIN_QV_SCORE, 38.0)
+        # 下限必须低于「三项恰好压线合格」的理论最低分 45.75 —— 这是本次下调的核心不变量
+        # 2026-10-07：MIN_TECHNICAL_SCORE_FORMAL 45→40（方案 A），压线下限随之 45.75→44.5
+        formal_min = (self.cfg.QUALITY_SCORE_WEIGHT * 50.0 + self.cfg.VALUATION_SCORE_WEIGHT * 40.0
+                      + self.cfg.TECHNICAL_SCORE_WEIGHT * self.cfg.MIN_TECHNICAL_SCORE_FORMAL)
+        self.assertAlmostEqual(formal_min, 44.5, places=2)
+        self.assertLess(self.cfg.MIN_QV_SCORE, formal_min)
+        # 综合分低于下限的 formal 候选仍被否决（本轮不放松质量/估值资格判定）：
+        # 压线质量（ROE 5/10/10 → 质量分 50.0）+ 高 PE 24（估值分低）→ 综合分 < 38
+        cfg = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False,
+                               MIN_TECHNICAL_SCORE_FORMAL=0, QV_MAX_GAIN_FROM_250D_LOW=None)
+        df, fund = mk_df(HEALTHY, pe=24.0, pb=1.2), mk_fund(roe=(5, 10, 10))
         sig, reason = ev(df, fund=fund, cfg=cfg)
         self.assertIsNone(sig)
         self.assertEqual(reason, "FAIL_QV_SCORE")
+        # 边界对照：同样 PE 下质量分升到 51.25 → 综合分 38.19 ≥ 38 → 放行。
+        # 证明该闸门确实只拦「明显短板」，而非变成隐式技术分硬闸门。
+        sig_ok, reason_ok = ev(mk_df(HEALTHY, pe=24.0, pb=1.2), mk_fund(roe=(6, 10, 10)), cfg=cfg)
+        self.assertEqual(reason_ok, "PASS")
+        self.assertGreaterEqual(sig_ok.score, cfg.MIN_QV_SCORE)
 
 
 # ===========================================================================
@@ -572,10 +586,11 @@ class TestRelativeStrength(unittest.TestCase):
         self.assertIn("风险提示", weak.signals_hit)
 
     def test_relative_strength_cannot_bypass_score_floor(self):
-        # 门槛判定用 score（不含相对强度/筑底加分）：明显强势也不能把 ≈49.1 分的候选救过 50 分下限
-        cfg = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False, MIN_TECHNICAL_SCORE_FORMAL=0)          # 默认下限 50
+        # 门槛判定用 score（不含相对强度/筑底加分）：明显强势也不能把低于下限的候选救回来。
+        # 2026-10-07 下限 50→38，样本改为「质量压线(50) + PE24」使综合分落到 38 以下。
+        cfg = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False, MIN_TECHNICAL_SCORE_FORMAL=0)
         n = cfg.RS_LOOKBACK + 1
-        sig, reason = ev(mk_df(HEALTHY, pe=12.0, pb=1.2), fund=mk_fund(roe=(10, 10, 10)),
+        sig, reason = ev(mk_df(HEALTHY, pe=24.0, pb=1.2), fund=mk_fund(roe=(5, 10, 10)),
                          cfg=cfg, index_df=idx_df(np.linspace(100.0, 10.0, n)))
         self.assertIsNone(sig)
         self.assertEqual(reason, "FAIL_QV_SCORE")
@@ -705,9 +720,12 @@ class TestQualityHardeningGuards(unittest.TestCase):
         self.assertEqual(reason, "PASS")
 
     def test_qv_atr_guard_can_be_disabled(self):
-        # ATR 上限已放宽到 10%：把末端 5 根 K 线振幅拉宽（high ×1.30 / low ×0.85，
-        # 非对称以保持 20 日区间位置 ≤0.5），使 ATR% 明确越过新上限
-        cfg = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False, MIN_QV_SCORE=0, QV_ATR_GUARD=True)
+        # ATR 上限已于 2026-10-07 由 10% 下调至 6%（原值在主板池为死闸门，超限占比 0.000%）：
+        # 把末端 5 根 K 线振幅拉宽（high ×1.30 / low ×0.85，非对称以保持 20 日区间位置 ≤0.5），
+        # 使 ATR% 明确越过上限。注：QV_MAX_GAIN_FROM_250D_LOW=None 是为把该用例聚焦到
+        # ATR 语义本身 —— 该 fixture 已涨离底部 15%+，否则会被高位保护先一步拦下
+        # （返回 FAIL_OVEREXTENDED），断言的就不再是 ATR 这一层了。
+        cfg = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False, MIN_QV_SCORE=0, QV_ATR_GUARD=True, QV_MAX_GAIN_FROM_250D_LOW=None)
         high_range = mk_df(HEALTHY)
         for i in range(-5, 0):
             high_range.loc[high_range.index[i], "high"] = high_range.iloc[i]["close"] * 1.30
@@ -716,7 +734,7 @@ class TestQualityHardeningGuards(unittest.TestCase):
         self.assertIsNone(sig)
         self.assertEqual(reason, "FAIL_VOLATILE")
 
-        relaxed = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False, MIN_QV_SCORE=0, QV_ATR_GUARD=False)
+        relaxed = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False, MIN_QV_SCORE=0, QV_ATR_GUARD=False, QV_MAX_GAIN_FROM_250D_LOW=None)
         sig, reason = ev(high_range, cfg=relaxed)
         self.assertIsNotNone(sig)
         self.assertEqual(reason, "PASS")

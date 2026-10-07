@@ -51,10 +51,12 @@ def ev(df, fund, cfg=None, val_context=None, **kw):
 # ===========================================================================
 class TestScoreFloor(unittest.TestCase):
     def test_low_score_formal_rejected_at_default_floor(self):
-        # ROE 10/10/10 + PE12/PB1.2 → 质量分≈61.6、估值分≈71.2、技术分 0
-        # → 综合分≈49.1 < 50，无缺项（formal 候选）→ 默认下限 50 否决
-        df, fund = make_df(pe=12., pb=1.2), make_fund(roe=(10, 10, 10))
-        sig, reason = ev(df, fund, m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False, MIN_TECHNICAL_SCORE_FORMAL=0))  # MIN_QV_SCORE=50 默认
+        # 2026-10-07：MIN_QV_SCORE 由 50 下调至 38（见配置注释）。
+        # 构造「质量分压线(50) + 估值分低(PE24) → 综合分 < 38」的 formal 候选：
+        #   0.45×50.0 + 0.30×估值分(PE24) + 0.25×0(技术分门槛置0) < 38
+        # 该样本质量/估值各自都「压线合格」，只有综合分不达标 —— 正是本闸门该拦的情形。
+        df, fund = make_df(pe=24., pb=1.2), make_fund(roe=(5, 10, 10))
+        sig, reason = ev(df, fund, m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False, MIN_TECHNICAL_SCORE_FORMAL=0))
         self.assertIsNone(sig)
         self.assertEqual(reason, "FAIL_QV_SCORE")
 
@@ -67,22 +69,47 @@ class TestScoreFloor(unittest.TestCase):
         self.assertEqual(sig.tier, "formal")
 
     def test_high_score_passes_default_floor(self):
-        # 综合分≈62.3 ≥ 默认下限 50；技术短板门槛置 0 隔离（本用例只验证综合分下限语义）
+        # 综合分≈62.3 ≥ 默认下限 38；技术短板门槛置 0 隔离（本用例只验证综合分下限语义）
         cfg = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False, MIN_TECHNICAL_SCORE_FORMAL=0)
         sig, reason = ev(make_df(), make_fund(), cfg)
         self.assertEqual(reason, "PASS")
         self.assertEqual(sig.tier, "formal")
         self.assertGreaterEqual(sig.score, m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", ).MIN_QV_SCORE)
 
+    def test_default_floor_below_formal_theoretical_minimum(self):
+        """2026-10-07 新增：默认下限必须低于「三项恰好压线合格」的理论最低分 45.75。
+
+        这是本次下调的核心不变量 —— 下限低于 45.75 意味着
+        「质量50 / 估值40 / 技术45」全部恰好达标的候选**必然通过**，
+        该闸门不再被用来二次筛技术分（那正是旧值 50 的问题：
+        0.45×50+0.30×40+0.25×T ≥ 50 ⟹ T ≥ 62，近似一道隐式技术分硬闸门）。
+        """
+        cfg = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy")
+        formal_min = (cfg.QUALITY_SCORE_WEIGHT * 50.0 + cfg.VALUATION_SCORE_WEIGHT * 40.0
+                      + cfg.TECHNICAL_SCORE_WEIGHT * cfg.MIN_TECHNICAL_SCORE_FORMAL)
+        # 用计算式而非硬编码：MIN_TECHNICAL_SCORE_FORMAL 于 2026-10-07 由 45 降至 40
+        # （方案 A），压线理论最低分随之由 45.75 变为 44.5。硬编码会在调参时立刻失效。
+        self.assertAlmostEqual(formal_min, 44.5, places=2)
+        self.assertLess(cfg.MIN_QV_SCORE, formal_min,
+                        "默认综合分下限必须低于压线理论最低分，否则变成隐式技术分闸门")
+        self.assertLessEqual(cfg.MIN_TECHNICAL_SCORE_FORMAL, 40.0,
+                             "技术分门槛不得高于 40（再上调会把方案 A 的放行额度收回）")
+
     def test_floor_not_applied_to_pending(self):
         # 缺 PE → 估值分记 0、综合分被人为压低；但属 pending，下限不应把它直接否决，
         # 否则「数据缺失」与「质量不够」两种语义被混为一谈。
-        df = make_df()
-        df.loc[df.index[-1], "peTTM"] = np.nan
-        sig, reason = ev(df, make_fund(), m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False))
+        # 2026-10-07（下限 50→38）：改用 PE=24 让有 PE 时的分数本就低于下限，
+        # 再抽掉 PE 使分数进一步走低 —— 断言「分数确实低于下限」这个前提更明确。
+        df = make_df(pe=24., pb=1.2)
+        sig, reason = ev(df, make_fund(roe=(5, 10, 10)), m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False))
         self.assertEqual(reason, "PASS")
         self.assertEqual(sig.tier, "pending")
         self.assertLess(sig.score, m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", ).MIN_QV_SCORE)
+        df_missing = df.copy()
+        df_missing.loc[df_missing.index[-1], "peTTM"] = np.nan
+        sig2, reason2 = ev(df_missing, make_fund(roe=(5, 10, 10)), m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False))
+        self.assertEqual(reason2, "PASS")
+        self.assertEqual(sig2.tier, "pending")
 
 
 class TestDimensionFloors(unittest.TestCase):
@@ -156,7 +183,9 @@ class TestScoreFloorEquivalence(unittest.TestCase):
     def test_shipped_helper_reports_floor_between_formal_min_and_ceiling(self):
         cfg = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", )
         e = m.qv_floor_equivalence(cfg)
-        self.assertAlmostEqual(e["floor"], 50.0, places=2)
+        # 2026-10-07：下限由 50 下调至 38（低于 formal 理论最低分 45.75），
+        # 使该闸门不再被当作「隐式技术分 ≥62 筛选」使用，回归「技术面不否决」的设计声明。
+        self.assertAlmostEqual(e["floor"], 38.0, places=2)
         self.assertAlmostEqual(e["min_verified_quality"], 50.0, places=2)
         self.assertAlmostEqual(e["valuation_industry_at_cap"], 40.0, places=6)
         # 规则4：绝对口径压线处与行业口径锚定相同估值分（均为 40）
@@ -164,12 +193,13 @@ class TestScoreFloorEquivalence(unittest.TestCase):
         # 压线合格者技术分满分时的综合分上限 = 0.45×50 + 0.30×40 + 0.25×100 = 59.5
         for key in ("ceiling_industry", "ceiling_absolute"):
             self.assertAlmostEqual(e[key], 59.5, places=2)
-        # 下限 50 落在 (formal 理论最低分 45.75, 压线上限 59.5) 之间：
-        # 能拦「三项均压线」的候选，但不再 100% 淘汰全部压线合格者
+        # 2026-10-07：下限 38 落在 formal 理论最低分 45.75 **之下**
+        # → 「三项恰好压线合格」的候选必然通过，本闸门只拦「有明显短板」的情形，
+        #   不再二次筛技术分（旧值 50 会要求技术分 ≥62，等价于隐式技术硬闸门）。
         formal_min = (cfg.QUALITY_SCORE_WEIGHT * 50.0 + cfg.VALUATION_SCORE_WEIGHT * 40.0
                       + cfg.TECHNICAL_SCORE_WEIGHT * cfg.MIN_TECHNICAL_SCORE_FORMAL)
-        self.assertAlmostEqual(formal_min, 45.75, places=2)
-        self.assertGreater(cfg.MIN_QV_SCORE, formal_min)
+        self.assertAlmostEqual(formal_min, 44.5, places=2)
+        self.assertLess(cfg.MIN_QV_SCORE, formal_min)
         self.assertLess(cfg.MIN_QV_SCORE, e["ceiling_industry"])
         # 日志说明必须随配置动态给出正确结论（当前口径：上限不低于下限）
         desc = m.describe_qv_floor(cfg)
@@ -184,19 +214,21 @@ class TestScoreFloorEquivalence(unittest.TestCase):
         self.assertIn("不可达（需 >100）", desc)
 
     def test_implied_technical_requirement_matches_documented_values(self):
-        # 反解 0.45q + 0.30v + 0.25t ≥ 50 所需技术分，与配置注释/README 口径一致。
+        # 反解 0.45q + 0.30v + 0.25t ≥ MIN_QV_SCORE 所需技术分，与配置注释/README 口径一致。
         # 规则4后：行业/绝对口径压线处估值分均为 40（锚点对齐）。
+        # 2026-10-07：下限 50→38 后，压线质量分(50)+压线估值分(40) 的组合**不再需要技术分**
+        # （0.45×50+0.30×40 = 34.5 < 38，仍需 t ≥ 14）——这是本次修复的核心结果：
+        # 该闸门不再是「隐式技术分 ≥62 硬闸门」，技术面权重回归「仅排序、不否决」。
         cfg = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", )
 
         def required_tech(quality_score, valuation_score):
             return (cfg.MIN_QV_SCORE - cfg.QUALITY_SCORE_WEIGHT * quality_score
                     - cfg.VALUATION_SCORE_WEIGHT * valuation_score) / cfg.TECHNICAL_SCORE_WEIGHT
 
-        # 质量分=压线下限 50，估值分=40（两口径一致）：技术分须 ≥62 才能过线
-        self.assertAlmostEqual(required_tech(50, 40), 62.0, places=1)
-        # 质量分 70：需 26
-        self.assertAlmostEqual(required_tech(70, 40), 26.0, places=1)
-        # 质量分 90：无需技术分（负值 → 无约束）
+        # 质量分=压线下限 50，估值分=40：技术分只需 ≥14（原 50 时需 ≥62）
+        self.assertAlmostEqual(required_tech(50, 40), 14.0, places=1)
+        # 质量分 70：无需技术分（负值 → 无约束）
+        self.assertLessEqual(required_tech(70, 40), 0.0)
         self.assertLessEqual(required_tech(90, 40), 0.0)
         # 与随代码发布的 helper 数值一致
         e = m.qv_floor_equivalence(cfg)

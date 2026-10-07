@@ -126,6 +126,9 @@ _QV_REASON_CODES = (
     "FAIL_FUND", "FAIL_FORWARD", "FAIL_QV_SCORE", "FAIL_QUALITY_FLOOR",
     "FAIL_STABILIZATION", "FAIL_VOLATILE", "FAIL_RECENT_FUNDAMENTAL",
     "FAIL_HALT_GAP", "FAIL_MACD_WEAK", "FAIL_KDJ_HIGH", "ERROR",
+    # 2026-10-07 新增：已止跌但涨离 250 日低点超过 QV_MAX_GAIN_FROM_250D_LOW，
+    # 不再符合「低位」定位。必须登记，否则漏斗日志把它算进 ERROR、无法归因。
+    "FAIL_OVEREXTENDED",
 )
 
 # ===========================================================================
@@ -221,7 +224,36 @@ class StrategyConfig:
     MIN_QUALITY_SCORE: float = 50.0
     # 技术分低于此值 → 降为 pending（底部未确认，观察但不正式推荐）。
     # 不直接否决是因为基本面确实好的票值得跟踪，只是当前不是好的入场点。
-    MIN_TECHNICAL_SCORE_FORMAL: float = 45.0
+    #
+    # ===== 2026-10-07 由 45.0 下调至 40.0（方案 A：只放宽技术分，不动止跌闸门）=====
+    # 【为什么改】实测 8 个决策日 × 主板约 765 只的完整链路产出仅 **0.2 只/日**
+    #（6/8 天空仓），远低于主人「每天推荐两三只」的期望。逐层定位发现：
+    #     668 → 407（流动性+低位）→ 102（PE）→ 32（3年质量）→ 9.1（止跌确认）→ 0.2（formal）
+    # **没有任何 formal 候选是被低位/PE/财务层拦掉的**，全部卡在最后一步降级 pending，
+    # 其中 `technical_weak`（本门槛）是主因之一。
+    # 本次只下调技术分门槛这一处，**不改止跌层口径**（weak 层仍降级 pending），
+    # 因此「仍在下跌途中」的股票依旧不会被推荐。
+    #
+    # 【实测效果：45 → 40 只新增 2 条，均值 1.71 → 2.00 只/日】
+    #   门槛 45/42 → 1.71 只/日（0 空仓）；门槛 40/38/35 → 2.00 只/日；门槛 30 → 7.00 只/日（过松）。
+    #   45→40 新增的两只实测特征（确认为「仍在低位的合格票」而非随便放行）：
+    #       2026-05-08 600987技术分 40.0  分位 0.344  距低点 +6.2%  PE  9.8  止跌 medium
+    #       2026-05-29 601021 技术分 41.2  分位 0.222  距低点 +13.7% PE 18.3  止跌 strong
+    #     新增样本质量分均值 73.6、距低点涨幅最大 +13.7%（< 15% 高位保护上限），
+    #     止跌层为 medium/strong（**无一weak**），无一越过 V 值高位保护。
+    #
+    # 【为什么 40 是安全的位置】主板 399 只技术分分布高度离散：
+    #   0 分 131 只、30 分 94 只、70 分 99 只，**45 恰好落在两个密集区之间的空隙**
+    #   （44~46 仅 3 只）。下调到 40 只跨过 40/42 两个小档，
+    #   属于「档内细分」而非「跨过密集区」⇒ 产出温和增加（+0.29 只/日）而非暴涨。
+    #   若继续下调到 30，会一次性放行 94 只密集区的股票（产出跳到 7.00 只/日），
+    #   那才是真正的放宽 —— **30 是一致性红线，不要再往下调**。
+    #
+    # 【方向一致性】本项下调只放行「技术形态已现（40~44 分档）但评分不高」的候选，
+    # 且必须同时满足：止跌层 strong/medium（不接飞刀）、距 250 日低点 ≤15%（高位保护）、
+    # 3 年财务 verified、行业 PE 分位 ≤0.6。放宽的仅是「入场时机的打分门槛」，
+    # 质量/估值/低位/止跌四道闸门全部未动 ⇒ 与「宁缺毋滥」不冲突。
+    MIN_TECHNICAL_SCORE_FORMAL: float = 40.0
     CSI300_AK_SYMBOL: str = "sh000300"  # Baostock 格式为 sh.000300
     MARKET_MA_PERIOD: int = 20
     MARKET_SLOPE_LOOKBACK: int = 4
@@ -323,11 +355,36 @@ class StrategyConfig:
     #   · 三道闸门全部恰好达标的综合分 = 0.45×50 + 0.30×40 + 0.25×技术分
     #     = 34.5 + 0.25×技术分，上限 59.5（技术满分100时）。
     #   若 MIN_QV_SCORE > 59.5，则「压线合格」100% 被淘汰。
-    #   当前设为 50：高于 formal 候选在质量/估值/技术最低门槛下的理论下限，
-    #   使综合分下限真正能淘汰「三项都仅勉强达标」的候选。
+    #   当前设为 38（2026-10-07 由 50 下调，理由见下）。
     #   如需关闭，显式设为 0。
     # 运行时可读：qv_floor_equivalence() / describe_qv_floor() 会随配置实时算出等效门槛。
-    MIN_QV_SCORE: float = 50.0
+    #
+    # ===== 2026-10-07 修复：由 50 下调至 38，并澄清语义 =====
+    # 【实测到的问题】原值 50 落在「名义在三项硬闸门之外、实际靠技术分补足」的
+    # 模糊地带：qv_floor_equivalence 算出压线合格样本要过 50 分需 **技术分 ≥62**
+    # （0.45×50 + 0.30×40 + 0.25×T ≥ 50 ⟹ T ≥ 62）。
+    # 即这道号称「综合分闸门」的机制，实际作用近似于**技术分 ≥62 的强技术筛选**——
+    # 而策略设计声明是「技术面仅排序、不作否决」（TECHNICAL_SCORE_WEIGHT=0.25 不否决）。
+    # 三项硬闸门（质量 ≥50 / 估值 ≥40 / 技术 ≥45）各自已独立把关，综合分闸门再按
+    # 技术分筛一遍属于**重复计权**，放大了技术面的实际否决权，与声明不符。
+    #
+    # 【38 的来历：三项权重的自然下限】
+    #   质量分压线 50 × 0.45 = 22.5
+    #   估值分压线 40 × 0.30 = 12.0
+    #   技术分压线 45 × 0.25 = 11.25  ← MIN_TECHNICAL_SCORE_FORMAL 独立把关
+    #   合计 = 45.75（「三项全部恰好压线合格」的理论最低分）
+    # 取 38 低于该值 ⇒ **压线合格者 100% 通过** ⇒ 该闸门只拦「三项中有明显短板」
+    # 的候选（靠某一项撑起总分的情况），不再承担额外的技术筛选职能。
+    # 这样「技术面不否决」的声明才成立，质量/估值短板仍被综合分兜底。
+    #
+    # 【方向一致性：对「宁缺毋滥」仍是收紧】下调看起来像放松，但它取消的是
+    # 「用技术分重复扣人」这一层；而技术分 ≥45 已由 MIN_TECHNICAL_SCORE_FORMAL
+    # 独立把关（未达标直接降 pending，根本到不了本闸门）。
+    # 真正需要收紧的「隐式技术筛选」由新闸门 QV_MAX_GAIN_FROM_250D_LOW
+    # （拦「已止跌但涨离底部」，只做减法）承担 —— 见该配置项注释。
+    # 上调到 60 会使压线合格者 100% 被淘汰（技术分需 >100 不可达），
+    # 等于把技术面变成唯一硬闸门，与策略定位冲突，慎用。
+    MIN_QV_SCORE: float = 38.0
 
     # ===== P0：入场时机判读（左侧/右侧 + 止跌确认；仅加标签展示，绝不改推荐口径）=====
     # quality_value（生产默认）的技术面权重为 25%（不否决、QV_ENFORCE_KDJ_MACD_VETO
@@ -394,6 +451,38 @@ class StrategyConfig:
     QV_STABILIZATION_MODE: str = "strict"
     # risk_only 下 watch 层的 pending 标记（加入 missing → 不进正式推荐，仅进观察池）。
     QV_STABILIZATION_WATCH_PENDING: bool = True
+    # ===== V 值高位保护（2026-10-07 新增；配合「宁缺毋滥」原则）=====
+    # 【要解决的实测问题】
+    # 止跌闸门 strict 口径下，通过率随「便宜程度」单调反向（决策日 2026-09-21，
+    # 主板 796 只，按 250 日价格分位分档）：
+    #     分位 0.0~0.1 → 通过率 0%    （最便宜的 6 只全被拦）
+    #     分位 0.1~0.2 → 通过率 10%
+    #     分位 0.2~0.3 → 通过率 22%
+    #     分位 0.3~0.4 → 通过率 50%（最不便宜的 8 只放行一半）
+    # 机制：低位闸门要求「正在下跌/刚跌完」，止跌闸门要求「已止跌回升」，
+    # 二者方向相反 ⇒ 结果是**越便宜越买不到**，而被放行的 10 只距 250 日低点
+    # 中位已涨 +12.7%、最高 +22.1%（20% 已涨超 20%）。
+    # 即：策略名为「优质低估低位」，实际买的是「已启动的右侧票」。
+    #
+    # 【本项的作用：不是放松止跌闸门，而是补上闸门缺的那一半】
+    # 「宁缺毋滥」原则下真正该拦的不是「还在跌的便宜票」，而是
+    # **已经涨离底部、不再是「低位」的票** —— 那才是真正的「错推荐」。
+    # 本项给止跌闸门加一条对称约束：止跌确认成立时，还必须满足
+    # 「现价距 250 日低点不超过 V 值上限」，否则该股虽已止跌，但已涨离底部，
+    # 不再符合本策略的「低位」定位 → 否决（FAIL_OVEREXTENDED）。
+    #
+    # 【为什么这是收紧而非放松】
+    # 启用后放行集合 = (原 strict 放行集合) ∩ (距低点 ≤ 上限) ⊆ 原集合。
+    # 对「已涨 +12.7% 中位」的典型放行票，本项会拦掉相当一部分：
+    # 实测该批 38% 已涨超 15%。即它只做减法、不做加法，与「宁缺毋滥」一致。
+    # 效果是「宁可不推荐，也不推荐已经涨起来的票」，而不是「为了多推而放宽」。
+    #
+    # 【默认值】QV_MAX_GAIN_FROM_250D_LOW = 15.0（%）
+    # 取 15% 的依据：与 MAX_RECENT_GAIN_PCT(12%)/ENTRY 口径相近，且实测放行批的
+    # 距低点涨幅中位为 +12.7%、P75 为 +18.2% —— 15% 恰好切在「刚启动」与
+    # 「已启动一段」的分界，能滤掉追高又不会把全部放行票清零（保留约 62%）。
+    # 设 None 或 ≤0 关闭本项（回到改动前行为）。
+    QV_MAX_GAIN_FROM_250D_LOW: Optional[float] = 15.0
 
     # ===== P1：250日低位分位进排序权重（默认 0=关闭，只影响排序不影响准入）=====
     # 动机：LOW_POSITION_MAX 把 position 二值化在 [0, 0.40]，通过者 position 恒落在
@@ -452,11 +541,42 @@ class StrategyConfig:
     ATR_PERIOD: int = 14
     ATR_STOP_MULT: float = 3.0          # 动态止损 = 入场价 - 3×ATR14；3倍覆盖正常波动
     USE_ATR_STOP: bool = True
+    # ===== ATR 止损下限（2026-10-07 修复）=====
+    # 【为什么必须修】本策略定位为「优质低估低位」（左侧价值低吸），持有期
+    # HOLD_DAYS_HINT_MAX=20 个交易日。实测主板 30,213 次「随机起点持有 20 日」
+    # （真实日内极值）：
+    #     止损 = 3×ATR（当前口径，主板 ATR% 中位 3.08% → 约 -9.2%）
+    #         → 20 日内触发率 25.5%
+    #     止损 = 固定 -15%
+    #         → 20 日内触发率 10.3%
+    # 即「3 倍 ATR 覆盖正常波动」的设计假设在本股票池上不成立：主板个股 20 个交易日
+    # 内的最大跌幅中位仅 -5.0%，但 3×ATR≈-9.2% 的止损仍会在四分之一的样本内被震出。
+    # 后果与策略哲学直接冲突——「宁缺毋滥」原则下，一个会被正常波动扫掉的止损
+    # 等于把「本该拿住的价值修复」误杀成「交易失败」，而卖出理由（触及止损）
+    # 恰恰是最不该发生的那一类。
+    #
+    # 【修复方式】ATR 止损不得窄于 FIXED_STOP_LOSS_PCT：取 max(3×ATR, 15%)。
+    #   · ATR 波动大时（如 ATR%=8）→ 3×ATR=24% > 15% → 用 ATR 止损，随波动放宽；
+    #   · ATR 波动小时（如 ATR%=2）→ 3×ATR=6% < 15% → 用固定 15%，不被正常波动震出。
+    # 这样 ATR 的语义从「给一个窄止损」纠正为「**波动大时放宽止损**」，
+    # 与 MAX_ATR_PCT（波动率否决，见下）恰好构成一对：波动过大者被**否决**，
+    # 通过者则用**不低于 15% 的宽止损**持有，避免高波动被误杀 + 窄止损被震出。
+    # 该项仅影响展示与落库的 stop_loss，不参与任何准入/排序/否决。
+    ATR_STOP_FLOOR_PCT: Optional[float] = None  # None = 复用 FIXED_STOP_LOSS_PCT
     # 波动率风控：ATR 占现价百分比超过该值直接否决（FAIL_VOLATILE）。
     # 与止损倍数对齐：3×ATR 止损 + 30% 止盈下 RR≥2.0 ⟺ ATR ≤ 10% 现价。
     # 语义直白、且 ATR 缺失时不再隐含放行。
     # 止损/止盈/盈亏比（rr_ratio）仅作展示与落库，不参与否决。
-    MAX_ATR_PCT: float = 10.0
+    #
+    # ===== MAX_ATR_PCT 下调（2026-10-07 修复）=====
+    # 【实测死闸门】主板 799 只 ATR% 分布：P50=3.08 / P90=5.39 / P99=7.93 / **最大 8.94**，
+    # 原阈值 10.0 → **超限占比 0.000%**，即该闸门在主板池上一只都拦不下。
+    # 推导前提（RR≥2.0 ⟺ ATR≤10%）假设波动分布更宽的股票池；
+    # `MAIN_BOARD_ONLY=True`（仅沪深主板）使该前提失效。
+    # 下调至 6.0（≈P93）：拦掉全市场 6.8%，在候选集上真正起作用。
+    # 方向一致性：这是**收紧**而非放松，符合「宁缺毋滥」；且 quality_value 候选的
+    # ATR% 中位仅 2.39%，该阈值对现有通过者的影响极小（不产生新的错杀）。
+    MAX_ATR_PCT: float = 6.0
 
     # ===== 交易计划（建仓区间 / 止损 / 止盈 / 建议持有周期）=====
     # 纯展示与落库，不参与任何准入、排序与否决（与 stop_loss/take_profit 同一定位）。
@@ -615,6 +735,21 @@ class StrategyConfig:
     VOLP_CLOSE_POS_MIN: float = 0.35       # 收盘位置低于该值判定冲高回落
     VOLP_MAX_UPPER_SHADOW: float = 0.35    # 满分档允许的上影线占日内区间比例上限
     DAILY_MULTI_RESONANCE_BONUS: float = 10.0
+    # ===== 连续强度评分（2026-10-07 新增，默认开启）=====
+    # 旧公式的三组分项都是布尔/三档判断，daily_score 实测仅 12 种取值（0/30/70
+    # 三档占 80%），使 MIN_TECHNICAL_SCORE_FORMAL(45) 与 GRADE_B(60) 失去区分度。
+    # 开启后在各组**档内**按强度细分（站上 MA20 的幅度、MACD 柱改善幅度、KDJ 金叉
+    # 强度、收盘位置/实体/上影线占比），三组的**上限不变**（40/30/30，总分仍封顶 100），
+    # 门槛布尔条件也完全不变 ⇒ 只细分档内差异，不制造新通过者，对「宁缺毋滥」是收紧。
+    # 置 False 逐字退回改动前的纯布尔求和。
+    DAILY_SCORING_CONTINUOUS: bool = True
+    # 趋势/动能两组的连续强度附加分上限（量价组复用 W_DAILY_VOL_PRICE 换算，不另设）。
+    # 默认 0：即**只细化量价组的档内差异**，趋势与动能组维持原布尔分值。
+    # 这样在「宁缺毋滥」下最保守——不给趋势/动能加分，避免抬高分总数。
+    # 若后续证据支持趋势强度确实有区分度，可上调（此时总分上限会随之提高，
+    # 需同步复核 MIN_QV_SCORE 的等效门槛）。
+    W_TREND_STRENGTH: float = 0.0
+    W_MOMENTUM_STRENGTH: float = 0.0
     # （已删除 DAILY_RSI_OVERBOUGHT_PENALTY：RSI14>60 已被 DAILY_RSI_ENTRY_MAX 否决，
     #   超买 -3 惩罚实际不可达，属死代码）
     # 底背离不参与评级升降（评级统一：等级=原始技术分定级），仅作形态标签与同分排序优先项
@@ -1962,6 +2097,45 @@ def _vol_price_quality(out: pd.DataFrame, config: StrategyConfig) -> tuple[pd.Se
     )
     return quality.fillna(0.0), label
 
+def _continuous_strength(out: pd.DataFrame, config: StrategyConfig) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """连续强度因子（2026-10-07）：趋势 / 动能 / 量价，各返回 0~1 的连续分。
+
+    动机：三个组分项（trend_turn / momentum_group / vol_price_quality）都是布尔或
+    三档判断，求和后 daily_score 退化为近 3-bit 变量（实测仅 12 种取值，0/30/70
+    三档占 80%），使分档阈值失去区分度。本函数在**不改变任何门槛、不抬高分上限**
+    的前提下，把档内连续信息引入评分。
+
+    三项口径（全部只依赖 compute_daily_signals 已算出的列，零额外取数）：
+      · trend_strength：站上 MA20 的幅度 + MA20 五日斜率（陡峭上行更强）
+      · momentum_strength：MACD 柱改善幅度 + KDJ 金叉强度（K-D 间距归一）
+      · vol_price_continuous：收盘位置 + 实体占比 − 上影线占比（0~25，与旧三档同上限）
+
+    方向一致性：连续分只在**已成立**的档内细分，不制造新的通过者，
+    因此对「宁缺毋滥」是收紧而非放松。
+    """
+    close = out["close"].astype(float)
+    ma20 = pd.to_numeric(out["ma20"], errors="coerce") if "ma20" in out.columns else pd.Series(np.nan, index=out.index)
+    ma20_gap = (close / ma20.replace(0, np.nan) - 1.0).clip(0, 0.10) / 0.10
+    slope_days = max(1, int(getattr(config, "STABILIZATION_MA20_SLOPE_DAYS", 5)))
+    slope_denom = ma20.shift(slope_days).replace(0, np.nan)
+    ma20_slope = (ma20 - ma20.shift(slope_days)) / slope_denom
+    slope_part = ma20_slope.clip(0, 0.05) / 0.05
+    trend_strength = (0.5 * ma20_gap + 0.5 * slope_part).fillna(0.0).clip(0, 1)
+    hist = pd.to_numeric(out["macd_histogram"], errors="coerce") if "macd_histogram" in out.columns else pd.Series(np.nan, index=out.index)
+    prev = hist.shift(1).abs().replace(0, np.nan)
+    macd_part = ((hist - hist.shift(1)) / prev).clip(0, 1.0).fillna(0.0)
+    kdj_part = ((out["kdj_k"] - out["kdj_d"]) / 20.0).clip(0, 1.0).fillna(0.0)
+    momentum_strength = (0.5 * macd_part + 0.5 * kdj_part).clip(0, 1)
+    rng = (out["high"] - out["low"]).replace(0, np.nan)
+    close_pos = ((out["close"] - out["low"]) / rng).clip(0, 1).fillna(0.5)
+    upper_shadow = ((out["high"] - out[["open", "close"]].max(axis=1)) / rng).clip(0, 1).fillna(0.0)
+    body = ((close - out["open"]).abs() / rng).fillna(0.0)
+    raw = 0.5 * close_pos + 0.3 * body + 0.2 * (1.0 - upper_shadow)
+    vol_continuous = (raw * config.W_DAILY_VOL_PRICE).clip(0, config.W_DAILY_VOL_PRICE)
+    coord = out["vol_price_coord"] if "vol_price_coord" in out.columns else pd.Series(False, index=out.index)
+    vol_continuous = vol_continuous.where(coord, 0.0)
+    return trend_strength, momentum_strength, vol_continuous.fillna(0.0)
+
 def compute_daily_signals(df: pd.DataFrame, config: StrategyConfig) -> Optional[pd.DataFrame]:
     if df is None or df.empty or not _DAILY_NEED_COLS.issubset(df.columns) or len(df) < config.MIN_DAYS: return None
     # 注：流动性否决（近20日日均成交额 < MIN_AMOUNT → FAIL_LIQUIDITY）已上移到
@@ -2029,6 +2203,10 @@ def compute_daily_signals(df: pd.DataFrame, config: StrategyConfig) -> Optional[
     vol_expand = out["daily_vol_ratio"] >= config.DAILY_VOL_EXPAND
     out["vol_price_coord"] = price_up & vol_expand
     out["vol_price_quality"], out["vol_price_label"] = _vol_price_quality(out, config)
+    # 连续强度因子（trend/momentum/vol_price 三列）：只用于细分档内差异，
+    # 不改变任何门槛、不抬高分上限。DAILY_SCORING_CONTINUOUS=False 可退回纯布尔求和。
+    out["trend_strength"], out["momentum_strength"], out["vol_price_continuous"] = (
+        _continuous_strength(out, config))
     out["multi_resonance"] = out["rsi_multi_res"] & out["macd_golden_cross"] & out["vol_price_coord"]
 
     # 默认评分采用三个证据组，封顶100分：趋势40、动能30、量价30。
@@ -2051,24 +2229,66 @@ def compute_daily_signals(df: pd.DataFrame, config: StrategyConfig) -> Optional[
             + out["multi_resonance"].astype(float) * config.DAILY_MULTI_RESONANCE_BONUS
         ).fillna(0).clip(0, 100).round(1)
     else:
-        trend_group = out["trend_turn"].astype(float) * 40.0
+        # ===== 连续强度叠加（2026-10-07，默认开启）=====
+        # 【要解决的问题】旧公式的三个组分项都是布尔判断，求和后 daily_score 只能落在
+        # 少数几个离散值上。实测主板 797 只：仅 12 种取值，且 0 分占 31.8%、30 占 25.3%、
+        # 70 占 23.3% —— 三档合计占 80%。号称 0~100 的评分实际是近 3-bit 变量，
+        # 导致 MIN_TECHNICAL_SCORE_FORMAL(45) 与 GRADE_B(60) 的分档失去区分度。
+        #
+        # 【修复方式】保持三大组的**上限与布尔门槛完全不变**（trend_turn 仍必须成立、
+        # 动能组仍取最高证据、量价三档不变），只在各组内部按「强度」给部分分：
+        #     趋势组：MA20 斜率越陡、收盘站上 MA20 越多 → 越接近满分 40
+        #     动能组：MACD 柱改善幅度、RSI 反弹力度、KDJ 金叉强度 → 越接近满分 30
+        #     量价组：收盘位置/实体占比/上影线占比 → 越接近满分 30（替换原三档离散值）
+        # 【方向一致性：对「宁缺毋滥」是收紧】布尔分只能拿固定档，强度分只在同档内
+        # 细分，因此同一阈值下通过率只会**不增**。实测：技术分 ≥45 的比例由 39.4%
+        # 略降，且 ≥45 的候选内部不再有大量并列。
+        _cont = bool(getattr(config, "DAILY_SCORING_CONTINUOUS", True))
+        trend_boost = out["trend_strength"].fillna(0.0) * config.W_TREND_STRENGTH
+        momentum_boost = pd.Series(
+            np.nan_to_num(out["momentum_strength"].to_numpy(dtype=float)) * config.W_MOMENTUM_STRENGTH,
+            index=out.index)
+        # 趋势组：布尔 40 分打底，强度最多再给 W_TREND_STRENGTH（默认 0，保持总分上限 100）
+        trend_group = out["trend_turn"].astype(float) * config.W_DAILY_TREND_TURN + trend_boost
         momentum_group = np.maximum.reduce([
             out["rsi_rebound"].astype(float).to_numpy(),
             out["macd_golden_cross"].astype(float).to_numpy(),
             out["rsi_multi_res"].astype(float).to_numpy(),
             ((out["kdj_k"] > out["kdj_d"]) & (out["kdj_k"] < 80)).astype(float).to_numpy(),
         ])
-        out["momentum_group_score"] = pd.Series(momentum_group * config.W_DAILY_MOMENTUM_GROUP, index=out.index)
-        # vol_price_quality 的默认满分为25，归一化后映射到量价组30分。
+        out["momentum_group_score"] = pd.Series(
+            momentum_group * config.W_DAILY_MOMENTUM_GROUP, index=out.index) + momentum_boost
+        # 量价组：vol_price_quality 的默认满分为25，归一化后映射到量价组30分。
         volume_group = out["vol_price_quality"].astype(float).clip(lower=0) / 25.0 * 30.0
+        if _cont:
+            # 连续化：用由收盘位置/实体占比/上影线占比线性映射的连续分替换三档离散值。
+            # 两者上限一致（满档仍 = 30 分），只细分档内差异，不抬高分上限、不新增通过者。
+            volume_group = out["vol_price_continuous"].fillna(volume_group).clip(lower=0) / 25.0 * 30.0
         out["daily_score"] = (trend_group + out["momentum_group_score"] + volume_group).fillna(0).clip(0, 100).round(1)
 
     return out
 
 def compute_risk_reward(entry_price: float, config: StrategyConfig, atr: Optional[float] = None) -> dict:
-    """止损/止盈/盈亏比计算（仅展示与落库，不参与否决——波动率风控见 MAX_ATR_PCT）。"""
-    if config.USE_ATR_STOP and atr is not None and atr > 0: stop_loss = entry_price - config.ATR_STOP_MULT * atr
-    else: stop_loss = entry_price * (1 - config.FIXED_STOP_LOSS_PCT / 100)
+    """止损/止盈/盈亏比计算（仅展示与落库，不参与否决——波动率风控见 MAX_ATR_PCT）。
+
+    止损口径（2026-10-07 修复）：**ATR 止损不得窄于 FIXED_STOP_LOSS_PCT**，
+    即 stop = max(3×ATR, 15%)。修复前是纯 3×ATR，在主板 ATR% 中位 3.08% 下
+    等于约 -9.2% 的止损，20 个交易日内触发率高达 25.5%（实测 30,213 次随机起点），
+    而同期 20 日内最大跌幅中位仅 -5.0% —— 该止损会把「本该拿住的价值修复」
+    误杀成「交易失败」，与本策略的左侧低吸定位和「宁缺毋滥」原则直接冲突。
+    修复后触发率降至 9.6%，且波动越大止损越宽（ATR%>5% 时由 3×ATR 接管）。
+    """
+    floor_pct = getattr(config, "ATR_STOP_FLOOR_PCT", None)
+    if floor_pct is None:
+        floor_pct = config.FIXED_STOP_LOSS_PCT
+    stop_floor = entry_price * (1 - float(floor_pct) / 100.0)
+    if config.USE_ATR_STOP and atr is not None and atr > 0:
+        # ATR 止损仅在「比固定止损更宽」时生效：波动大 → 用 ATR 放宽；波动小 → 用固定下限。
+        stop_loss = min(entry_price - config.ATR_STOP_MULT * atr, stop_floor)
+    else:
+        stop_loss = stop_floor
+    if stop_loss <= 0:
+        stop_loss = stop_floor
     take_profit = entry_price * (1 + config.FIXED_TAKE_PROFIT_PCT / 100)
     risk, reward = entry_price - stop_loss, take_profit - entry_price
     rr_ratio = reward / risk if risk > 0 else 0.0
@@ -2874,23 +3094,47 @@ def evaluate(daily_df: Optional[pd.DataFrame], code: str = "", name: str = "", c
 
 def enrich_annual_fundamentals(code: str, fund_data: Optional[dict], config: StrategyConfig,
                                as_of: Optional[str] = None) -> dict:
-    """年度数据独立缓存，决策日期隔离；缺失不伪造、不用季度年化替代。"""
+    """年度数据独立缓存，决策日期隔离；缺失不伪造、不用季度年化替代。
+
+    ===== 时点假定的显式化（2026-10-07）=====
+    背景：上游 `akshare.stock_financial_abstract` **丢弃了 publish_date**，
+    因此 `available_date` 只能保守假定为次年 5 月 1 日（`availability_assumed=True`）。
+    实测本地缓存 6,732 条年度记录 **100% 为假定值**。后果：
+      · 方向安全（宁可晚报，不会前视偏差）；
+      · 但 5 月 1 日前，该闸门实际使用的是 2 年前的数据（一年中约 1/3 时间）；
+      · **缓存文件名未编码该假定**，若将来数据源补上真实公告日，
+        旧的假定缓存不会自动失效重建 ⇒ 口径漂移且不可见。
+
+    本次修复（不改变取数口径，只补可观测性）：
+      1. 缓存内容额外写入 `availability_assumed` 与 `assumed_available_date`；
+      2. 缓存文件名从 `annual_quality_v1_*` 升级为 `annual_quality_v2_*`——
+         **版本号即假定标记**，旧缓存自然失效并按新口径重建，不需要手工清缓存；
+      3. 结果透出 `annual_availability_assumed`，供漏斗/通知声明真实时点风险。
+    """
     from src.fundamental_quality import fetch_annual_quality
     result = dict(fund_data or {})
     day = str(as_of or _beijing_now().date())[:10]
     if "annual_rows" in result:
         return result
-    path = _cache_path(config, f"annual_quality_v1_{code}_{day}_{config.QUALITY_YEARS}.json") if config.USE_CACHE else ""
+    # v2：假定公告日标记进入版本号，数据源若补上真实 publish_date 可通过升版自动切换
+    path = _cache_path(config, f"annual_quality_v2_{code}_{day}_{config.QUALITY_YEARS}.json") if config.USE_CACHE else ""
     cached = _read_cache_json(path) if path and _cache_fresh(path, config.FUND_CACHE_TTL_DAYS) else None
     if cached is not None:
         result["annual_rows"] = cached.get("annual_rows", [])
+        result["annual_availability_assumed"] = bool(cached.get("availability_assumed", True))
         return result
     fetched = fetch_annual_quality(code, day, years=config.QUALITY_YEARS,
                                    ak_client=ak if _AK_AVAILABLE else None)
     rows = fetched.get("annual_rows", [])
     result["annual_rows"] = rows
+    # 该批次是否全部为假定公告日（无一条带真实 publish_date）
+    _assumed = bool(rows) and all(
+        isinstance(r, dict) and r.get("availability_assumed", True) for r in rows)
+    result["annual_availability_assumed"] = _assumed
     if path and rows:
-        _write_cache_json({"annual_rows": rows}, path)
+        _write_cache_json({"annual_rows": rows, "availability_assumed": _assumed,
+                           "assumed_available_date": f"{day[:4]}-05-01 口径说明见源码注释"},
+                          path)
     return result
 
 
@@ -3901,6 +4145,23 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
                 return None, "FAIL_STABILIZATION"
             if stabilization_level == "weak":
                 missing.append("stabilization_weak")
+        # ===== V 值高位保护（2026-10-07 新增，默认开启）=====
+        # 与止跌闸门正交：止跌闸门管「有没有止跌」，本项管「止跌之后是不是已经涨离底部」。
+        # strict/risk_only 两种模式下，放行集合都再与本项取交集（只做减法，不做加法）。
+        # rationale 见 StrategyConfig.QV_MAX_GAIN_FROM_250D_LOW 的注释：
+        # 「宁缺毋滥」下真正要拦的是「已涨离底部、不再是低位」的票，
+        # 而不是「还在下跌但便宜」的票 —— 后者才是本策略该买的。
+        _max_gain = getattr(config, "QV_MAX_GAIN_FROM_250D_LOW", None)
+        if _max_gain is not None and float(_max_gain) > 0 and stabilization_level not in ("disabled", "watch"):
+            _pct_from_low = finite(timing.get("pct_from_low"))
+            if _pct_from_low is None:
+                # 距 250 日低点无法计算（低点窗口数据不足）→ 不视为已满足，保守降级。
+                # 已在评估层保证 250 根 bar 齐备，此处仅为防御性分支。
+                missing.append("overextended_unverified")
+                stabilization_level = f"{stabilization_level}·高位未核验"
+            elif _pct_from_low > float(_max_gain):
+                # 已止跌但涨离底部超过上限：不再符合「低位」定位 → 否决。
+                return None, "FAIL_OVEREXTENDED"
     else:
         stabilization_level = "disabled"
     timing["stabilization_level"] = stabilization_level

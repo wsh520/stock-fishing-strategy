@@ -86,9 +86,24 @@ _STRATEGY_ZH = {"bottom_fishing": "优质低估低位", "volume_breakout": "放�
 # 例：【优质低估低位】选股结果 / 【放量突破】选股结果 / 【低位企稳】选股结果（technical）
 _LOW_POSITION_ROLE = "低位企稳"
 _STRATEGY_ROLE_ZH = {"bottom_fishing": "优质低估低位", "volume_breakout": "放量突破"}
-# 飞书通知每策略最多展示的股票数。策略层已按 MAX_PICKS/NEUTRAL_MAX_PICKS/BEAR_MAX_PICKS
-# 截取正式推荐，这里再做一次通知口径的收敛：宁缺毋滥，用户只看 Top-3。
-NOTIFY_TOP_PER_STRATEGY = 3
+# 飞书通知每策略最多展示的股票数。
+#策略层已按 MAX_PICKS/NEUTRAL_MAX_PICKS/BEAR_MAX_PICKS 截取正式推荐。
+#
+# ===== 2026-10-07 由 3 改为 5（配合主人「每天推荐两三只即可」的实盘口径）=====
+# 原值 3 存在一处**口径不一致**：策略层放行的第 4、5 只已 `save_recommendations`
+# 落库、会进入周度追踪与信号归因（等价于「已推荐、已建仓、会被统计战绩」），
+# 但通知只展示 Top-3 → 这两只「已经被推荐了，却看不见」。
+# 在「宁缺毋滥」原则下这是错的：该看的不给看，等于让人无法复核自己的持仓。
+#
+# 为什么不改成「不设上限」：留一个显式上限作为**兜底**，防止将来某个上游口径
+# 变更导致单日推荐数意外放大时，飞书被几十张卡片刷屏。
+# 取 5 = 与策略层牛市上限 MAX_PICKS 对齐 ⇒ 策略层放几只，通知就展示几只，
+# 「落库集合」与「可见集合」严格一致。
+# 实测（真实行情 + 真实年度财务，决策日 2026-09-21）：通过全部闸门 11 只，
+#其中 tier=formal 仅 **2 只**（9 只因 technical_weak / stabilization_weak
+# 降级 pending）—— 即正常情况下卡片就是 2~3 张，与主人期望一致，
+# 5 只是异常牛市时的兜底上限，不会造成干扰。
+NOTIFY_TOP_PER_STRATEGY = 5
 
 # ===== 估值口径声明 =====
 # 行业相对估值依赖单一 Baostock 接口 query_stock_industry；它不可用时全市场回退绝对阈值
@@ -136,7 +151,8 @@ def notify_screening_result(
         notify_screening_result(output_df, market_env=market_env_desc, strategy="volume_breakout")
         notify_screening_result(None, market_env=market_env_desc, error_msg=str(e))
 
-    展示口径：df 为正式推荐，每策略最多 NOTIFY_TOP_PER_STRATEGY=3 只（宁缺毋滥）。
+    展示口径：df 为正式推荐，最多展示 NOTIFY_TOP_PER_STRATEGY 只（默认 5，与策略层
+    MAX_PICKS 对齐，保证「落库集合 == 可见集合」，不会出现已落库却看不到的票）。
     本通知**只发通过全部筛选闸门的正式推荐**——未通过筛选的对象（波动率风控否决的
     观察池等）一律不上卡片，用户在群里看到的每一条都是可直接执行的推荐。
 
