@@ -4,75 +4,60 @@
 
 ## 当前荐股运行口径
 
-当前规则见 [荐股调整说明](docs/quality_value_recommendations.md)，数据字段和公告时效见 [近期经营数据契约](docs/recent_operating_contract.md)。默认使用多维近期经营核验与止跌强/中/弱分层；弱证据留观察，资格通过后才参与正式排序。旧单项前瞻与评分可显式进入兼容模式。
+当前规则见[荐股调整说明](docs/quality_value_recommendations.md)、[近期经营数据契约](docs/recent_operating_contract.md)及[本次证据升级边界](docs/recommendation_evidence_upgrade.md)。先核验资格与分层，再排序；缺失或走弱证据留观察，只有formal进入正式名单。本次不改变交易、回测与追踪算法，不以规则分声称收益改善。
 
 ## 当前默认：优质低估低位荐股
 
-`StrategyConfig.RECOMMENDATION_MODE="quality_value"` 为**优质低估低位入口（run.py）**的默认资格判定——它选的是「多年质量好 + 相对低估 + 价格处 250 日低位」，**不是技术性抄底**。这里的“低股价”指相对自身250个有效交易日区间的位置，不是每股面值低。**放量突破入口（run_breakout.py）已改为独立的 `technical` 模式**（见下文「双策略并行」），不再与它共用同一资格判定。
+`StrategyConfig.RECOMMENDATION_MODE="quality_value"` 是 `run.py` 默认：连续年度质量+近期经营与财务risk+相对及自身历史估值+250日低位+近期底部与止跌。低位是相对自身价格序列的位置。`VolumeBreakoutConfig` 与 `run_breakout.py` 默认 `technical`，提供独立右侧突破信号。
 
-| 必选维度 | 默认规则 |
+| 必选维度 | 当前默认规则 |
 |---|---|
-| 多年质量（非金融） | 最近连续3个可用完整年度：ROE中位数≥10%、每年ROE≥5%、每年扣非净利润>0、每年合并净利润与经营现金流>0、三年经营现金流合计/合并净利润合计≥0.8（分母须>0） |
-| 估值（行业相对 PE，#4a） | 默认 `USE_INDUSTRY_RELATIVE_VALUATION=True`：**PE** 在其**所属行业当日横截面**的分位 ≤60%（`VALUATION_INDUSTRY_PERCENTILE_MAX`）才算便宜；行业数据缺失或行业内可比样本 <10（`VALUATION_INDUSTRY_MIN_PEERS`）时**自动回退**绝对 PE 上限 `0<PE TTM≤25`。PE≤0 一律否决、PE 缺失只列待核验。**PB 自本轮起不再单独否决**（高于绝对/行业上限只作异常识别与风险说明，且不进入估值评分）；`PB≤0` 仍按净资产异常否决，PB 缺失只标注缺项、不把核心证据完整的股票降为 pending |
-| 近期经营核验 | `REQUIRE_RECENT_OPERATING=True`：最新已公告报告的收入、净利、扣非、经营现金流、毛利率和净利率与去年同期比较；明确亏损/严重收缩或收入利润现金同降否决；轻度走弱与缺失分别进入观察/待核验。真实公告日、报告期、股票身份与决策日必须有效，详见数据契约。 |
-| 价格位置 | 至少250根有效日线，当前收盘价在250日收盘价序列中的中秩分位≤40%（相同收盘价按中间名次计，横盘同价不再误判为最低位）；取数窗口600自然日 |
-| 综合分下限（#3） | `MIN_QV_SCORE=38`（2026-10-07 由 50 下调）：综合分（0.45×质量+0.30×估值+0.25×技术）<38 的 **formal 候选**否决（`FAIL_QV_SCORE`）。**38 低于压线理论最低分 45.75**（=0.45×50+0.30×40+0.25×45），故「三项恰好压线合格」的候选必然通过，本闸门只拦「有明显短板」者；旧值 50 会要求技术分 ≥62，等价于一道隐式技术硬闸门，与「技术面仅排序、不否决」的设计声明矛盾。反解所需技术分已由 62 降至 14。设 0 关闭。，弱市自然少推/不推；仅对 formal 生效，pending 不受其累；设 0 关闭。该值高于质量、估值与 formal 技术门槛组合的理论下限，能实际拦截三项仅勉强达标的候选。 |
-| 维度短板门槛 | `MIN_QUALITY_SCORE=50`：**已核验（verified）**样本质量分 < 50 → `FAIL_QUALITY_FLOOR` 直接否决（差公司再便宜也是价值陷阱，防止估值满分拉高综合分的假象）。**只判已核验样本**——质量数据缺失/部分缺失/金融专项待核验的候选仍按分层约定降级 pending（缺失不误杀）；评分锚点决定 verified 样本质量分恒 ≥50，默认值即保底下限，上调（如 60）可拦截「已核验但平庸」的候选。**`MIN_TECHNICAL_SCORE_FORMAL=40`**（2026-10-07 由 45 下调，方案 A）：技术分 < 40 → 降为 pending（基本面好但入场时机未到，跟踪观察但不正式推荐）。**只放宽技术分门槛，未动止跌闸门**（weak 层仍降级 pending），故「仍在下跌途中」的股票依旧不会被推荐。实测 8 个决策日 × 主板约765 只：完整链路产出由 **0.2 只/日** 升至约 **2 只/日**；新增放行样本实测特征为「技术分 40~41、250 日分位 0.22~0.34、距低点 +6.2%~+13.7%、止跌 medium/strong、质量分均值 73.6」，且无一越过 V 值高位保护（15%）。**30 是一致性红线**：下调到 30 会一次性放行技术分 30 密集区的 94 只（产出跳至 7 只/日），那才是真正的放宽。 |
-| 止跌分层 | 强：MA20确认且站上MA60；中：MA20确认，或MACD连续3日改善且近5日最低价不低于前20日最低价；弱：仅MACD改善，留观察。无改善否决。窗口缺失不视为确认。 |
-| V 值高位保护（2026-10-07） | `QV_MAX_GAIN_FROM_250D_LOW=15%`：**止跌确认成立时，还须「现价距 250 日低点 ≤15%」**，否则 `FAIL_OVEREXTENDED`。止跌闸门管「有没有止跌」，本项管「止跌后是否已涨离底部」——**只做减法**（放行集合 ⊆ 原 strict 放行集合）。实测拦下 17 只「分位≤0.40 但已涨 +15.6%~+30.8%」的票（这些在旧口径下全部 PASS，即原本会被错荐）。严格 `>` 才否决；距低点无法计算 → pending 不放行。 |
-| 止损口径（2026-10-07） | **ATR 止损不得窄于固定止损：stop = max(3×ATR, 15%)**。原纯 3×ATR 在主板 ATR% 中位 3.08% 下约 -9.2%，20 个交易日内触发率 **25.5%**（同期最大跌幅中位仅 -5.0%），会把「本该拿住的价值修复」误杀成「交易失败」；修复后触发率降至 9.6%。ATR 波动大时（ATR%>5%）仍由 3×ATR 放宽。仅影响展示与落库，不参与否决。 |
-| 波动率闸门（2026-10-07 修正） | `MAX_ATR_PCT` 由 10.0 **下调至 6.0**。原值在主板池为**死闸门**：797 只实测 ATR% P50=3.08/P90=5.39/P99=7.93/**最大 8.94**，超限占比 0.000%。6.0 ≈ P93，拦全市场 6.8%，方向为收紧。 |
-| 相对强度（排序微调 + 风险提示） | `RS_LOOKBACK`(=60)：同一起止日期下「个股区间涨跌幅 − 沪深300区间涨跌幅」（百分点）。指数日线复用主流程已取得的 `get_index_daily` 结果，按**共有交易日**对齐，只使用决策日及之前的数据。**不设硬性准入线**：以 `RS_WEIGHT`(=3.0) 为上限小幅调整 `rank_score`，资格判定仍用不含该调整的综合分；明显跑输（≤`RS_UNDERPERFORM_WARN`=-10pp）时打风险提示标签。指数缺失/对齐数据不足 → `relative_strength=None`、排序中性，不给「强势/弱势」结论 |
-| 停牌缺口 | `REQUIRE_NO_HALT_GAP`：相邻 K 线自然日间隔 > `MAX_BAR_GAP_DAYS`(=12) 判定期间曾停牌 → `FAIL_HALT_GAP` 否决（quality_value 与 technical 共用同一守卫与归因码） |
-| 择时读数 + 决策简报（P0/P5，纯展示） | `SURFACE_TIMING_READ=True`：为每条推荐附「左侧/右侧 + 是否仍在下跌」标签（用 `TIMING_MA_LONG`=60 的均线区分站上/跌破，MACD 深度走弱判「仍在下跌」）与决策简报（信心分档/今日触发/看多理由/主要风险/失效价）。**不参与任何否决、排序与落库**，只把择时判断显式交回人工 |
-| 基础核验 | 最新行情与指数基准日一致、负债率已核验且≤70%、已知商誉超限否决；金融股独立待专项核验 |
+| 年度质量（非金融） | 连续3个可用完整年度：ROE中位数≥10%、每年ROE≥5%、扣非/合并净利润/经营现金流每年为正，三年现金流合计/合并净利合计≥0.8；缺年度不以更旧年度顶替 |
+| 相对PE估值 | 默认行业PE分位≤60%，优先PB/PE盈利能力proxy在自身0.5～2倍区间的可比组（至少10样本）；不足回退整个行业，行业PE样本仍不足回退 `0<PE TTM≤25`。PB/PE不是实际年度ROE，也不是增长可比组 |
+| PB职责 | PB≤0否决；默认高PB只提示风险、不单独评分或否决，缺PB不单独pending。PB可参与proxy构组并间接影响PE分位；显式双护栏可恢复PB硬门 |
+| 自身历史PE | `REQUIRE_HISTORICAL_VALUATION=True`：决策日前最多250根行情中至少120个正且有限PE样本，当前PE中秩分位≤0.60；超限否决，缺证据pending；当前日不计入历史样本 |
+| 周期行业 | 实际编码B06/B07/B08/B09/B10/B11、C25/C26/C30/C31/C32、G55及名称识别；关闭相对估值仍分类，未知行业pending。归母利润正常化PE默认≤25，至少3年归母利润证据与归母TTM；不得混合合并净利口径 |
+| 近期经营 | 最新真实公告报告与去年同周期比较六维指标；同比单项下降容忍3%，现金流下降容忍3%且现金转换≥0.8；收入/合并净利/现金流三项同降仍failed。单季/TTM只作辅助，不能补核心缺失 |
+| 财务risk | `REQUIRE_FINANCIAL_RISK=True`：同报告期/真实公告日/来源/合并人民币口径，负债率≤70%、商誉/净资产≤20%、扣非/合并净利≥0.5；缺核心字段pending，已知硬伤否决，缺商誉不能填零 |
+| 价格位置 | 至少250根有效日线，收盘价序列中秩分位≤40%；同价取中间名次，取数窗口600自然日 |
+| 近期底部 | 默认 `QV_LOW_ANCHOR_MODE="recent_structure"`：近60日收盘低点年龄5～40个交易日；距底上限 `5×ATR/现价` 限制在10%～20%，未确认pending、超限否决。250日盘中极值仅诊断；固定15%仅legacy生效 |
+| 止跌与技术40 | 默认strict：MA20确认且站上MA60为strong；MA20确认，或MACD连续3日改善且近5日低点不低于前20日低点为medium；weak只观察、无确认否决。默认状态技术分趋势40+动能30+量价30，持续状态与最近5日衰减事件计分，技术<40为pending |
+| 额外分数线 | `MIN_QV_SCORE=0`、`MIN_QUALITY_SCORE=0`，默认关闭重复综合分/质量分硬门；旧38/50不是当前规则。年度资格、止跌与技术40仍必须核验 |
+| 行情时效与缓存 | 北京时间盘中/闭市阶段用行情 `.meta.json` 记录版本、取数时间、阶段和末bar日期；touch/mtime不能证明新鲜。独立覆盖当日的交易日历给出应完成交易日，指数必须核验，不能由index自身证明index时效 |
+| 风控与分层 | 合法OHLC、流动性、相邻bar自然日缺口>12天、ATR上限（共享 `MAX_ATR_PCT=6`，突破4）独立生效；金融专项pending。只有formal进入正式通知与推荐落库 |
 
-### ✅ 综合分下限与硬闸门对齐
+综合规则分仍为45%质量+30%估值+25%技术，默认用于排序；已核验历史PE以30%权重混入估值分。`rank_score` 再加入近60日相对沪深300强度有界微调（最多±3）与经结构确认的横盘加分（最多5），低位分位额外排序权重默认0。按排序分、质量、估值降序及代码升序排列，排序不能抵消资格硬伤。`describe_qv_floor()` 按实际配置解释显式开启的分数线；权重和必须为1。
 
-`MIN_QV_SCORE=50` 已设置在 formal 候选理论最低分之上，使综合分闸门能够实际区分“三项均压线”的候选。运行时 `describe_qv_floor()` 会随配置实时算出等效门槛并打进漏斗日志。调整前务必先跑 `python backtest.py ab --mode quality_value`。
+年度质量优先原始新浪摘要真实公告日；摘要fallback无公告日时保守按次年5月1日可用，显式记录 `availability_assumed` 与公告日假定标签。真实晚公告不被假定覆盖，原始已知失败不被fallback抹掉。近期经营及财务risk必须有真实公告日。免费接口不是历史财报修订版本库，不保证历史证据完整。
 
-**市场级刹车（#2，已对 quality_value 生效）**：此前 quality_value 在 `main()` 提前 return，绕过了组合层风控；现已把**急跌熔断**（沪深300 近5日累计 ≤ `MARKET_CRASH_HALT_PCT`(-8%) → 当日不推荐）与**推荐数量按 regime 收缩**（牛 `MAX_PICKS`=5 / 中性 `NEUTRAL_MAX_PICKS`=4 / 熊 `BEAR_MAX_PICKS`=2，由 `resolve_max_picks` 解析）移到分支之前，两种模式共用。quality_value 还默认启用 ATR/收盘价≤`MAX_ATR_PCT`(10%) 波动率闸门（与3×ATR止损+30%止盈下RR≥2.0对齐），`QV_ATR_GUARD=False` 可关闭；technical 继续使用自己的 ATR 闸门。
-
-**regime 双指标确认（P2）**：`MARKET_REGIME_DUAL_INDICATOR=True` 时，在沪深300 MA20 斜率之外叠加第二指标——长期均线 `MARKET_MA_LONG`(=60) 趋势：只有「斜率看多**且**现价与 MA20 均在 MA60 上方」才判 `bull`，「斜率看空且均在 MA60 下方」才判 `bear`，两者不同向一律降级 `neutral`（描述串会显式标注「斜率判 x，MA60 未同向确认，降级中性」）。这是对 regime 抖动的治本手段（滞回只是补丁）；指数样本不足 `MARKET_MA_LONG` 时自动退回单指标，口径与改动前一致。置 False 恢复纯 MA20 斜率判据。
-
-**可选的 KDJ/MACD 下限否决**：默认关闭（`QV_ENFORCE_KDJ_MACD_VETO=False`）。止跌强/中/弱分层仍独立生效；显式开启该开关会额外检查MACD深度走弱与KDJ过热，分别归因 `FAIL_MACD_WEAK` / `FAIL_KDJ_HIGH`。
-
-综合规则分保持 **45%质量+30%估值+25%技术**。资格通过后按 `rank_score`、质量、估值降序及代码升序排列。`rank_score` 加入相对沪深300强度微调（最多±3）与横盘结构加分（最多5）；后者须实际满足近20日振幅收敛、低点不下移、收盘离散度低，才按距低点30至120日插值。排名加分不能补偿资格硬伤，行业分散继续有效。
-
-年度数据来自AkShare新浪财务摘要的准确字段（ROE%、扣非净利、合并净利、经营现金流净额，金额元）。有公告日时按公告日可用；摘要不提供公告日时保守按次年5月1日可用。缺最新年度不能用更旧年度顶替；取数失败/NaN/金融专项未核验均为pending。该接口不是历史财报修订版本库，历史报告仍有重述数据局限。
-
-只有显式 `formal` 进入正式推荐名单与落库。缺数据、经营走弱、止跌弱或技术分不足均为 `pending`，只保留观察日志。年度缓存按代码、决策日和年数隔离；近期经营缓存还包含阈值。质量路径在行情预筛后取财务，突破路径在终审取近期经营，避免逐只全市场重复请求。默认不再额外要求旧Baostock单项同比；关闭新模块后质量路径才使用旧forward配置。
-
-> 近期经营模块用于当前荐股。免费摘要不是历史财报版本库，历史面板缺少证据时不能当成完整核验；本次没有修改历史取数或回测模块。
-
-详细规则与测试见 [荐股调整说明](docs/quality_value_recommendations.md)。新增离线测试：`python -B -m unittest discover -s tests -p test_recent_operating.py -v` 与 `python -B -m unittest discover -s tests -p test_strategy_revision.py -v`。以下旧技术策略章节仅描述显式设置`RECOMMENDATION_MODE="technical"`时的对照行为（**放量突破入口现即跑此模式**）；交易回测/追踪的原有局限并未因本次荐股调整自动消失。
-
-数据层采用 Baostock 主数据源 + AkShare 备用数据源的双源架构，主源失败自动切换。
-
-**双策略并行**（共用同一套数据层 / 基本面防雷 / 市场环境 / 周线确认 / 并发筛选骨架）：
+**双策略并行**：共用数据层、财务risk、近期经营与市场风控，信号资格保持独立。
 
 | 策略 | 定位 | 信号类型 | 推荐数量（牛/中/熊） |
-|------|------|----------|----------------------|
-| **优质低估低位入口**（run.py，`quality_value`） | 优质低估低位 | 多年质量 + 近期经营核验 + 行业相对低估值 + 250日低位 + 止跌强/中确认 + 正式综合分≥50 | 5 / 4 / 2 + 急跌熔断 |
-| **突破入口**（run_breakout.py，`technical`） | 右侧顺势 | 放量突破 + 基本面防雷 + 近期经营核验 + 周线终审；不等同于连续三年质量认证 | 5 / 3 / 0（熊市空仓） |
+|---|---|---|---|
+| 优质低估低位（run.py，quality_value） | 中长期低位 | 年度质量+经营/risk+相对及历史估值+周期正常化+近期底部+止跌与状态技术40 | 5 / 4 / 2 + 急跌熔断 |
+| 突破（run_breakout.py，technical） | 右侧顺势 | 首日突破、固定原阻力锚点站稳/回踩确认+防雷/经营/risk+周线MA AND；不等同于三年质量认证 | 5 / 3 / 0 |
 
-**两个入口现在是真正独立的信号源**（#1）：优质低估低位入口跑 `quality_value` 资格，突破入口跑自己的 `technical` 七层漏斗。此前突破入口也用 `quality_value`，会委派同一套资格判定、产出与前者完全相同，再经组合层去重后突破卡片恒为空——等于花双份成本拿一份结果；改为 `technical` 后突破基于放量形态独立出票。组合层做同股去重与每日总量上限（`DAILY_TOTAL_MAX_PICKS`=7，后运行的突破剔除当日已被优质低估低位推荐的个股）。市场环境为「未知」（指数数据缺失）时，经 `UNKNOWN_AS_BEAR` 折叠为熊市**只作用于推荐数量上限**（优质低估低位侧收缩为 2 只、突破空仓）；准入分数线不因「未知」上浮（门槛上浮只对已确认的 `bear` 生效，且仅 technical 路径有准入分数线）。
+突破周线默认 `WEEKLY_MA_BOTH_REQUIRED=True`：站上MA10（容忍2%）且MA10上行，并按开关检查已收盘周MACD。最近5日确认源于通过完整原事件闸门的突破，固定原锚点；任一随后收盘跌破锚点取消确认。站稳需2日超过锚点0.5%，回踩触及锚点上方2%范围并收盘重新超过0.5%；确认日距锚点超过7%不确认。突破子分和总规则分有界，幅度1%～3%最佳、到7%降至零；市场/行业20日RS最多±3只调整排序，不改原规则等级或资格。
 
-**市场级熔断**（`MARKET_CRASH_HALT_PCT`=−8% / `MARKET_CRASH_LOOKBACK`=5）：沪深300 近 5 个交易日累计跌幅越阈 → 优质低估低位入口本次运行直接不推荐——急跌期间全市场同步满足 RSI 超卖 / MA5 拐头 / 创新低底背离，个股级斜率过滤识别不了这种系统性风险。该熔断现置于 `main()` 的 quality_value 分支之前，对默认模式同样生效（#2）；突破入口在熊市本就空仓（`BEAR_MAX_PICKS_BREAKOUT`=0）。> 2026-10-05 锚点由 **−4% 放宽至 −8%**（测试新策略用）：沪深300 近 5 日跌 4%~8% 的「急跌但未崩盘」区间不再整日停荐，两套策略共享此阈值（`VolumeBreakoutConfig` 未覆写）。回退只需改 `StrategyConfig.MARKET_CRASH_HALT_PCT` 一处。
+组合层同股去重与每日合计上限 `DAILY_TOTAL_MAX_PICKS=7` 仍由后运行突破入口执行。市场级急跌熔断为沪深300近5日累计≤−8%；市场regime双指标、滞回、行业分散与推荐量收缩仍沿用既有配置。未知市场数据不能作为已核验环境。
 
-## 策略一：优质低估低位 / 低位企稳（bottom_fishing_strategy.py）
+新risk、历史PE、周期、底部、突破分类、子分与RS字段在结果对象存在，不代表全部落库；MySQL目前使用固定列白名单，并未完整保存全部新增证据。
+
+以下“历史技术对照”四层技术过滤是**历史technical对照说明**，不是当前quality_value默认，也不是突破当前默认；其中旧阈值与实验结论只适用于其历史配置。当前突破规则见“策略二”和[突破设计](docs/volume_breakout_strategy.md)。交易/回测/追踪章节描述既有行为，本次荐股证据调整没有自动补齐历史核验或证明业绩改善。
+
+## 历史技术对照：低位企稳（bottom_fishing_strategy.py）
 
 > **模块名与口径的关系**：`bottom_fishing_strategy.py` 承载两种资格判定，对外称谓按**实际生效口径**给出——
-> `quality_value`（生产默认，run.py）= **优质低估低位**；`technical`（对照/旧规则）= **低位企稳**（才是真正的技术抄底：底背离、RSI 超卖、回撤深度）。下面的 4 层过滤描述的是 **technical 对照口径**，见本节开头的口径说明。
+> `quality_value`（run.py默认）= **优质低估低位**；以下内容记录旧technical低位企稳配置（底背离、RSI超卖、回撤深度）。历史阈值不能直接当作当前运行值；突破technical是独立规则。
 
 4 层量化过滤体系：
 
-1. **市场环境过滤**：沪深300日线MA20斜率判断牛/熊/中性环境；熊市不扣分定级，而是把准入门槛**上浮 10 分**（`BEAR_GRADE_BOOST`），保证展示分数与等级始终同源；数据不足时明示「未知」（`UNKNOWN_AS_BEAR`：未知经 `_effective_regime` 折叠为熊市，作用于推荐数量上限的收缩；**门槛上浮只对已确认的 `bear` 生效**——`evaluate()` 按原始 regime 判定，与突破策略 `evaluate_breakout()` 用有效 regime 判门槛的做法不同）；**regime 双指标确认**（`MARKET_REGIME_DUAL_INDICATOR`，见上文「regime 双指标确认（P2）」）；**regime 滞回**（`MARKET_REGIME_HYSTERESIS`）：牛/熊/中性切换须连续 2 个交易日同向确认，避免斜率在阈值附近抖动导致 regime 逐日跳变（状态存 `cache/market_regime_state.json`，超 10 天自动重置；**确认计数每个自然日最多推进一次**——同一天内多套策略依次运行读的是同一份收盘数据，若允许重复计数会把「连续 2 个交易日」悄悄缩短为「同日翻转」）；**市场级熔断**（`MARKET_CRASH_HALT_PCT`=−8% / `MARKET_CRASH_LOOKBACK`=5）：沪深300 近 5 个交易日累计跌幅越阈 → 本次运行不推荐（数据不足不触发，避免指数缺数误判）
-2. **基本面防雷**：年化ROE/负债率为核心否决项（金融业——银行/保险/券商等负债率天然 80%+，按名称关键词+代码白名单识别并单独放宽阈值）；商誉/扣非为可选否决项，主源 Baostock 不提供，**technical 路径的决赛圈与放量突破策略的终审会用 AkShare 按字段补齐后复核**（`_fill_optional_fundamentals`，只填 None 字段、不覆盖主源）。注意 **quality_value 路径不做这一步**：它由 `evaluate_quality_value` 直接跑年度质量核验（AkShare `stock_financial_abstract`），商誉为空时不否决、只按缺项计。**ROE 口径为线性年化**（Q1×4 / Q2×2 / Q3×4/3 / Q4×1，累计值年化后才与 `MIN_ROE` 年化阈值可比，不再随财报日历漂移）；财报季度按**交易所披露截止日回溯**取「最近已披露季度」（最多回溯 `FUND_LOOKBACK_QUARTERS`=4 季），结果带 `report_period` 标明数据实际所属报告期；基本面磁盘缓存为 `fund_v2_*`（旧 `fund_*` 单季未年化口径已隔离废弃）
+1. **市场环境过滤**：沪深300日线MA20斜率判断牛/熊/中性环境；熊市不扣分定级，而是把准入门槛**上浮 10 分**（`BEAR_GRADE_BOOST`），保证展示分数与等级始终同源；数据不足时明示「未知」（`UNKNOWN_AS_BEAR`：未知经 `_effective_regime` 折叠为熊市，作用于推荐数量上限的收缩；**门槛上浮只对已确认的 `bear` 生效**——`evaluate()` 按原始 regime 判定，与突破策略 `evaluate_breakout()` 用有效 regime 判门槛的做法不同）；**regime 双指标确认**（`MARKET_REGIME_DUAL_INDICATOR`，见当前默认的市场风控说明）；**regime 滞回**（`MARKET_REGIME_HYSTERESIS`）：牛/熊/中性切换须连续 2 个交易日同向确认，避免斜率在阈值附近抖动导致 regime 逐日跳变（状态存 `cache/market_regime_state.json`，超 10 天自动重置；**确认计数每个自然日最多推进一次**——同一天内多套策略依次运行读的是同一份收盘数据，若允许重复计数会把「连续 2 个交易日」悄悄缩短为「同日翻转」）；**市场级熔断**（`MARKET_CRASH_HALT_PCT`=−8% / `MARKET_CRASH_LOOKBACK`=5）：沪深300 近 5 个交易日累计跌幅越阈 → 本次运行不推荐（数据不足不触发，避免指数缺数误判）
+2. **基本面防雷**：年化ROE/负债率为核心否决项（金融业——银行/保险/券商等负债率天然 80%+，按名称关键词+代码白名单识别并单独放宽阈值）；商誉/扣非为可选否决项，主源 Baostock 不提供，**technical 路径的决赛圈与放量突破策略的终审会用 AkShare 按字段补齐后复核**（`_fill_optional_fundamentals`，只填 None 字段、不覆盖主源）。当时quality_value尚未接入本次独立risk；其“商誉为空不否决”的旧处理不能用作当前正式核验依据，当前规则以上表为准。**ROE 口径为线性年化**（Q1×4 / Q2×2 / Q3×4/3 / Q4×1，累计值年化后才与 `MIN_ROE` 年化阈值可比，不再随财报日历漂移）；财报季度按**交易所披露截止日回溯**取「最近已披露季度」（最多回溯 `FUND_LOOKBACK_QUARTERS`=4 季），结果带 `report_period` 标明数据实际所属报告期；基本面磁盘缓存为 `fund_v2_*`（旧 `fund_*` 单季未年化口径已隔离废弃）
 3. **日线技术指标筛选**：底背离（**双低点算法**：与窗口内前一个价格低点比较 RSI/DIF，而非指标自身最小值）+ 趋势转折（MA5拐头/EMA金叉同源合并计分）+ RSI超卖反弹 + **量价质量分**（放量阳线收高位/一般放量上涨/放量冲高回落三档）；流动性过滤（近20日日均成交额 ≥3000万，独立归因 `FAIL_LIQUIDITY`）；入场质量否决（当日涨幅 >5% 追高否决、开盘跳空高开 >2% 否决、近5日累计涨幅 >12% 已反弹一段否决、RSI14 >60 否决、量比 >4 天量否决、MA20 近5日斜率 <-4% 的陡峭下降通道中趋势转折信号不认可、距60日高点回撤 <10% 非底部区域否决、回撤 >70% 崩盘型/价值陷阱否决）；严格确认指标（现价须落在近20日价格区间下半部、MACD 柱须**连续 3 日**改善（`MACD_MOMENTUM_DAYS`=3，与止跌确认闸门共用同一参数）、KDJ 须金叉、K≤55 且 K 值上行）；**数据时效**（个股最新K线与市场最新交易日不一致，即停牌/数据滞后 → 暂不推荐）；**停牌缺口**（相邻 K 线自然日间隔 >12 天判定为期间曾停牌 → 暂不推荐，独立归因 `FAIL_HALT_GAP`：这类股票的 20 日均量/60日高点/ATR 全部跨缺口计算，「60日高点」可能实为数月前的高点）
 4. **波动率风控**：ATR 占现价百分比 >10% 直接否决（`MAX_ATR_PCT` / `FAIL_VOLATILE`——与3×ATR止损+30%止盈下RR≥2.0对齐，语义直白，且修复了旧实现 ATR 缺失时 RR 恒 2.0 永不否决的漏洞）；止损/止盈/盈亏比（3×ATR 或固定 15% 止损、固定 30% 止盈，价值策略口径）**仅作展示与落库，不参与否决**；**决赛圈周线确认**（`REQUIRE_WEEKLY_TREND`：默认 `WEEKLY_MA_BOTH_REQUIRED=False`，即「收盘站上周线 MA10（容忍 `WEEKLY_TOLERANCE`=2%）」或「MA10 上行」**满足其一**即可——真·低位买点常出现在周线 MA10 尚未上行时，双条件会把目标 setup 全滤掉；设 True 恢复「站上**且**上行」严格口径。**且**须周线 MACD 企稳（`REQUIRE_WEEKLY_MACD_STABLE`：柱值翻红或绿柱连续 2 周收窄）。两个开关独立生效、任一启用即拉周线；**只用已收盘周 bar**——末根周线落在本 ISO 周且非周五即剔除，避免半成品 bar 污染口径（判断基准为北京时间）；数据缺失/截止过旧 → 待核验候选，不占正式名额；取满即止）；**行业分散**（同一行业最多 2 只）；**推荐数量按市场环境收缩**（牛 `MAX_PICKS`=5 / 中性 `NEUTRAL_MAX_PICKS`=4 / 熊 `BEAR_MAX_PICKS`=2，未知经 `_effective_regime` 折叠为熊，统一由 `resolve_max_picks` 解析，周线确认取满即止）
 
-**荐股质量分层（数据缺失不等于筛选通过）**：
+**历史技术分层（当前formal还须满足开头表格中的经营/risk等证据）**：
 
 | 层级 | 条件 | 处理 |
 |------|------|------|
@@ -81,15 +66,15 @@
 | **波动率观察池**（volatile） | 前置各层已通过（technical：技术分已达准入线；突破：突破/量能/形态/趋势已过；quality_value：质量/估值/低位已过），**仅 ATR 占现价百分比超上限**被否决 | **仅 CI 日志逐只留档**（含风险等级与风险提示；**不推送飞书**），**不落库、不参与追踪、不是买入建议** |
 | 暂不推荐 | 行情日期滞后（停牌/数据过期）或任一项否决条件未过 | 直接淘汰 |
 
-默认技术评分：趋势40 + 动能30 + 量价30，满分100。RSI/MACD/KDJ在动能组内取最高，共振不再重复加分。`DAILY_SCORING_MODE="legacy"` 或显式自定义旧权重时使用旧兼容公式。按分数分为 A/B/C/D 四个等级（A≥80 / B≥60 / C≥40），**等级与展示分数同源（底背离不升档）**；准入门槛 `MIN_PASS_GRADE` 默认 B。**排序**（technical 路径）：主键 `rank_score`（= 技术分 + 连续质量分）降序 → 底背离优先 → 盈亏比降序 → **股票代码升序（末级键）**。quality_value 路径改用 **排序分 `rank_score` → 质量分 → 估值分 → 股票代码升序**（`rank_score` = 综合分 + 相对强度有界微调 + 横盘筑底加分，见上文「当前默认」一节）。两条路径都以股票代码为末级键，保证两次运行结果可复现、不受并发完成顺序影响。**连续质量分**（`RANK_QUALITY_WEIGHT`=10，置 0 可完全关闭）只用于打破布尔闸门造成的分数并列，**不参与任何门槛判定**——「哪些股票通过」与引入前完全一致，变的只是通过者之间的先后：低波动 0.35 + 回撤深度 0.35 + 20 日区间位置 0.30（MACD 动能维度权重默认 0，因前置闸门已保证通过者恒为满分），四路取值全部复用已算出的列，零额外取数。执行过程输出选股漏斗日志（各层通过率 + 时效剔除数 + 停牌缺口剔除数 + 待核验候选数 + 取数来源统计）。**波动率风控否决明细**（`[VOLATILE]` 区块）会逐只打印：代码/名称/技术分/等级/收盘/ATR%与上限及倍数/风险档/RSI/量比/已达标项，最多 20 只，超出提示剩余条数；若该层当天零淘汰且日线无通过标的，则改为直接点出主要拦截层（避免「为什么没推荐」无从复核）。
+历史technical技术评分：趋势40 + 动能30 + 量价30，满分100。RSI/MACD/KDJ在动能组内取最高，共振不再重复加分。`DAILY_SCORING_MODE="legacy"` 或显式自定义旧权重时使用旧兼容公式。按分数分为 A/B/C/D 四个等级（A≥80 / B≥60 / C≥40），**等级与展示分数同源（底背离不升档）**；准入门槛 `MIN_PASS_GRADE` 默认 B。**排序**（technical 路径）：主键 `rank_score`（= 技术分 + 连续质量分）降序 → 底背离优先 → 盈亏比降序 → **股票代码升序（末级键）**。quality_value 路径改用 **排序分 `rank_score` → 质量分 → 估值分 → 股票代码升序**（`rank_score` = 综合分 + 相对强度有界微调 + 横盘筑底加分，见上文「当前默认」一节）。两条路径都以股票代码为末级键，保证两次运行结果可复现、不受并发完成顺序影响。**连续质量分**（`RANK_QUALITY_WEIGHT`=10，置 0 可完全关闭）只用于打破布尔闸门造成的分数并列，**不参与任何门槛判定**——「哪些股票通过」与引入前完全一致，变的只是通过者之间的先后：低波动 0.35 + 回撤深度 0.35 + 20 日区间位置 0.30（MACD 动能维度权重默认 0，因前置闸门已保证通过者恒为满分），四路取值全部复用已算出的列，零额外取数。执行过程输出选股漏斗日志（各层通过率 + 时效剔除数 + 停牌缺口剔除数 + 待核验候选数 + 取数来源统计）。**波动率风控否决明细**（`[VOLATILE]` 区块）会逐只打印：代码/名称/技术分/等级/收盘/ATR%与上限及倍数/风险档/RSI/量比/已达标项，最多 20 只，超出提示剩余条数；若该层当天零淘汰且日线无通过标的，则改为直接点出主要拦截层（避免「为什么没推荐」无从复核）。
 
 > **保底观察候选（fallback）默认关闭**（`ENABLE_DAILY_FALLBACK=False`）：与「宁可少荐」哲学一致，不再每天硬推一只低置信度票；置 True 可恢复旧行为（候选明确标记 `tier=fallback`，仅作观察，不应直接实盘）。
 
 ## 策略二：放量突破（volume_breakout_strategy.py）
 
-捕捉「横盘整理末端 → 放量突破关键阻力位」的趋势启动点。骨架、数据层、基本面防雷、市场环境、决赛圈周线确认全部继承抄底策略，只替换日线信号与评估层（七层漏斗）：
+捕捉「横盘整理末端 → 放量突破关键阻力位」的趋势启动点。复用数据层、市场环境与筛选骨架，独立日线信号和评估，并覆写突破周线AND默认（七层漏斗）：
 
-1. **基本面防雷**（继承 `check_fundamentals`）；另加载最新报告期净利同比，已核验且同比<0时 `FAIL_RECENT_FUNDAMENTAL`，缺失按待核验处理
+1. **基本面防雷**（继承 `check_fundamentals`）；终审核验最新真实公告多维近期经营与独立财务risk，恶化否决、走弱/缺失pending，金融专项pending
 2. **流动性 & 数据完整性**（近 20 日日均成交额 ≥ `MIN_AMOUNT`）
 3. **日线技术面（核心）**：
    - 三级阻力位：**L1=近 60 日最高 / L2=近 20 日最高 / L3=MA60**；`REQUIRE_L1_OR_L2=True`（默认）= 只认 L1/L2，L3 判定被整体置 False，避免「低位整理股反弹站上 MA60」被误判为突破；置 False 才启用 L3
@@ -98,12 +83,13 @@
    - **突破前平台整理**：近 20 日振幅 ≤18%、收盘离散度（std/mean）≤4%（窗口右端 `shift(3)` 避开突破 bar 污染）
    - **趋势背景**：MA20 上行、MA60 走平或上行、现价站上 MA20
    - **近期假突破过滤**：近 10 日无「突破 L1 后 3 日内跌回」记录（事件锚定突破日 L1；**向量化实现**，区间差分替代三重循环）
+   - 首日之外可确认最近5日原事件的站稳/回踩：固定原阻力锚点，任何随后收盘跌破取消，不能把阻力回落当新突破
    - 突破**前一日** RSI ≤80（突破日天然推高 RSI，检查当日会误杀正常突破）
-   - **KDJ/MACD 下限否决**（`FAIL_MACD_WEAK` / `FAIL_KDJ_HIGH`）：把这两个指标从纯评分项升级为硬闸门。此前它们只贡献 `W_MOMENTUM_BR`=10 分（占满分 10%），分档失守仍可守住 B 级 60 分准入线，对「推荐与否」没有约束力。闸门只拦两种形态——**MACD 柱深度弱势且仍在恶化**（柱值/收盘 ≤ −0.5% 且连续 2 日递减，双条件 AND）与 **KDJ 已在区间顶部**（K > 85，或 K ≥ 80 且 K < D）；刻意不要求金叉（突破日 RSV 直接打到 100、K 单日跳升，金叉常滞后 1–2 日，硬金叉会系统性漏掉「窄幅整理后首根放量阳线」）。**实测结论：MACD 侧在突破策略中结构性不可达**——`brk_l2` 只认「首次站上阻力位」那天，该日必然 ≥2% 涨幅使 DIF 上行，而柱值下降需 `ΔDIF < hist/4`，横盘阶段 `hist ≤ 0`，不等式永不成立（已固化为参数扫描回归断言）。因此**突破策略的实际新增控制力来自 KDJ 高位闸门**，MACD 侧保留为「突破口径被放宽」时的保险丝。
-4. **波动率风控**：ATR ≤4.0% 现价（比优质低估低位 10% 更紧，突破策略独立阈值）
-5. **综合评分与等级**：突破强度(35，**0.55×级别 + 0.45×幅度** 加法混合——替代旧纯乘法，旧公式下 L2/L3 级别系数把幅度分压得极低、B 级准入事实上只推 L1) + 量能质量(25，0.7×放量 + 0.3×整理充分度) + 平台整理(15) + 趋势背景(15) + 动能确认(10)；B 级 ≥60 准入，熊市 +15
-6. **决赛圈周线确认**（继承 `check_weekly_trend` + `check_weekly_macd`，同样只用已收盘周 bar）
-7. **排序截取**：评分↓ → 突破级别↓ → 20日均成交额↓ → 代码↑；牛 5 / 中性 3 / **熊 0（直接空仓）**
+   - **KDJ/MACD 下限否决**（`FAIL_MACD_WEAK` / `FAIL_KDJ_HIGH`）：把这两个指标从纯评分项升级为硬闸门。此前它们只贡献 `W_MOMENTUM_BR`=10 分（占满分 10%），分档失守仍可守住 B 级 60 分准入线，对「推荐与否」没有约束力。闸门只拦两种形态——**MACD 柱深度弱势且仍在恶化**（柱值/收盘 ≤ −0.5% 且连续 2 日递减，双条件 AND）与 **KDJ 已在区间顶部**（K > 85，或 K ≥ 80 且 K < D）；刻意不要求金叉（突破日 RSV 直接打到 100、K 单日跳升，金叉常滞后 1–2 日，硬金叉会系统性漏掉「窄幅整理后首根放量阳线」）。历史首次突破样本中的MACD不可达结论只适用于当时配置；新增站稳/回踩确认日仍重新核验MACD/KDJ，不能宣称当前全部路径不可触发。
+4. **波动率风控**：ATR ≤4.0% 现价（共享质量侧上限为6%，突破独立阈值）
+5. **综合评分与等级**：突破强度(35，**0.55×级别 + 0.45×有界幅度（1%～3%最佳，7%降至零）** 加法混合——替代旧纯乘法，旧公式下 L2/L3 级别系数把幅度分压得极低、B 级准入事实上只推 L1) + 量能质量(25，0.7×放量 + 0.3×整理充分度) + 平台整理(15) + 趋势背景(15) + 动能确认(10)；B 级 ≥60 准入，熊市 +15
+6. **决赛圈周线确认**：默认MA10站上且上行（AND），另检查启用的周线MACD，只用已收盘周bar；缺失/滞后pending
+7. **排序截取**：ranking_score（原规则分+有界RS）↓ → 突破级别↓ → 20日均成交额↓ → 代码↑；牛5 / 中性3 / 熊0
 
 **交易计划**（仅展示与落库）：止损 = max(突破位 − 1×ATR, 现价 × (1 − 6%))（保证最大亏损上限；技术位不低于执行价时才采用技术位，否则回退固定 6%），止盈 = min(现价 × 1.15, 现价 + 5×ATR)（固定目标与 ATR 目标取更近者）。`MIN_RR_RATIO_BREAKOUT` 检查已删除（止损≤6%/止盈15% 下 RR≥2.5 恒成立，检查永不触发）。
 
@@ -123,7 +109,7 @@ python run_breakout.py --no-notify    # 仅落库，不通知
 - **共享并发筛选骨架** `run_concurrent_screen`（两策略同一模板）：线程池 + 心跳看门狗（每 1 分钟心跳，连续 4 分钟无完成打印在途股票代码定位卡点；`WATCHDOG_TICK_SEC`/`WATCHDOG_IDLE_WARN_SEC` 可调）+ 时间预算（`SCREEN_TIME_BUDGET_MIN`=240 分钟，超时取消未完成任务、按已完成结果出报告，漏斗统计按已处理数计）
 - **行业估值快照进度可观测**：`build_industry_valuation_snapshot` 用独立线程池遍历全 A 拉日线构建横截面，冷启动 cache 全 miss 时曾是 1~2h+ 静默黑洞；现补开始/每 `SNAPSHOT_PROGRESS_LOG_EVERY`（默认 200）只进度（带命中数与 ETA）/成功汇总（含耗时）三段日志，异常路径也带已完成数，纯观测不改口径
 - **取数来源统计**：`fetch_stats`（Baostock 命中 / AkShare 兜底 / 双源均失败），漏斗末尾汇总
-- **确定性排序**：优质低估低位策略主键 `rank_score`（quality_value 下追加 质量分→估值分 二级键）、末级键股票代码升序（突破策略为 评分→级别→20日均额→代码），两次运行结果可复现，不受并发完成顺序影响
+- **确定性排序**：优质低估低位策略主键 `rank_score`（quality_value 下追加 质量分→估值分 二级键）、末级键股票代码升序（突破策略为 排序分→级别→20日均额→代码），两次运行结果可复现，不受并发完成顺序影响
 
 ## 自动执行
 
@@ -137,7 +123,7 @@ python run_breakout.py --no-notify    # 仅落库，不通知
 
 | 勾选项 | 默认 | 作用 |
 |--------|------|------|
-| `reuse_cache` | **开** | 手动运行时复用「最近一次收盘快照」——把恢复回来的行情缓存标记为今日有效，**完全不拉行情**，几分钟跑完一轮（详见下方缓存策略） |
+| `reuse_cache` | **开** | 手动运行尝试复用行情缓存；仍须meta阶段与独立交易日历核验，touch不能将旧快照变成有效闭市行情（详见下方缓存策略） |
 | `purge_cache` | 关 | 手动运行时也清除行情缓存、强制重新拉取，用于复现定时运行的取数行为 |
 | `no_cache` | 关 | 两套策略都跳过 `cache/` 读写（既不读也不写，本次不共享） |
 | `no_save` | 关 | 两套策略都跳过 MySQL 落库（纯测试运行，避免测试推荐与晚间正式结果混在同一天） |
@@ -148,9 +134,10 @@ python run_breakout.py --no-notify    # 仅落库，不通知
 - **为什么是 21:00**：Baostock 一般 17:30 起陆续更新当日数据、20:00 前完成，21:00 起跑留足安全边际。
 - **两套策略为什么合并进同一个 job**：优质低估低位与放量突破的数据层是同一组函数（`get_daily_data` / `get_fundamentals` / `get_stock_list` 由突破模块直接导入），`DAILY_BARS` / `WEEKLY_BARS` / `ADJUST` / `CACHE_DIR` 也完全一致，因此**缓存文件名逐字相同**（`daily_sh.600000_last120_qfq.csv`）。放在同一个 job 里顺序执行，二者共用同一个 `cache/` 目录：优质低估低位侧全量拉取并写入当天行情，突破随后直接读同一份文件，**几乎零重拉**。相比两条独立流水线，既省掉约 3000 次日线 + 数千次基本面查询（这些查询被全局锁 `bs_lock` 串行化，正是运行时长的大头），也天然保证顺序——组合层去重由**后运行者**执行（`fetch_rec_codes_for_date` 剔除当日已被优质低估低位推荐的个股，并按 `DAILY_TOTAL_MAX_PICKS` 默认 7 截取合计上限），不再依赖 cron 时间差。
 - **`if: always()` 的用意**：突破步骤带 `if: always()`，优质低估低位侧失败/异常时突破仍会执行——两套策略是独立信号源，不应互相阻塞；前者未写出的缓存由突破自行补拉（慢但结果正确）。
-- **缓存策略：定时「必新」、手动「复用」两套通道**。定时运行**使用**磁盘缓存（不再强制 `--no-cache`）——这是跨策略共享的前提；为消除「恢复回来的行情缓存是否可信」这一隐患（其新鲜度依赖文件 mtime，而复用与否取决于 `actions/cache` 是否保留 mtime），定时运行会先执行 `Purge restored quote cache`，**一律删除** `daily_*` / `weekly_*` / `index_daily_*`：这三类由抄底重新全量拉取写入，突破复用的是**本次运行刚写下的**文件。保留 `stock_list`（6天）/ `fund_v2`（7天）/ `industry`（30天）/ `market_regime_state.json`——它们是真正时间不敏感的数据，用 TTL 判定、与 mtime 无关，跨天复用正确且必要（基本面每天约 6000 次查询正是靠 7 天 TTL 才不必重跑）。`_cache_fresh_today` 的「当天」与 TTL 新鲜度判定、财报季度候选、regime 滞回状态日期统一按**北京时间**计算，runner 时区为 UTC 也不产生跨日边界漂移。
-  - **手动运行走另一个分支**：`Purge restored quote cache` 只在 `schedule` 或勾选 `purge_cache` 时执行；否则由 `Reuse last close snapshot` 步骤把行情缓存 `touch` 成今天，让 `_cache_fresh_today` 判定为有效 —— 白天测试**一个行情请求都不发**。这不是「拿旧数据凑数」：Baostock 当日数据 17:30 后才陆续入库，17:00 前全量拉取拿回的本来也就是「昨收为止」的同一批 K 线，与缓存内容一致；周线剔除（`_drop_incomplete_weekly_bar`）等逻辑判的是 bar 自身的 `date` 列而非 mtime，因此结果与全量拉取逐字相同。
-  - 因此缓存 key 带 run id（`baostock-cache-<UTC 日期>-<run_id>`，`restore-keys` 为「当天前缀 → 全局前缀」）：`actions/cache` 的 key 不可变、同 key 二次保存会被跳过，若只用日期做 key，「当天第一次运行」（常是上午的手动测试，行情只到昨收）写下的缓存会锁死当天，21:00 定时任务重新拉取的当日最新行情反而存不进去，晚上再手动运行就会命中那份「收盘前」的旧快照。
+- **行情缓存以meta与交易日历核验**：行情CSV旁的 `.meta.json` 记录版本、带时区取数时间、盘中/闭市阶段与末bar日期。闭市运行不能复用当天盘中取得的缓存；无meta、跨日、未来取数时间等不视为新鲜。独立覆盖当前日期的交易日历确定应完成交易日，再检查指数与个股末bar日期；不能用index自身末日期证明index时效。日历缺失或指数落后时保留未核验处理。
+  - 定时任务仍按工作流清理恢复的行情缓存以重取，保留股票列表、财务、行业及regime状态按各自TTL管理；两个入口共享本次运行已核验缓存。
+  - 手动 `Inspect restored quote cache (manual runs)` 只检查并保留缓存，不修改行情或meta时间；数据层仍验证meta、取数阶段与交易日，不保证零行情请求、几分钟完成或与重拉结果逐字相同。关闭 `reuse_cache`、勾选 `purge_cache` 或定时执行都会清理恢复的行情CSV及meta，触发重取。
+  - 缓存key仍带run id，避免同日期不可变缓存key锁住当天较早快照；key和文件mtime都不是行情时效证据。
 - **regime 滞回状态跨策略共享**：`cache/market_regime_state.json` 也在这份缓存里，因此两套策略读到**同一个已确认 regime**（此前两条独立流水线各维护一条状态链，可能互相不一致）。为避免「一天内运行两次 = 确认计数推进两次」把 `MARKET_REGIME_CONFIRM_DAYS=2` 悄悄退化为「同日翻转」，`_apply_regime_hysteresis` 已改为**每个自然日最多推进一次确认计数**（依据状态文件自身的 `updated` 日期，对「一天跑几次」完全鲁棒）。
 - **周五 21:20 的用意**：晚于当日 21:00 的选股任务 20 分钟，确保当日新推荐已落库，再由周任务决定首期追踪。
 - 缓存传递：`Daily Stock Screening` 与 `Weekly Recommendation Tracking` 使用 `actions/cache` 的 `cache/` 目录，共用前缀 `baostock-cache-<日期>`（每日任务另带 `run_id` 后缀，周任务仍按日期存取，靠 `restore-keys` 前缀命中当天最新一份）；归因月报只查 MySQL 不拉行情，因此不涉及缓存。每日任务结束时上传 artifact（`data/` 与 `cache/market_regime_state.json`，`if-no-files-found: ignore`）便于回溯 regime 滞回状态。
@@ -218,7 +205,7 @@ SOURCE schema.sql;
 ├── src/
 │   ├── bottom_fishing_strategy.py          # 策略一：优质低估低位+低位企稳（quality_value / technical 双口径 · 数据层 · 评分 · 共享筛选骨架）
 │   ├── volume_breakout_strategy.py         # 策略二：放量突破（7层漏斗，继承策略一数据层/骨架）
-│   ├── fundamental_quality.py              # 年度质量核验（AkShare 新浪财务摘要，独立于策略与缓存代码）
+│   ├── fundamental_quality.py              # 年度质量核验（原始公告日优先，AkShare摘要fallback）
 │   ├── volume_breakout_backtest.py         # 突破策略离线回测（本地 CSV，不联网；含闸门 A/B 与漏斗归因）
 │   ├── bottom_fishing_strategy_akshare.py  # 旧版策略备份（AkShare 数据源，未被引用）
 │   └── bottom_fishing_strategy_old.py      # 更早期版本备份（未被引用）
@@ -227,7 +214,7 @@ SOURCE schema.sql;
 ├── notify/
 │   └── feishu.py                     # 飞书通知：选股结果（按策略前缀区分卡片）/ 周度追踪（按策略分列）/ 归因月报
 ├── cache/                            # 自动生成的磁盘缓存（已 gitignore）
-│   ├── daily_*/weekly_*/index_daily_*  # 个股与指数行情（按交易日失效）
+│   ├── daily_*/weekly_*/index_daily_*  # 个股与指数行情（meta阶段及交易日历核验）
 │   ├── stock_list*.csv               # 股票列表（按 CACHE_TTL_DAYS=6 天失效）
 │   ├── fund_v2_*                     # 基本面（按 FUND_CACHE_TTL_DAYS=7 天失效；主源名带起始季度标签）
 │   ├── annual_quality_v2_*           # 年度质量（按代码/决策日/年数隔离；v2=公告日假定标记入版本号）
@@ -243,6 +230,8 @@ SOURCE schema.sql;
 ├── docs/                             # 策略设计文档
 │   ├── volume_breakout_strategy.md   # 放量突破策略设计说明（分层漏斗 + 独立回测 + 参数速查）
 │   ├── quality_value_recommendations.md  # 优质低估低位荐股资格/排序/分层与验证清单
+│   ├── recent_operating_contract.md      # 真实公告经营证据与同期/辅助趋势契约
+│   ├── recommendation_evidence_upgrade.md # 本次默认与证据/持久化边界
 │   ├── minimal_repairs.md            # 荐股逻辑最小修复（核验/成交模拟/追踪与归因口径）
 │   └── TOP5改进说明.md               # 荐股质量分层/底背离修正等改进落地记录
 ├── tests/                            # 第二批 unittest 测试（T+1 成交模拟 / 核验离线 / 持久化 / 追踪幂等）
@@ -384,27 +373,30 @@ python src/volume_breakout_strategy.py screen
 
 ### 运行单元测试
 
-以下测试均使用合成数据/打桩数据源、不访问网络，改动策略或主流程后应先跑它们（**2026-09-28 按当前默认口径实测全部通过**）：
+以下为离线回归命令。合成数据/mock验证规则行为，不发送通知、不连接数据库；旧规则测试显式隔离兼容配置。最终通过数量以完成后的日志为准。
 
 ```bash
-python test_entry_filters.py      # 单只判定：15 个入场场景 + 分层/时效/双低点背离/量价分档/评级同源/排序可复现（69 项断言）
-python test_main_layering.py      # main() 编排：周线路径与禁用路径下的正式推荐/待核验候选分层（15 项断言）
-python test_strategy_fixes.py     # 2026-09 修复回归：配置/ROE年化/流动性与波动率归因/波动率否决明细仅日志留档（飞书不再渲染观察池）/周线已收盘bar/regime滞回（含每自然日最多推进一次）/北京时区/向量化对拍/突破评分校准 + **数据源降级措辞、估值口径声明与 valuation_mode 逐行标注**（78 项断言；飞书相关断言在缺 requests 时自动跳过）
-python test_optimizations_p0.py   # P0 优化项：pct_chg 双源口径统一/停牌缺口过滤/排序质量分 rank_score/推荐数量上限与市场级熔断（75 项断言）
-python test_momentum_gates.py     # KDJ/MACD 下限闸门：纯函数边界与缺数据行为/突破接线（既有形态无回归 + KDJ 高位拦截可开关复现）/FAIL_MACD_WEAK 结构性不可达的扫描断言/quality_value 接线（技术面不新增否决 + 深度弱势被拦 + 健康匀速上行不误杀 + 成长数据缺失按默认降级 pending 且无其它缺项）/**止跌确认闸门（库级默认已开启 · 全市场环境均拦 · 显式关闭即放行 · 旧配置名兼容迁移）**/「新闸门在抄底 technical 路径会被既有严格确认层架空」的覆盖关系断言（47 项断言）
-python -B -m unittest test_recommendation_upgrades -v  # 荐股升级项（#1~#4 + 维度短板门槛）：综合分下限(仅formal)/前瞻确认(恶化否决·缺失可配)/行业相对估值(分位·回退·快照)/突破独立(technical不委派)/市场级刹车(急跌熔断·regime收缩·max_picks截取) + **综合分下限等效门槛固化（压线质量分 50、两口径综合分上限均为 59.5、过线所需技术分 ≥62、下限高于 formal 理论最低分 45.75）** + **维度短板门槛（质量短板只判已核验样本·缺失仍 pending / 技术短板降级不否决·可关闭）**（31 项，离线）
-python -B -m unittest test_quality_value_hardening -v  # 旧规则隔离回归；新默认策略另见下列测试
-python test_strictness_fixes.py    # 「宁缺毋滥」三项修复回归（24 项；含真实面板断言，无 backtest_cache 时自动 SKIP 该组）
-python test_backtest_ab.py        # backtest ab 子命令离线测试：变体定义自检（模式名/重名/字段拼写）--set 类型强转与非法字段报错/报告渲染与警示留痕/CLI 接线（24 项断言，不联网）
-python test_breakout_ab.py        # 突破策略闸门 A/B 与漏斗诊断：GATE_VARIANTS 字段自检/_technical_cfg 不污染默认值/funnel_counts 计数守恒/gate_ab 变体与非法名报错/报告渲染口径/CLI 四开关/空标记文件跳过与坏文件仍报错/「tier 从不提升为 formal → 独立回测恒不成交」的缺陷固化（30 项断言，不联网）
-python -m unittest test_fundamental_quality test_quality_recommendations   # 年度质量与默认荐股口径（28 + 14 = 42 项）
-python -m unittest test_minimal_quality_repairs   # 最小修复口径：流动性边界 / 估值评分 / 成长报告期 / 突破核验与通知过滤（7 项）
-python -m unittest tests.test_backtest_execution tests.test_breakout_verification_offline tests.test_quality_backtest_persistence tests.test_tracking_idempotency   # T+1 成交模拟(12) / 突破核验离线(13) / 优质低估低位回测持久化(5) / 固定期限追踪幂等与统计口径(19，含周收益率列计算)
+python -B -m unittest discover -s tests -p test_recommendation_evidence_upgrades.py -v
+python -B -m unittest discover -s tests -p test_financial_evidence_upgrades.py -v
+python -B -m unittest discover -s tests -p test_recent_operating.py -v
+python -B -m unittest discover -s tests -p test_strategy_revision.py -v
+python -B -m unittest discover -s tests -p test_breakout_verification_offline.py -v
+python -B -m unittest test_fundamental_quality test_quality_recommendations test_quality_value_hardening test_recommendation_upgrades test_minimal_quality_repairs -q
+python -B test_entry_filters.py
+python -B test_main_layering.py
+python -B test_strategy_fixes.py
+python -B test_optimizations_p0.py
+python -B test_momentum_gates.py
+python -B test_score_weight_p4.py
+python -B test_strictness_fixes.py
+python -B test_backtest_ab.py
+python -B test_breakout_ab.py
+python -B -m unittest tests.test_backtest_execution tests.test_quality_backtest_persistence tests.test_tracking_idempotency
 ```
 
 ## 数据持久化
 
-两张表，首次连接时自动创建（`CREATE TABLE IF NOT EXISTS`，幂等）：
+两张表，首次连接时自动创建（`CREATE TABLE IF NOT EXISTS`，幂等）。推荐写入使用固定列白名单；本次新增risk、历史PE、正常化PE、近期底部、突破分类/锚点/子分/RS等字段并未全部保存，结果对象不等于完整数据库审计记录：
 
 | 表 | 写入方 | 说明 |
 |----|--------|------|
@@ -431,7 +423,7 @@ python -m unittest tests.test_backtest_execution tests.test_breakout_verificatio
 
 推送到飞书群的消息卡片分三类。**卡片标题按「本次实际生效的口径名」取名**（`【优质低估低位】` / `【放量突破】` / technical 对照口径显示 `【低位企稳】`），不再出现【抄底策略】优质低估低位荐股 这类自相矛盾的组合——`bottom_fishing` 这个落库值覆盖 quality_value 与 technical 两种口径，标题只用数据推断会误标，故由调用方显式传 `recommendation_mode`；**每策略最多展示 Top-3**（`NOTIFY_TOP_PER_STRATEGY=3`，在策略层 `MAX_PICKS` 截取之上再做一次通知口径收敛，宁缺毋滥）；**pending 不渲染**（`pending` 参数仅为兼容旧调用签名而保留）。
 
-> **卡片上的都是「正式推荐」，不是「候选」**：`notify_screening_result` 在渲染前会按 `tier` 过滤掉全部非 `formal` 标的，因此卡片里出现的每一只都已落库、并被周度追踪统计战绩。单票标签原写作「XX候选」，因中文里「候选」天然偏「备选／仅供参考」而与实际含义相反，现统一改为「**正式推荐 · XX口径**」；同时每只票都渲染**操作计划**块（建仓区间 / 止损 / 止盈 / 建议持有周期，见 `describe_trade_plan`），两套策略共用同一格式。
+> **卡片上的都是「正式推荐」，不是「候选」**：`notify_screening_result` 在渲染前会按 `tier` 过滤掉全部非 `formal` 标的，因此卡片里出现的每一只都满足正式层级；是否落库及参与追踪仍取决于MySQL配置与 `--no-save`。单票标签原写作「XX候选」，因中文里「候选」天然偏「备选／仅供参考」而与实际含义相反，现统一改为「**正式推荐 · XX口径**」；同时每只票都渲染**操作计划**块（建仓区间 / 止损 / 止盈 / 建议持有周期，见 `describe_trade_plan`），两套策略共用同一格式。
 
 **两种「容易误读」的情形都会显式声明**：
 
@@ -444,7 +436,9 @@ python -m unittest tests.test_backtest_execution tests.test_breakout_verificatio
 | 周度追踪 | 每周追踪后 | 追踪**观测条数**（一行=一次「推荐×期限」观测，非一只股票；跨 5/10/15/20 交易日）、**混合口径**胜率/平均收益 + **按期限分列**（同一期限才可比）、**按策略分列**（优质低估低位/放量突破各自条数/胜率/平均收益）及逐只明细（带 [优质低估低位]/[放量突破] 与期限标签） |
 | 信号归因月报 | 每月归因后 | 统计周期（含「推荐后20交易日」口径说明）、已统计推荐数（**仅含已满 20 交易日**）与未计入条数、整体胜率、平均收益/平均峰值收益，以及按等级/评分分档/底背离/市场环境/策略×持有期限的分组统计（缺失维度归入「未知」档，分组样本数之和等于总数） |
 
-## 技术指标
+## 指标速查（当前默认与技术对照分开）
+
+未标quality_value或突破的技术抄底项仅供technical低位企稳对照，不是当前质量入口资格。
 
 | 指标 | 环节 | 用途 |
 |------|------|------|
@@ -455,25 +449,25 @@ python -m unittest tests.test_backtest_execution tests.test_breakout_verificatio
 | RSI14 上限 / 量比上限 | 日线 | 已反弹一段否决（RSI>60）/ 天量出货否决（量比>4）；突破策略检查**前一日** RSI ≤80 |
 | 60日高点回撤（下限/上限） | 日线 | 底部区域过滤（回撤 <10% 判上涨中继；>70% 判崩盘型/价值陷阱） |
 | 20日区间位置 / MACD柱 / KDJ | 日线 | 严格确认：区间下半部 + MACD柱连续3日改善（`MACD_MOMENTUM_DAYS`=3）+ KDJ金叉、K≤55 且 K 上行 |
-| MACD 柱深度弱势 / KDJ 高位 | 日线 | **荐股控制闸门**（`FAIL_MACD_WEAK` / `FAIL_KDJ_HIGH`）：柱值/收盘 ≤−0.5% 且连续 2 日递减（双条件 AND）／K >85 或 K ≥80 且 K<D。突破策略默认开启（`REQUIRE_BR_MACD_NOT_WEAK` / `REQUIRE_BR_KDJ_NOT_HIGH`）；quality_value 模式由 `QV_ENFORCE_KDJ_MACD_VETO` 控制（默认关闭，保持「技术面不作否决」口径） |
-| MACD 柱连续改善 + 站上 MA20 | 日线 | **止跌确认闸门**（`FAIL_STABILIZATION`，`QV_STABILIZATION_GATE` **库级默认开启**）：**全市场环境**（牛/中/熊/unknown）的 formal 推荐须满足其一，否则否决；MACD/MA20 数据不足不视为已确认。旧名 `QV_BEAR_TIMING_GATE` 自动迁移（含构造后赋值） |
+| MACD 柱深度弱势 / KDJ 高位 | 日线 | **荐股控制闸门**（`FAIL_MACD_WEAK` / `FAIL_KDJ_HIGH`）：柱值/收盘 ≤−0.5% 且连续 2 日递减（双条件 AND）／K >85 或 K ≥80 且 K<D。突破策略默认开启（`REQUIRE_BR_MACD_NOT_WEAK` / `REQUIRE_BR_KDJ_NOT_HIGH`）；quality_value 模式由 `QV_ENFORCE_KDJ_MACD_VETO` 控制（默认关闭额外否决；strict止跌、状态技术40与近期底部仍独立生效） |
+| MACD 柱连续改善 + 站上 MA20 | 日线 | **止跌确认闸门**（`FAIL_STABILIZATION`，`QV_STABILIZATION_GATE` **库级默认开启**）：**全市场环境**按strict强/中/弱判定；MACD路径须连续改善且不创新低，弱确认pending，无确认否决，数据不足不视为确认。旧名 `QV_BEAR_TIMING_GATE` 自动迁移（含构造后赋值） |
 | 近 60 个交易日个股 vs 沪深300 区间涨跌幅差 | 日线 + 指数 | 相对强度（`relative_strength`，百分点）：仅作正式候选间**有界排序微调**（±`RS_WEIGHT`）与跑输风险提示，无硬性准入线；按共有交易日对齐，指数缺失为 None（排序中性） |
 | 现价 vs MA20/MA60 + 距 250 日低点天数与幅度 | 日线（展示） | P0 择时读数：右侧·站上MA20/MA60 / 右侧雏形 / 左侧·MA20下方 / ⚠左侧·仍在下跌（MACD深度走弱）；**仅标签，不参与否决与排序** |
-| ATR% | 日线 | 波动率风控（quality_value ≤10% / technical ≤10%——两路径共用 `MAX_ATR_PCT`，与3×ATR止损+30%止盈下RR≥2.0对齐 / 突破 ≤4.0% 独立阈值，超限否决 FAIL_VOLATILE；ATR 缺失为 FAIL_DATA） |
-| 周线 MA10 / MACD | 周线 | 决赛圈确认（默认「站上MA10（容忍2%）**或** MA10 上行」满足其一即可，`WEEKLY_MA_BOTH_REQUIRED=False`；另 MACD柱翻红或绿柱连收2周；**只用已收盘周 bar**；数据缺失/滞后 → 待核验候选） |
+| ATR% | 日线 | 波动率风控（quality_value ≤6% / technical ≤6%——两路径共用 `MAX_ATR_PCT`，与3×ATR止损+30%止盈下RR≥2.0对齐 / 突破 ≤4.0% 独立阈值，超限否决 FAIL_VOLATILE；ATR 缺失为 FAIL_DATA） |
+| 周线 MA10 / MACD | 周线 | 决赛圈确认（突破默认「站上MA10（容忍2%）**且**MA10上行」，`WEEKLY_MA_BOTH_REQUIRED=True`；低位technical对照可用OR；另 MACD柱翻红或绿柱连收2周；**只用已收盘周 bar**；数据缺失/滞后 → 待核验候选） |
 | RSI14/7/21 | 日线 | 超卖反弹 + 底背离判断（前一个价格低点当根的 RSI 对比）+ 多周期共振 |
 | 成交量比 + 收盘位置/实体/上影线 | 日线 | 量价质量分（放量企稳 25 / 放量上涨 18 / 放量冲高回落 10） |
 | 三级阻力位（60日高/20日高/MA60） | 日线（突破） | 突破级别判定（L1/L2/L3；`REQUIRE_L1_OR_L2=True` 默认只认 L1/L2，L3 整体关闭） |
 | 量比/成交额/量能分位/额比 | 日线（突破） | 放量四重确认（1.8–4.0 倍 + ≥1亿 + 60日80%分位 + ≥中位×1.5） |
 | 平台振幅/收盘离散度 | 日线（突破） | 突破前整理充分度（振幅 ≤18%、std/mean ≤4%，shift(3) 避污染） |
-| 最新K线日期 | 日线 | 数据时效（与沪深300最新交易日不一致 → 停牌/滞后，暂不推荐 FAIL_STALE） |
+| 最新K线日期 | 日线 | 数据时效（独立交易日历先核验应完成交易日与指数，再检查个股日期；不能以index自证index时效，滞后归因FAIL_STALE） |
 | 相邻K线自然日间隔 | 日线 | 停牌缺口过滤（>12 天 → FAIL_HALT_GAP，滚动指标跨缺口失真）；**quality_value 与 technical 均已接入**，同一归因码 |
 | ATR% / 回撤深度 / 20日区间位置 | 日线（排序） | 连续质量分（technical 路径的 `rank_score` 组成；仅决定同批通过者先后，不改准入；`RANK_QUALITY_WEIGHT`=10 可置 0） |
 | 成交额(20日均值) | 日线 | 流动性过滤（<3000万 否决，独立归因 FAIL_LIQUIDITY） |
 | 沪深300 MA20 斜率 + MA60 趋势 | 市场环境 | 牛/熊/中性 regime（`MARKET_REGIME_DUAL_INDICATOR` 默认开启：斜率与 MA60 趋势须同向，否则降级中性；另含连续 2 日确认的滞回机制） |
 | 沪深300 近5日累计涨跌幅 | 市场环境 | 市场级熔断（≤ −8% → 本次运行不推荐，优质低估低位入口） |
 | 行业分类 | 集中度 | 行业分散（同一行业最多 2 只，避免单一板块押注） |
-| PE 行业内分位 / 绝对 PE 上限 | 估值（口径） | 行业相对估值回退绝对 PE 上限时逐行标注 `valuation_mode`，飞书卡片显式声明本次口径（PB 只作异常识别与风险说明，不参与准入与评分） |
+| PE 行业内分位 / 绝对 PE 上限 | 估值（口径） | 行业相对估值回退绝对 PE 上限时逐行标注 `valuation_mode`，飞书卡片显式声明本次口径（PB默认不单独评分或高值否决，但参与盈利能力proxy构组；PB≤0仍否决） |
 
 ## 数据源
 
@@ -481,7 +475,8 @@ python -m unittest tests.test_backtest_execution tests.test_breakout_verificatio
 
 - **主源 Baostock**：`query_history_k_data_plus`（个股/指数日线，前复权）、`query_all_stock`（股票列表）、`query_stock_industry`（行业分类，用于行业分散与行业相对估值快照）、`query_profit_data` / `query_balance_data`（ROE/负债率）、`query_growth_data`（最新报告期净利润同比 YOYNI，用于前瞻确认）
 - **备源 AkShare**：`stock_zh_a_hist`（个股日线，东财通道；不可达时自动切 `stock_zh_a_daily` 新浪通道）、`stock_zh_index_daily`（指数）、`stock_info_a_code_name`（股票列表）、`stock_financial_analysis_indicator` / `stock_balance_sheet_by_report_em` / `stock_profit_sheet_by_report_em`（基本面，**technical 与突破路径的决赛圈按字段补齐**商誉/扣非与主源缺失的核心项，只填 None 字段、不覆盖主源）
-- **AkShare 独立通道（年度质量）**：`src/fundamental_quality.py` 的 `fetch_annual_quality` 走 `stock_financial_abstract`（新浪财务摘要宽表「常用指标」）取 ROE / 扣非净利 / 合并净利 / 经营现金流净额，供 quality_value 的「连续 3 个完整年度」质量核验——**不依赖 Baostock**，也**没有 AkShare 兜底之外的替代源**（取数失败按缺证据处理，绝不当作通过）
+- **年度质量**：原始新浪摘要优先保留真实公告日，AkShare `stock_financial_abstract` 为摘要fallback；保留ROE、扣非、合并净利、经营现金流与归母利润。无公告日fallback显式标 `availability_assumed`（保守次年5月1日），不覆盖真实晚公告或原始硬伤。
+- **近期经营与财务risk**：原始新浪 `gjzb` / `fzb` 保留真实公告日、来源、报告期与合并人民币口径；缺失降pending。单季/TTM为辅助证据，risk不跨期或跨公告日拼接。
 - **切换规则**：
   - 单条取数失败（异常或返回空）→ 自动用 AkShare 兜底重取
   - Baostock 连续失败达 8 次 → 熔断，本次运行后续请求直接走 AkShare（避免逐股无效重试）
@@ -489,7 +484,7 @@ python -m unittest tests.test_backtest_execution tests.test_breakout_verificatio
 - **连接管理**：登录真实重试（检查 error_code）、查询失败自动重连、全局线程锁防止 C++ 底层 socket 多线程踩踏；模块级 `socket.setdefaulttimeout(20)` 防假死
 - **失败重试**：请求异常按退避重试（个股 `MAX_RETRY=2`，股票列表 `LIST_MAX_RETRY=4`）；「返回空」视为该标的确实无数据，不重试
 - **两级缓存**：内存 `CacheManager`（进程内，`CACHE_EXPIRE_HOURS=4` 小时）→ `cache/` 目录磁盘缓存
-  - 行情类按交易日失效：新交易日自动重拉，同日重复运行走缓存
+  - 行情类按meta取数日期/阶段核验，闭市不能复用盘中缓存；还须独立日历与末bar时效核验，同日并不保证可复用
   - 股票列表按 `CACHE_TTL_DAYS=6` 天、基本面按 `FUND_CACHE_TTL_DAYS=7` 天（`fund_v2_*`；主源缓存名带起始季度标签，报告期滚动后自动失效，备用源为按 TTL 失效）、行业分类按 `INDUSTRY_CACHE_TTL_DAYS=30` 天失效；年度质量 `annual_quality_v2_<code>_<决策日>_<年数>.json` 与成长 `growth_v1_<code>_<年>Q<季>.json` 同样按 7 天 TTL，且各自按决策日/季度隔离
   - 磁盘只缓存未过滤的原始列表，过滤在返回时应用，改 config 即时生效无需清缓存
   - 两个数据源的缓存文件命名天然隔离（Baostock 带 `sh.` 前缀、AkShare 为纯 6 位数字），互不污染

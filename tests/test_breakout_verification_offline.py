@@ -39,6 +39,7 @@ def weekly(end=DAY, n=60):
 class BreakoutVerificationTests(unittest.TestCase):
     def config(self, **kwargs):
         return vb.VolumeBreakoutConfig(RECOMMENDATION_MODE="technical", FETCH_DELAY=0,
+            REQUIRE_FINANCIAL_RISK=False,
             REQUIRE_BR_MACD_NOT_WEAK=False, REQUIRE_BR_KDJ_NOT_HIGH=False, **kwargs)
 
     def evaluate(self, frame=None, **kwargs):

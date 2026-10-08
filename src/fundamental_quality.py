@@ -7,8 +7,9 @@ https://akshare.akfamily.xyz/data/stock/stock.html#id214
 常用指标 rows 净资产收益率(ROE), 扣非净利润, 净利润, 经营现金流量净额
 map to ROEWEIGHTED (%), NPCUT, NETPROFIT and MANANETR (CNY yuan).
 净利润 includes minority interests; 归母净利润 is deliberately never used.
-The upstream publish_date is discarded by AkShare's abstract function, so
-May 1 of the following year is the conservative availability assumption.
+The raw Sina path retains publish_date. If it fails, the AkShare abstract path
+uses May 1 of the following year as a conservative availability assumption and
+explicitly retains availability_assumed.
 This is disclosure gating, not a historical-vintage/restatement database.
 """
 from datetime import date, datetime
@@ -21,6 +22,7 @@ _SINA_FIELDS = {
     "deducted_profit": "扣非净利润",
     "net_profit": "净利润",
     "operating_cashflow": "经营现金流量净额",
+    "attributable_profit": "归母净利润",
 }
 
 
@@ -139,6 +141,7 @@ def evaluate_annual_quality(annual_rows, as_of, years=3, median_roe_min=10,
             invalid.append(f"invalid_available_date:{y}")
             continue
         row = {key: _number(raw.get(key)) for key in _FIELDS}
+        row["attributable_profit"] = _number(raw.get("attributable_profit"))
         row.update(year=y, report_date=report.isoformat(),
                    available_date=available.isoformat(),
                    availability_assumed=assumed or bool(raw.get("availability_assumed", False)))
@@ -285,28 +288,59 @@ def _parse_sina_abstract(table):
     return rows
 
 
-def fetch_annual_quality(code, as_of, years=3, ak_client=None):
-    """Fetch one company's annual evidence and return the evaluator result.
+def fetch_annual_quality(code, as_of, years=3, ak_client=None, request_get=None,
+                         **quality_kwargs):
+    """Raw Sina disclosure dates first; abstract fallback explicitly assumes May 1.
 
-    No cache, market-wide calls or industry inference. The caller must route
-    financial companies to evaluate_annual_quality(..., financial=True).
-    Network/schema errors are returned as missing evidence, never a pass.
+    Supplying only ak_client keeps existing offline adapters offline. To test
+    the raw preference inject request_get too. quality_kwargs are forwarded to
+    evaluate_annual_quality, including optional yearly positivity checks.
     """
+    from .recent_operating import SOURCE_URL, parse_summary
+
     _validate(as_of, years)
     symbol = str(code).strip()
     if not re.fullmatch(r"\d{1,6}", symbol):
         raise ValueError("code must contain 1 to 6 digits")
     symbol = symbol.zfill(6)
-    try:
-        if ak_client is None:
-            import akshare as ak_client
-        table = ak_client.stock_financial_abstract(symbol=symbol)
-        rows = _parse_sina_abstract(table)
-    except Exception as exc:
-        result = evaluate_annual_quality([], as_of, years)
-        result["missing_tags"].append("fetch_error")
-        result["reason"] = f"年度财报取数失败：{type(exc).__name__}: {exc}"
+    raw_rows, raw_error = [], None
+    if request_get is not None or ak_client is None:
+        try:
+            if request_get is None:
+                import requests
+                request_get = requests.get
+            market = "sh" if symbol.startswith("6") else "sz" if symbol.startswith(("0", "3")) else "bj"
+            response = request_get(SOURCE_URL, params={"paperCode": market + symbol,
+                "source": "gjzb", "type": "0", "page": "1", "num": str(max(24, 4 * (years + 2)))}, timeout=15)
+            response.raise_for_status()
+            for row in parse_summary(response.json()):
+                report, available = _date(row.get("report_date")), _date(row.get("available_date"))
+                if report and (report.month, report.day) == (12, 31) and available and available > report:
+                    raw_rows.append(dict(row, year=report.year, availability_assumed=False))
+        except Exception as exc:
+            raw_error = type(exc).__name__
+    raw_result = evaluate_annual_quality(raw_rows, as_of, years, **quality_kwargs)
+    # Known raw violations must never be erased by fallback values.
+    if raw_result["status"] in {"verified", "failed", "financial_review"}:
+        result, source = raw_result, SOURCE_URL
     else:
-        result = evaluate_annual_quality(rows, as_of, years)
-    result.update(code=symbol, source="akshare.stock_financial_abstract", amount_unit="CNY yuan")
+        try:
+            if ak_client is None:
+                import akshare as ak_client
+            rows = _parse_sina_abstract(ak_client.stock_financial_abstract(symbol=symbol))
+            # Replace entire matching fiscal rows, never mix metric bases. Actual
+            # future/late dates also override assumed availability in the fallback.
+            raw_years = {row["year"] for row in raw_rows}
+            rows = [row for row in rows if row["year"] not in raw_years] + raw_rows
+            result = evaluate_annual_quality(rows, as_of, years, **quality_kwargs)
+            source = "sina.raw+akshare.stock_financial_abstract" if raw_rows else "akshare.stock_financial_abstract"
+        except Exception as exc:
+            result, source = raw_result, SOURCE_URL
+            result["missing_tags"].append("fetch_error")
+            result["reason"] += f"；年度摘要取数失败：{type(exc).__name__}"
+    if raw_error:
+        result["raw_fetch_error"] = raw_error
+    result.update(code=symbol, as_of=_date(as_of).isoformat(), source=source,
+                  amount_unit="CNY yuan",
+                  availability_assumed=any(row["availability_assumed"] for row in result["annual_rows"]))
     return result

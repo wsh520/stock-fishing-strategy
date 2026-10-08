@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 from datetime import datetime
 from typing import Optional
@@ -131,6 +132,110 @@ _RECOMMENDATION_NOTE = (
     "\n**名单口径:** 下列均为**正式推荐**（已通过全部筛选闸门、已落库并纳入周度追踪）；"
     "\n每只票下方的**操作计划**为计划价位，按**次日开盘**执行，仓位与资金管理请自行判断。"
 )
+
+
+def _display_number(value, digits: int = 1, *, positive: bool = False) -> str:
+    """展示真实有限数值；缺失与非有限值不能冒充零分。"""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "缺数据"
+    if not math.isfinite(number) or (positive and number <= 0):
+        return "缺数据"
+    return f"{number:.{digits}f}"
+
+
+def _display_text(value, default: str = "缺数据") -> str:
+    if value is None or pd.isna(value) or not str(value).strip():
+        return default
+    return str(value)
+
+
+def _recommendation_evidence(row: dict) -> list[str]:
+    """只解释信号携带的证据，不重新判定资格或计算交易计划。"""
+    lines = []
+    if "historical_pe_percentile" in row:
+        percentile = _display_number(row.get("historical_pe_percentile"))
+        if percentile != "缺数据":
+            value = float(row["historical_pe_percentile"])
+            percentile = f"{value:.1%}" if 0 <= value <= 1 else "缺数据"
+        samples = _display_number(row.get("historical_pe_samples"), 0, positive=True)
+        lines.append(f"自身历史PE分位: {percentile} | 有效历史样本: {samples}（分位越低，相对自身历史越便宜）")
+    if "normalized_pe" in row or "cyclical_risk" in row:
+        cycle_key = _display_text(row.get("cyclical_risk"))
+        cycle = {"peak": "盈利高峰风险", "normal": "未见盈利高峰风险",
+                 "missing": "缺数据", "not_required": "不适用"}.get(cycle_key, "待核验")
+        pe = _display_number(row.get("normalized_pe"), positive=True)
+        if pe == "缺数据" and cycle_key == "not_required":
+            pe = "不适用"
+        lines.append(f"周期估值: 正常化PE {pe}（多年归母利润中位数口径） | {cycle}")
+    if "financial_risk_status" in row:
+        status = {"verified": "已核验通过", "failed": "未通过",
+                  "missing": "缺数据·待核验", "partial": "数据不全·待核验",
+                  "not_required": "本次未要求核验"}.get(
+                      _display_text(row.get("financial_risk_status")), "待核验")
+        lines.append(f"财务风险: {status}（负债、商誉、扣非利润）")
+    technical = [(key, label) for key, label in (
+        ("technical_trend_score", "趋势"), ("technical_momentum_score", "动能"),
+        ("technical_volume_score", "量能")) if key in row]
+    if technical and row.get("weekly_status") == "not_required":
+        lines.append("技术子分: " + " / ".join(
+            f"{label} {_display_number(row.get(key))}" for key, label in technical))
+    return lines
+
+
+def _upgrade_recommendation_body(body: str, row: dict, is_breakout: bool) -> str:
+    """补充正式卡片证据，替换已有突破解释，避免重复及默认权重误导。"""
+    lines = body.splitlines()
+    # 突破入口的 quality_value 信号仍沿用优质低估低位描述。
+    technical_breakout = is_breakout and row.get("weekly_status") != "not_required"
+    if technical_breakout:
+        category_key = _display_text(row.get("breakout_category"))
+        category = {"first_breakout": "首次突破", "held_confirmed": "已站稳确认",
+                    "retest_confirmed": "回踩确认"}.get(category_key, "类别待核验")
+        event_date = _display_text(row.get("breakout_event_date"))
+        if event_date == "缺数据" and category_key == "first_breakout":
+            event_date = _display_text(row.get("date"))
+        confirmation = _display_text(row.get("breakout_confirmation_date"))
+        confirmed = category_key in {"held_confirmed", "retest_confirmed"}
+        price_date = confirmation if confirmed else _display_text(row.get("date"))
+        anchor = _display_number(row.get("breakout_anchor"), 2, positive=True)
+        replacement = [
+            f"信号: {category} | 事件日: {event_date} | 确认日: {confirmation} | 固定阻力锚点: {anchor}",
+            "原事件五维子分: " + " / ".join(
+                f"{label} {_display_number(row.get(key))}" for key, label in (
+                    ("breakout_score", "突破"), ("volume_br_score", "量能"),
+                    ("pattern_score", "平台"), ("trend_br_score", "趋势"),
+                    ("momentum_br_score", "动能"))),
+            f"原事件量能组成: 量比 {_display_number(row.get('volume_ratio_score'))}"
+            f" + 整理 {_display_number(row.get('consolidation_score'))}（实际子分）",
+            f"相对强度（百分点）: 市场 {_display_number(row.get('market_relative_strength'))}"
+            f" | 行业 {_display_number(row.get('industry_relative_strength'))}"
+            f" | 排序调整 {_display_number(row.get('relative_strength_adjustment'))}"
+            "（只调整排序，不改变原事件评分及等级）",
+        ]
+        old_prefixes = ("信号:", "事件五维子分:", "原事件五维子分:", "量能组成:",
+                        "原事件量能组成:", "相对强度(pp):", "相对强度（百分点）:")
+        upgraded = []
+        for line in lines:
+            if line.startswith(old_prefixes):
+                continue
+            if line.startswith("评分:"):
+                line = line.replace("评分:", "原事件评分:", 1)
+                price_label = "确认日收盘" if confirmed else "事件日收盘"
+                line = line.replace(" | 收盘:", f" | {price_label}（{price_date}）:", 1)
+            if " | 日均额:" in line:
+                before, after = line.split(" | 日均额:", 1)
+                _, separator, tail = after.partition(" | ")
+                line = before + f" | 日均额: {_display_number(row.get('avg_amount'), positive=True)}万元"
+                if separator:
+                    line += separator + tail
+            upgraded.append(line)
+        lines = upgraded[:3] + replacement + upgraded[3:]
+        if confirmed:
+            lines.append("评分说明: 本次为原突破事件的后续确认；总分、等级及五维子分沿用原事件，当前收盘价格日期为确认日。")
+    lines.extend(_recommendation_evidence(row))
+    return "\n".join(lines)
 
 
 def notify_screening_result(
@@ -311,12 +416,13 @@ def notify_screening_result(
         else:
             body = (
                 f"**{r.get('name', '')} {r.get('code', '')}**\n"
-                f"评分: {r.get('score', 0)} ({r.get('grade', '')}) "
-                f"| 收盘: {r.get('close', 0)} "
-                f"| 止损: {r.get('stop_loss', 0)} "
-                f"| 止盈: {r.get('take_profit', 0)} "
-                f"| RR: {r.get('rr_ratio', 0)}"
+                f"评分: {_display_number(r.get('score'))} ({_display_text(r.get('grade'), '-')}) "
+                f"| 收盘: {_display_number(r.get('close'), 2, positive=True)} "
+                f"| 止损: {_display_number(r.get('stop_loss'), 2, positive=True)} "
+                f"| 止盈: {_display_number(r.get('take_profit'), 2, positive=True)} "
+                f"| RR: {_display_number(r.get('rr_ratio'), 2)}"
             )
+        body = _upgrade_recommendation_body(body, r, is_breakout)
         body += per_stock_footer_tmpl.format(
             label=candidate_label, env=market_env, ts=now, idx=idx, total=shown_n,
         )

@@ -75,6 +75,7 @@ from src.bottom_fishing_strategy import (
     get_daily_data,
     get_fundamentals,
     enrich_recent_operating,
+    enrich_financial_risk,
     get_market_environment,
     get_stock_list,
     has_halt_gap,
@@ -94,6 +95,14 @@ logger = logging.getLogger("strategy.breakout")
 DISPLAY_COLS = [
     ("code", "代码"), ("name", "名称"), ("date", "日期"), ("close", "收盘"),
     ("score", "评分"), ("grade", "等级"), ("daily_score", "日线分"),
+    ("breakout_score", "突破分"), ("volume_br_score", "量能分"), ("pattern_score", "平台分"),
+    ("trend_br_score", "趋势分"), ("momentum_br_score", "动能分"),
+    ("volume_ratio_score", "量比分(17.5)"), ("consolidation_score", "整理分(7.5)"),
+    ("breakout_event_date", "事件日"), ("breakout_confirmation_date", "确认日"),
+    ("breakout_category", "信号类别"), ("breakout_anchor", "固定阻力"),
+    ("early_start", "提前启动"), ("resistance_drop_trigger", "阻力下降触发"),
+    ("market_relative_strength", "相对市场pp"), ("industry_relative_strength", "相对行业pp"),
+    ("relative_strength_adjustment", "排序调整"), ("ranking_score", "排序分"),
     ("breakout_level", "突破级别"), ("breakout_margin", "突破幅度%"),
     ("rsi", "RSI"), ("vol_ratio", "量比"), ("turnover_ratio", "换手比"),
     ("avg_amount", "日均额(万)"), ("platform_range", "平台振幅%"),
@@ -124,6 +133,22 @@ class VolumeBreakoutConfig(StrategyConfig):
     - BEAR_MAX_PICKS → 用 BEAR_MAX_PICKS_BREAKOUT 覆盖（熊市直接空仓）
     - BEAR_GRADE_BOOST → 用 BEAR_GRADE_BOOST_BREAKOUT 覆盖（+15，比抄底严）
     """
+
+    RECOMMENDATION_MODE: str = "technical"
+    WEEKLY_MA_BOTH_REQUIRED: bool = True
+    ALLOW_RESISTANCE_DROP_BREAKOUT: bool = False
+    RECENT_BREAKOUT_DAYS: int = 5
+    BREAKOUT_HOLD_DAYS: int = 2
+    RETEST_TOLERANCE: float = 0.02
+    CONFIRM_MAX_EXTENSION_PCT: float = 7.0
+    BREAKOUT_MARGIN_OPTIMAL_LOW: float = 1.0
+    BREAKOUT_MARGIN_OPTIMAL_HIGH: float = 3.0
+    BREAKOUT_MARGIN_SCORE_ZERO: float = 7.0
+    USE_BREAKOUT_RELATIVE_STRENGTH: bool = True
+    BREAKOUT_RS_LOOKBACK: int = 20
+    BREAKOUT_RS_MAX_ADJUSTMENT: float = 3.0
+    BREAKOUT_RS_FULL_SCALE: float = 10.0
+    BREAKOUT_INDUSTRY_MIN_PEERS: int = 3
 
     # ===== 关键阻力位 =====
     BREAKOUT_LOOKBACK_HIGH: int = 60         # L1 长期新高回看窗口
@@ -223,6 +248,23 @@ class BreakoutSignal(Signal):
     # 突破策略排序/展示需要 20 日均成交额；基础 Signal（抄底策略）没有该字段，
     # 在子类补充并给默认值以保持两套信号构造接口兼容。
     avg_amount: float = 0.0
+    breakout_score: float = 0.0
+    volume_br_score: float = 0.0
+    pattern_score: float = 0.0
+    trend_br_score: float = 0.0
+    momentum_br_score: float = 0.0
+    volume_ratio_score: float = 0.0
+    consolidation_score: float = 0.0
+    breakout_event_date: str = ""
+    breakout_confirmation_date: str = ""
+    breakout_category: str = "first_breakout"
+    breakout_anchor: float = 0.0
+    resistance_drop_trigger: bool = False
+    early_start: bool = False
+    industry_relative_strength: Optional[float] = None
+    market_relative_strength: Optional[float] = None
+    relative_strength_adjustment: float = 0.0
+    ranking_score: float = 0.0
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -243,9 +285,74 @@ def _inv_smoothstep(x: pd.Series | float, lo: float, hi: float) -> pd.Series | f
     return 1 - _smoothstep(x, lo, hi)
 
 
-# ===========================================================================
+def breakout_margin_quality(value: pd.Series | float, config: VolumeBreakoutConfig):
+    """最优区间满分，超过最优上沿逐步降分，避免越追高越加分。"""
+    lo, hi, zero = (config.BREAKOUT_MARGIN_OPTIMAL_LOW,
+                    config.BREAKOUT_MARGIN_OPTIMAL_HIGH, config.BREAKOUT_MARGIN_SCORE_ZERO)
+    if not config.BREAKOUT_MIN_MARGIN * 100 < lo <= hi < zero:
+        raise ValueError("突破幅度评分需满足最小突破幅度 < 最优下沿 <= 最优上沿 < 归零幅度")
+    return (_smoothstep(value, config.BREAKOUT_MIN_MARGIN * 100, lo)
+            * _inv_smoothstep(value, hi, zero))
+
+
+def breakout_period_return(df, as_of, lookback):
+    """截止决策日的完整交易日收益；返回起止日期以防行业样本窗口错配。"""
+    if df is None or not {"date", "close"}.issubset(df.columns):
+        return None
+    dates = pd.to_datetime(df["date"], errors="coerce")
+    values = pd.to_numeric(df["close"], errors="coerce")
+    frame = pd.DataFrame({"date": dates, "close": values})
+    frame = frame.loc[dates.notna() & (dates <= pd.Timestamp(as_of))].sort_values("date")
+    if frame.date.duplicated().any() or len(frame) < lookback + 1:
+        return None
+    frame = frame.tail(lookback + 1)
+    if not np.isfinite(frame.close).all() or (frame.close <= 0).any():
+        return None
+    return (frame.date.iloc[0].strftime("%Y-%m-%d"), frame.date.iloc[-1].strftime("%Y-%m-%d"),
+            float((frame.close.iloc[-1] / frame.close.iloc[0] - 1) * 100))
+
+
+def compute_breakout_relative_strength(stock, benchmark, as_of, lookback=20):
+    """使用个股完整交易窗口的同日起止基准收益，未来数据不能参与。"""
+    period = breakout_period_return(stock, as_of, lookback)
+    if period is None or benchmark is None or not {"date", "close"}.issubset(benchmark.columns):
+        return None
+    dates = pd.to_datetime(benchmark["date"], errors="coerce")
+    prices = pd.Series(pd.to_numeric(benchmark["close"], errors="coerce").to_numpy(), index=dates)
+    if prices.index.duplicated().any():
+        return None
+    start, end, ret = period
+    try:
+        first, last = float(prices.loc[pd.Timestamp(start)]), float(prices.loc[pd.Timestamp(end)])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not np.isfinite([first, last]).all() or min(first, last) <= 0:
+        return None
+    return ret - (last / first - 1) * 100
+
+
+def build_breakout_industry_snapshot(samples, industry_map):
+    """复用筛选取数所得收益样本；按行业和同一起止日期构建一次快照。"""
+    snapshot = {}
+    for code, period in samples:
+        industry = industry_map.get(code)
+        if industry and period is not None:
+            start, end, ret = period
+            snapshot.setdefault((industry, start, end), {})[code] = ret
+    return snapshot
+
+
+def breakout_strength_adjustment(market_strength, industry_strength, config):
+    """缺失分量贡献零，最大影响为配置上限；不改变资格和等级。"""
+    values = [_num_or_none(market_strength), _num_or_none(industry_strength)]
+    scale = max(float(config.BREAKOUT_RS_FULL_SCALE), 1e-6)
+    bound = max(float(config.BREAKOUT_RS_MAX_ADJUSTMENT), 0)
+    return float(sum(0 if x is None else np.clip(x / scale, -1, 1) for x in values) * bound / 2)
+
+
+# ==========================================================================
 # 核心信号计算
-# ===========================================================================
+# ==========================================================================
 
 _BREAKOUT_NEED_COLS = {"close", "open", "high", "low", "volume", "amount", "date", "pct_chg"}
 
@@ -365,9 +472,19 @@ def compute_breakout_signals(df: pd.DataFrame, config: VolumeBreakoutConfig) -> 
     above_l1 = (out["close"] > out["level_l1"] * (1 + margin)) & out["level_l1"].notna()
     above_l2 = (out["close"] > out["level_l2"] * (1 + margin)) & out["level_l2"].notna()
     above_l3 = (out["close"] > out["level_l3"] * (1 + margin)) & out["level_l3"].notna()
-    brk_l1 = above_l1 & ~above_l1.shift(1, fill_value=False)
-    brk_l2 = above_l2 & ~above_l2.shift(1, fill_value=False)
-    brk_l3 = above_l3 & ~above_l3.shift(1, fill_value=False)
+    def crossing(level: pd.Series) -> tuple[pd.Series, pd.Series]:
+        threshold = level * (1 + margin)
+        # 两日必须跨过同一个当前锚点；单纯滚动高点退出窗口不构成主动突破。
+        crossed = (out["close"] > threshold) & (out["close"].shift(1) <= threshold)
+        dropped = ((level < level.shift(1)) & (out["close"] > threshold)
+                   & (out["close"].shift(1) <= level.shift(1) * (1 + margin)))
+        passive = dropped & ~crossed
+        return crossed | (passive & config.ALLOW_RESISTANCE_DROP_BREAKOUT), dropped
+
+    brk_l1, drop_l1 = crossing(out["level_l1"])
+    brk_l2, drop_l2 = crossing(out["level_l2"])
+    brk_l3, drop_l3 = crossing(out["level_l3"])
+    out["resistance_drop_trigger"] = drop_l1 | drop_l2 | (drop_l3 & (not config.REQUIRE_L1_OR_L2))
     if config.REQUIRE_L1_OR_L2:
         brk_l3 = pd.Series(False, index=out.index)
 
@@ -389,6 +506,11 @@ def compute_breakout_signals(df: pd.DataFrame, config: VolumeBreakoutConfig) -> 
         [out["level_l1"], out["level_l2"], out["level_l3"]],
         default=np.nan,
     )
+    out["breakout_anchor"] = breakout_ref
+    # 平台右端偏移三日：额外说明突破前两日是否已有价格与量能启动。
+    early_move = ((out["pct_chg"] >= config.MIN_BREAKOUT_PCT)
+                  & (out["daily_vol_ratio"] >= 1.2))
+    out["early_start"] = early_move.shift(1, fill_value=False) | early_move.shift(2, fill_value=False)
     out["breakout_margin"] = np.where(
         pd.notna(breakout_ref) & (breakout_ref > 0),
         (out["close"] / breakout_ref - 1) * 100,
@@ -477,7 +599,7 @@ def compute_breakout_signals(df: pd.DataFrame, config: VolumeBreakoutConfig) -> 
     # 等于只推 L1，信号稀疏。改为 0.55×级别 + 0.45×幅度 的加法混合：
     # L1 深度突破仍最高（~30 分），L2 常规突破 ~18 分，配合其他维度可达成 B 级准入。
     level_factor = out["breakout_level"].map({3: 1.0, 2: 0.75, 1: 0.5}).fillna(0.0)
-    margin_factor = _smoothstep(out["breakout_margin"], config.BREAKOUT_MIN_MARGIN * 100, 5.0)
+    margin_factor = breakout_margin_quality(out["breakout_margin"], config)
     out["breakout_score"] = config.W_BREAKOUT * (0.55 * level_factor + 0.45 * margin_factor)
 
     # ----- W_VOLUME_BR=25：放量倍数 + 突破前整理充分度（加权加法，避免单维度归零拖垮整体）-----
@@ -490,7 +612,9 @@ def compute_breakout_signals(df: pd.DataFrame, config: VolumeBreakoutConfig) -> 
     vol_quality = pd.Series(np.where(vol_ratio <= config.VOLUME_BREAKOUT_PEAK, vol_up, 1 - vol_down), index=out.index).fillna(0)
     # 整理质量：平台期收盘价 std/mean 越小分越高（能量聚集充分）
     tightness_quality = _inv_smoothstep(out["platform_tightness"], 0.005, config.MAX_PLATFORM_TIGHTNESS).fillna(0.5)
-    out["volume_br_score"] = config.W_VOLUME_BR * (0.7 * vol_quality + 0.3 * tightness_quality)
+    out["volume_ratio_score"] = config.W_VOLUME_BR * 0.7 * vol_quality
+    out["consolidation_score"] = config.W_VOLUME_BR * 0.3 * tightness_quality
+    out["volume_br_score"] = out["volume_ratio_score"] + out["consolidation_score"]
 
     # ----- W_PATTERN=15：平台振幅越小分越高 -----
     out["pattern_score"] = config.W_PATTERN * _inv_smoothstep(out["platform_range"], 5.0, config.MAX_PLATFORM_RANGE * 100).fillna(0)
@@ -569,6 +693,47 @@ def compute_breakout_risk_reward(
 # 评估函数：七层漏斗，返回 (Signal, reason_code)
 # ===========================================================================
 
+def check_breakout_confirmation(after: pd.DataFrame, anchor: float, config: VolumeBreakoutConfig, history: Optional[pd.DataFrame] = None):
+    """仅检查事件之后已完成的行情；任何收盘跌破固定锚点都取消确认。"""
+    if after.empty or not np.isfinite(anchor) or anchor <= 0:
+        return None
+    required = ["open", "high", "low", "close", "volume", "amount", "pct_chg", "atr"]
+    if not set(required).issubset(after.columns):
+        return None
+    values = after[required].apply(pd.to_numeric, errors="coerce")
+    if not np.isfinite(values.to_numpy()).all() or (values[["open", "high", "low", "close", "volume", "amount"]] <= 0).any().any():
+        return None
+    if (values.close < anchor).any():
+        return None
+    last = after.iloc[-1]
+    if str(last.get("tradestatus", "1")) not in ("1", "1.0"):
+        return None
+    if not all(bool(last.get(key, False)) for key in ("ma20_rising", "ma60_ok", "close_above_ma20")):
+        return None
+    if bool(last.get("recent_failed_breakout", False)):
+        return None
+    if ((float(last["close"]) / anchor - 1) * 100 > config.CONFIRM_MAX_EXTENSION_PCT
+            or float(last["pct_chg"]) > config.MAX_BREAKOUT_PCT
+            or float(last["atr"]) / float(last["close"]) * 100 > config.MAX_ATR_PCT_BREAKOUT):
+        return None
+    momentum_history = after if history is None else history
+    if len(momentum_history) >= 2:
+        previous = _num_or_none(momentum_history.iloc[-2].get("close"))
+        if previous is None or previous <= 0 or (float(last["open"]) / previous - 1) * 100 > config.MAX_GAP_UP_PCT:
+            return None
+    if config.REQUIRE_BR_MACD_NOT_WEAK and not macd_not_deeply_weak(momentum_history, config.MACD_WEAK_DAYS, config.MACD_WEAK_HIST_PCT):
+        return None
+    if config.REQUIRE_BR_KDJ_NOT_HIGH and not kdj_not_overheated(momentum_history, config.KDJ_K_HARD_MAX, config.KDJ_DEAD_CROSS_K):
+        return None
+    # 回踩须触及锚点附近，收盘重新站上最小突破余量，避免跌破后勉强回到锚点。
+    if (float(last["low"]) <= anchor * (1 + config.RETEST_TOLERANCE)
+            and float(last["close"]) > anchor * (1 + config.BREAKOUT_MIN_MARGIN)):
+        return "retest_confirmed"
+    if len(after) >= config.BREAKOUT_HOLD_DAYS and (values.close.tail(config.BREAKOUT_HOLD_DAYS) > anchor * (1 + config.BREAKOUT_MIN_MARGIN)).all():
+        return "held_confirmed"
+    return None
+
+
 def evaluate_breakout(
     daily_df: Optional[pd.DataFrame],
     code: str = "",
@@ -593,8 +758,8 @@ def evaluate_breakout(
 
     val_context：行业相对估值上下文，仅在 quality_value 委派路径下透传给
     evaluate_quality_value；technical（独立突破）路径忽略。
-    index_df：沪深300日线，仅在 quality_value 委派路径下透传给
-    evaluate_quality_value（用于近60日相对强度）；technical 路径忽略。
+    index_df：复用主流程指数日线；technical 用于有界相对强度排序，
+    quality_value 委派路径透传给 evaluate_quality_value。
     """
     if config is None:
         config = VolumeBreakoutConfig()
@@ -613,7 +778,7 @@ def evaluate_breakout(
             if "放量突破" not in base.signals_hit.split(","):
                 base.signals_hit += ",放量突破"
             extra = {k: getattr(breakout, k) for k in ("breakout_level", "breakout_margin", "platform_range", "avg_amount")}
-        return BreakoutSignal(**base.to_dict(), **extra), "PASS"
+        return BreakoutSignal(**{**base.to_dict(), **extra}), "PASS"
     regime = (market_env or {}).get("regime", "unknown")
     eff_regime = _effective_regime(regime, config)
     grade_boost = config.BEAR_GRADE_BOOST_BREAKOUT if eff_regime == "bear" else 0.0
@@ -668,6 +833,38 @@ def evaluate_breakout(
 
     # 层 3.1：突破判定
     if not bool(d_last.get("breakout_any", False)):
+        # 只对历史上通过完整原事件闸门的突破做确认，截断输入禁止未来行情污染。
+        event_config = VolumeBreakoutConfig(**{**asdict(config), "RECENT_BREAKOUT_DAYS": 0})
+        for pos in range(len(out) - 2, max(-1, len(out) - config.RECENT_BREAKOUT_DAYS - 2), -1):
+            event = out.iloc[pos]
+            if not bool(event.get("breakout_any", False)):
+                continue
+            event_date = pd.to_datetime(event["date"]).strftime("%Y-%m-%d")
+            source_dates = pd.to_datetime(daily_df["date"], errors="coerce")
+            event_source = daily_df.loc[source_dates <= pd.Timestamp(event_date)].copy()
+            original, _ = evaluate_breakout(event_source, code, name, event_config, market_env,
+                fund_data, latest_trade_date=event_date, index_df=index_df)
+            if original is None:
+                continue
+            category = check_breakout_confirmation(out.iloc[pos + 1:], original.breakout_anchor, config, history=out)
+            if category is None:
+                continue
+            original.date = day.strftime("%Y-%m-%d")
+            original.breakout_confirmation_date = original.date
+            original.breakout_category = category
+            if latest_trade_date is None:
+                original.missing_tags = ",".join(dict.fromkeys(filter(None, [*original.missing_tags.split(","), "market_date"])))
+            original.close = round(last_close, 2)
+            original.rsi = round(float(d_last["rsi14"]), 1)
+            original.vol_ratio = round(float(d_last["daily_vol_ratio"]), 2)
+            original.breakout_margin = round((last_close / original.breakout_anchor - 1) * 100, 2)
+            original.avg_amount = round(float(out["amount"].tail(20).mean()) / 1e4, 1)
+            rr = compute_breakout_risk_reward(last_close, original.breakout_anchor, config, float(d_last["atr"]))
+            original.stop_loss, original.take_profit, original.rr_ratio = rr["stop_loss"], rr["take_profit"], rr["rr_ratio"]
+            original.market_relative_strength = compute_breakout_relative_strength(out, index_df, original.date, config.BREAKOUT_RS_LOOKBACK)
+            original.relative_strength_adjustment = breakout_strength_adjustment(original.market_relative_strength, None, config) if config.USE_BREAKOUT_RELATIVE_STRENGTH else 0.0
+            original.ranking_score = original.score + original.relative_strength_adjustment
+            return original, "PASS"
         return None, "FAIL_NO_BREAKOUT"
     breakout_level = int(d_last.get("breakout_level", 0))
     breakout_margin = float(d_last.get("breakout_margin", 0))
@@ -836,6 +1033,16 @@ def evaluate_breakout(
         breakout_margin=round(breakout_margin, 2),
         platform_range=round(float(d_last.get("platform_range", 0)), 2),
     )
+    for key in ("breakout_score", "volume_br_score", "pattern_score", "trend_br_score", "momentum_br_score", "volume_ratio_score", "consolidation_score"):
+        setattr(sig, key, round(float(d_last.get(key, 0)), 3))
+    sig.breakout_event_date = sig.date
+    sig.breakout_anchor = breakout_ref
+    sig.resistance_drop_trigger = bool(d_last.get("resistance_drop_trigger", False))
+    sig.early_start = bool(d_last.get("early_start", False))
+    if config.USE_BREAKOUT_RELATIVE_STRENGTH:
+        sig.market_relative_strength = compute_breakout_relative_strength(out, index_df, sig.date, config.BREAKOUT_RS_LOOKBACK)
+        sig.relative_strength_adjustment = breakout_strength_adjustment(sig.market_relative_strength, None, config)
+    sig.ranking_score = sig.score + sig.relative_strength_adjustment
     return sig, "PASS"
 
 
@@ -866,6 +1073,17 @@ def describe_breakout(row: dict) -> str:
         f" | 日均额: {_fmt_cell(row.get('avg_amount'))}万"
         f" | 市场: {row.get('market_env') or '-'}",
     ]
+    category = {"first_breakout": "首次突破", "held_confirmed": "已站稳确认", "retest_confirmed": "回踩确认"}.get(row.get("breakout_category"), "首次突破")
+    lines.append(f"信号: {category} | 事件日: {row.get('breakout_event_date') or row.get('date')} | 确认日: {row.get('breakout_confirmation_date') or '-'} | 固定阻力: {_fmt_cell(row.get('breakout_anchor'))}")
+    lines.append("事件五维子分: " + " / ".join(f"{label} {_fmt_cell(row.get(key))}" for key, label in (
+        ("breakout_score", "突破"), ("volume_br_score", "量能"), ("pattern_score", "平台"),
+        ("trend_br_score", "趋势"), ("momentum_br_score", "动能"))))
+    lines.append(f"量能组成: 量比 {_fmt_cell(row.get('volume_ratio_score'))}/17.5 + 整理 {_fmt_cell(row.get('consolidation_score'))}/7.5（默认权重）")
+    if row.get("early_start"):
+        lines.append("标签: 突破前两日提前启动")
+    if row.get("resistance_drop_trigger"):
+        lines.append("标签: 滚动阻力下降触发")
+    lines.append(f"相对强度(pp): 市场 {_fmt_cell(row.get('market_relative_strength'))} | 行业 {_fmt_cell(row.get('industry_relative_strength'))} | 排序调整 {_fmt_cell(row.get('relative_strength_adjustment'))}")
     lines.append("策略口径: 技术突破 + 基本面防雷 + 近期经营核验；评分为规则分，不代表成功概率")
     if row.get("operating_summary"):
         lines.append(f"近期经营: {row['operating_summary']}")
@@ -911,7 +1129,8 @@ def _breakout_brief_lines(row: dict, lvl: str) -> list[str]:
         invalidation = "跌回突破关键位下方视为假突破离场"
 
     conviction = {"A": "高", "B": "中", "C": "中低", "D": "低（观察）"}.get(grade, "中")
-    why_today = f"今日放量突破 {lvl}" + (f"，涨幅 {margin:.2f}%" if margin is not None else "")
+    category = {"held_confirmed": "已站稳确认", "retest_confirmed": "回踩确认"}.get(row.get("breakout_category"), "放量突破")
+    why_today = f"今日{category} {lvl}" + (f"，距固定阻力 {margin:.2f}%" if margin is not None else "")
 
     return [
         f"**信心:** {conviction}",
@@ -920,6 +1139,20 @@ def _breakout_brief_lines(row: dict, lvl: str) -> list[str]:
         f"**风险:** {'；'.join(bear)}",
         f"**失效:** {invalidation}",
     ]
+
+
+def log_breakout_pending(rows, log=logger):
+    counts = {}
+    for row in rows:
+        for tag in str(row.get("missing_tags") or "").split(","):
+            if tag:
+                counts[tag] = counts.get(tag, 0) + 1
+    log.info("[PENDING] 待核验 %d 只 | 缺项统计 %s", len(rows), counts)
+    for row in rows:
+        log.info("[PENDING] %s(%s) 分数=%s 事件=%s 确认=%s 类别=%s 基本面=%s 周线=%s 近期经营=%s 缺项=%s",
+            row.get("name"), row.get("code"), row.get("score"), row.get("breakout_event_date"),
+            row.get("breakout_confirmation_date"), row.get("breakout_category"), row.get("fund_status"),
+            row.get("weekly_status"), row.get("operating_status"), row.get("missing_tags"))
 
 
 def main_breakout(
@@ -963,10 +1196,14 @@ def main_breakout(
         if market_crash_halt(index, config) is not None:
             logger.warning("指数急跌触发市场熔断，突破策略暂停推荐")
             return None
+        if pending_out is None:
+            pending_out = []
         if config.RECOMMENDATION_MODE == "quality_value":
-            return _screen_quality_pool(config, cache, market_env, latest,
+            result = _screen_quality_pool(config, cache, market_env, latest,
                                          pending_out, evaluator=evaluate_breakout,
                                          index_df=index, volatile_out=volatile_out)
+            log_breakout_pending(pending_out)
+            return result
 
         regime_raw = market_env.get("regime", "unknown")
         regime_eff = _effective_regime(regime_raw, config)
@@ -993,6 +1230,9 @@ def main_breakout(
             return None
         logger.info("待筛选股票数: %d", len(stock_list))
 
+        strength_enabled = config.USE_BREAKOUT_RELATIVE_STRENGTH
+        industry_map = get_stock_industry(config, cache) if (config.USE_INDUSTRY_DEDUP or strength_enabled) else {}
+        strength_samples = []
         fetch_stats["bs_ok"] = fetch_stats["ak_ok"] = fetch_stats["fail"] = 0
         signals: list[dict] = []
         total = len(stock_list)
@@ -1014,9 +1254,11 @@ def main_breakout(
                 daily_df = get_daily_data(code, config, cache)
                 if daily_df is None:
                     return None, "FAIL_DATA"
+                if strength_enabled and latest:
+                    strength_samples.append((str(code), breakout_period_return(daily_df, latest, config.BREAKOUT_RS_LOOKBACK)))
                 fund_data = get_fundamentals(code, cache, config)
                 return evaluate_breakout(daily_df, code, name, config, market_env, fund_data,
-                                         volatile_out=volatile_out, latest_trade_date=latest)
+                                         volatile_out=volatile_out, latest_trade_date=latest, index_df=index)
             except Exception as e:
                 logger.debug("%s(%s) 筛选异常: %s", name, code, e)
                 return None, "ERROR"
@@ -1112,15 +1354,27 @@ def main_breakout(
                             "无通过信号，主要拦截层为「%s」%d 只", _layer, _upstream[_layer])
 
         if not signals:
+            log_breakout_pending(pending_out)
             logger.info("未发现符合条件的放量突破信号")
             return None
 
-        # 确定性排序
-        df = pd.DataFrame(signals).sort_values(SORT_BY, ascending=SORT_ASC).reset_index(drop=True)
+        snapshot = build_breakout_industry_snapshot(strength_samples, industry_map)
+        periods = dict(strength_samples)
+        for row in signals:
+            period = periods.get(str(row["code"]))
+            if strength_enabled and period is not None:
+                start, end, ret = period
+                peers = snapshot.get((industry_map.get(str(row["code"])), start, end), {})
+                returns = [value for peer, value in peers.items() if peer != str(row["code"])]
+                if len(returns) >= config.BREAKOUT_INDUSTRY_MIN_PEERS:
+                    row["industry_relative_strength"] = float(ret - np.median(returns))
+                row["relative_strength_adjustment"] = breakout_strength_adjustment(row.get("market_relative_strength"), row.get("industry_relative_strength"), config)
+            row["ranking_score"] = row["score"] + row.get("relative_strength_adjustment", 0)
+        # 确定性排序：资格规则分保持原值，相对强度仅提供有界排序调整。
+        df = pd.DataFrame(signals).sort_values(["ranking_score", *SORT_BY], ascending=[False, *SORT_ASC]).reset_index(drop=True)
 
         # 候选只有完成终审才能升级 formal；缺项不占名额，继续向后补足。
         weekly_enabled = config.REQUIRE_WEEKLY_TREND or config.REQUIRE_WEEKLY_MACD_STABLE
-        industry_map = get_stock_industry(config, cache) if config.USE_INDUSTRY_DEDUP else {}
         industry_used: dict[str, int] = {}
         confirmed = []
         for _, candidate in df.iterrows():
@@ -1135,6 +1389,25 @@ def main_breakout(
             fund = enrich_recent_operating(code, fund, config, cache, as_of=str(row.get("date") or latest))
             from src.recent_operating import validated_operating_status, summarize_operating
             from src.bottom_fishing_strategy import _is_financial_stock
+            financial = _is_financial_stock(code, str(row["name"]), config)
+            risk_status = "not_required"
+            if config.REQUIRE_FINANCIAL_RISK:
+                if financial:
+                    risk_status = "missing"
+                    missing.append("financial_review")
+                else:
+                    fund = enrich_financial_risk(code, fund, config, cache, as_of=str(row.get("date") or latest))
+                    from src.financial_risk import validated_financial_risk_status
+                    risk_status = validated_financial_risk_status(fund.get("financial_risk"), code, row["date"])
+                    if risk_status == "failed":
+                        logger.info("%s 终审财务风险不达标，取消推荐", code)
+                        continue
+                    if risk_status != "verified":
+                        missing.append("financial_risk")
+                    else:
+                        fund.update({key: fund["financial_risk"]["metrics"].get(key) for key in (
+                            "debt_ratio", "goodwill_ratio", "deducted_profit_ratio")})
+            row["financial_risk_status"] = risk_status
             op_status = "not_required"
             if config.REQUIRE_RECENT_OPERATING:
                 if _is_financial_stock(code, str(row["name"]), config):
@@ -1153,7 +1426,9 @@ def main_breakout(
                 continue
             row["fund_status"], fund_tags = _fund_verify_state(fund)
             missing.extend(fund_tags)
-            verified = row["fund_status"] == "verified" and latest is not None and op_status in {"verified", "not_required"}
+            verified = (row["fund_status"] == "verified" and latest is not None
+                        and op_status in {"verified", "not_required"}
+                        and risk_status in {"verified", "not_required"})
             row["weekly_status"] = "disabled"
             if weekly_enabled:
                 wk = _fetch_weekly_dual(code, config)
@@ -1197,7 +1472,7 @@ def main_breakout(
                 if pending_out is not None:
                     pending_out.append(row)
                 continue
-            industry = industry_map.get(code, "") or ""
+            industry = (industry_map.get(code, "") or "") if config.USE_INDUSTRY_DEDUP else ""
             if industry and industry_used.get(industry, 0) >= config.MAX_PICKS_PER_INDUSTRY:
                 continue
             if industry:
@@ -1205,6 +1480,7 @@ def main_breakout(
             row["tier"] = "formal"
             confirmed.append(row)
         df = pd.DataFrame(confirmed).reset_index(drop=True) if confirmed else df.iloc[0:0]
+        log_breakout_pending(pending_out)
         logger.info("筛选完成，最终推荐 %d 只放量突破股票", len(df))
         return df
 

@@ -64,6 +64,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="跳过 MySQL 落库（仅飞书通知）")
     parser.add_argument("--no-notify", action="store_true",
                         help="跳过飞书通知（仅落库）")
+    parser.add_argument("--recommendation-mode", choices=("technical", "quality_value"), default="technical",
+                        help="荐股模式：默认独立技术突破，也支持显式 quality_value")
     return parser.parse_args(argv)
 
 
@@ -84,14 +86,8 @@ def run(argv: list[str] | None = None):
     logger.info("放量突破选股任务启动")
 
     config = VolumeBreakoutConfig()
-    # ===== 突破策略＝独立的第二信号源（#1）=====
-    # 优质低估低位入口（run.py）跑 quality_value（优质低估低位）。若突破入口也用 quality_value，
-    # evaluate_breakout 会委派同一个 evaluate_quality_value 资格判定，两套策略产出完全相同，
-    # 再经下方组合层去重后突破卡片恒为空——等于花双份成本拿一份结果。
-    # 这里强制 technical 模式，让突破走自己独立的「七层漏斗」（突破/量能/形态/平台/趋势/
-    # 假突破/RSI/动能/波动率/评分 + 决赛圈周线确认 + 熊市空仓），成为真正独立的信号源；
-    # 与优质低估低位的重叠由下方 fetch_rec_codes_for_date 去重、合计上限由 DAILY_TOTAL_MAX_PICKS 约束。
-    config.RECOMMENDATION_MODE = "technical"
+    # 默认独立技术突破；命令行可显式选择 quality_value 委派路径。
+    config.RECOMMENDATION_MODE = args.recommendation_mode
     if args.no_cache:
         config.USE_CACHE = False
         logger.info("已启用 --no-cache：跳过 cache/ 磁盘缓存读写，本次全部从数据源拉取")
@@ -128,8 +124,8 @@ def run(argv: list[str] | None = None):
         pending_rows: list[dict] = []
         output_df = main_breakout(config=config, cache=cache, volatile_out=volatile_rows,
                                   pending_out=pending_rows)
-        logger.info("Step 2/4 完成 (%.1f 分钟)，推荐 %d 只，波动率超限观察 %d 只", (time.time() - t) / 60,
-                    0 if output_df is None else len(output_df), len(volatile_rows))
+        logger.info("Step 2/4 完成 (%.1f 分钟)，推荐 %d 只，波动率超限观察 %d 只，待核验 %d 只", (time.time() - t) / 60,
+                    0 if output_df is None else len(output_df), len(volatile_rows), len(pending_rows))
 
         # 组合层：同一交易日已被其他策略推荐的个股不再重复推荐（同股去重），
         # 且两策略合计推荐数不超过 DAILY_TOTAL_MAX_PICKS（依赖运行顺序：后运行者去重）。

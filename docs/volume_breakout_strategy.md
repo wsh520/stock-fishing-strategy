@@ -1,4 +1,89 @@
-## 放量突破选股策略（Volume Breakout）设计
+# 放量突破选股策略（Volume Breakout）
+
+`VolumeBreakoutConfig.RECOMMENDATION_MODE="technical"` 和 `run_breakout.py` 默认使用独立突破资格。质量入口仍为 `quality_value`，两者共用行情、市场环境、近期经营与财务risk，不能把突破描述成三年质量认证。以下是当前荐股规则；交易计划与独立回测段落保留既有算法说明，本次不修改其算法、不声称实盘或收益改善。
+
+## 当前七层漏斗
+
+| 层 | 证据与处理 |
+|---|---|
+| 1 基本面 | 初筛继承 `check_fundamentals`；已知硬伤否决。初筛缺失不能视作已核验，信号初始pending；终审补齐财务并验证多维经营和独立risk，金融专项pending |
+| 2 行情 | ≥60根有效日线、近20日日均成交额≥3000万、合法且有限OHLCV/成交额/涨幅、有效交易状态；相邻bar自然日缺口>12天否决。独立日历确认应完成日，再核验指数和个股日期 |
+| 3 突破 | 默认只认L1近60日高点/L2近20日高点；超越≥0.5%，前后使用同一阻力锚点。量比1.8～4、当日成交额≥1亿、60日量能分位≥80%、成交额≥前20日中位数1.5倍；阳线实体占比≥0.5、收盘/最高≥0.97、涨幅2%～7%、跳空≤2% |
+| 3 整理/趋势 | 平台20日振幅≤18%、收盘std/mean≤4%，右端shift(3)避开突破污染；MA20斜率≥0、MA60斜率≥−1%、收盘站上MA20容忍2%；近期假突破否决；首日前一日RSI≤80，启用MACD/KDJ下限闸门 |
+| 4 ATR | `MAX_ATR_PCT_BREAKOUT=4`%，超限 `FAIL_VOLATILE`，缺失 `FAIL_DATA`；质量入口共享上限6%，不使用旧3.33/10作为当前比较值 |
+| 5 规则分 | 突破35+量能25+平台15+趋势15+动能10，总规则分限制在0～100。等级与准入仍用原规则分，B≥60，熊市提升15；子分与RS有界 |
+| 6 终审 | 多维近期经营、同报告期真实公告财务risk、财务补齐与周线条件全部核验，缺项/走弱pending、失败否决；不以初筛PASS替代formal |
+| 7 排序 | `ranking_score`（原规则分+有界RS）降序→突破级别降序→20日均成交额降序→代码升序；牛5、中性3、熊0。行业分散及组合层去重/每日总量上限继续生效 |
+
+行情缓存使用CSV旁meta（版本、带时区取数时间、盘中/闭市阶段、末bar日期），mtime/touch不是时效证明。闭市不能复用盘中取得缓存。独立覆盖当日的交易日历给出北京时间应完成交易日，不能由index自身末日期证明index时效；日历或行情不明不能当已核验。
+
+## 首日、站稳与回踩
+
+阻力为事件日前L1/L2（L3默认关闭）。默认 `ALLOW_RESISTANCE_DROP_BREAKOUT=False`，阻力滚动下降不能被当成新突破；判断穿越时前后收盘使用同一锚点。
+
+| 分类 | 证据 |
+|---|---|
+| `first_breakout` | 首日通过完整量能、形态、趋势、动能、ATR和准入闸门，记录原事件日期与阻力锚点 |
+| `held_confirmed` | 在最近5日原事件基础上，之后连续2日收盘超过同一锚点0.5% |
+| `retest_confirmed` | 在最近5日原事件基础上，确认日最低价触及锚点上方2%范围，收盘重新超过锚点0.5% |
+
+确认只用事件之后已完成的行情；原事件须截断到事件日重新核验完整原闸门。任何随后收盘跌破原锚点都取消确认，不能换成后来较低阻力。确认日还检查有效行情、交易状态、当前趋势、近期假突破、跳空、MACD/KDJ、当日涨幅与ATR；距锚点超过7%不确认。原事件日期、确认日期、固定锚点分别保留。确认分类通过不等于正式推荐，仍须财务与周线终审。
+
+## 评分与有界RS
+
+突破35分由 `0.55×级别系数+0.45×幅度质量` 构成，L1/L2/L3系数为1/0.75/0.5。幅度质量在1%～3%最佳区间取峰，过大逐步下降，到7%归零，避免单调奖励追高。量能25分拆成放量比子分17.5与整理子分7.5；平台15、趋势15、动能10均按有界质量计算，总分限制0～100。缺证据不能产生无限或负向失控子分。
+
+默认 `USE_BREAKOUT_RELATIVE_STRENGTH=True`，近20日同起止日期计算个股相对市场/行业的涨跌幅差，行业参照至少3个样本。`BREAKOUT_RS_MAX_ADJUSTMENT=3`、`BREAKOUT_RS_FULL_SCALE=10` 将排序调整限制在±3，缺市场/行业证据保持可用维度或中性，不设RS硬准入线。RS只改变 `ranking_score`，不反写规则分、等级或闸门。
+
+MACD否决为柱值/收盘≤−0.5%且连续2日恶化；KDJ为K>85或K≥80且K<D。历史首次突破样本中MACD未触发的诊断，不可扩展成当前全部路径结构性不可达：新增确认日仍重新核验两项。
+
+## 周线AND与财务终审
+
+突破默认 `WEEKLY_MA_BOTH_REQUIRED=True`：收盘站上周线MA10（容忍2%）**且**MA10上行；另按启用开关要求周线MACD柱翻红或绿柱连续2周收窄。只用已收盘周bar，数据缺失/滞后pending。低位technical对照可用MA OR，不能继承其说明来描述突破默认。
+
+近期经营使用最新真实公告报告的收入、合并净利、扣非、经营现金流、毛利率及净利率同期比较。单项下降容忍3%，现金流下降容忍3%且现金转换≥0.8；收入/合并净利/现金流三项同降仍failed。单季/TTM只辅助、不填核心缺失。独立财务risk要求同报告期/真实公告日/来源/合并人民币口径，负债率≤70%、商誉/净资产≤20%、扣非/合并净利≥0.5；缺商誉不能填零。金融专项pending。
+
+详见[荐股调整说明](quality_value_recommendations.md)与[近期经营契约](recent_operating_contract.md)。年度质量真实公告优先、摘要fallback假定必须带标签的规则属于质量入口；不能将假定公告日用在突破近期经营或risk核验。
+
+## 结果与持久化边界
+
+`BreakoutSignal` 携带突破分类、锚点/事件/确认日期、子分、市场/行业RS和排序分。只有formal进入正式通知与推荐落库。MySQL仍用固定列白名单，新增字段目前并未全部持久化；结果对象有字段不等于数据库有完整审计证据。
+
+突破入口复用推荐表和周度追踪链路，`strategy='volume_breakout'`，唯一键 `(rec_date,code,strategy)`；后运行入口按当日已荐股做组合去重与 `DAILY_TOTAL_MAX_PICKS=7` 合计上限。
+
+## 参数速查（本次默认）
+
+| 字段 | 默认 | 作用 |
+|---|---|---|
+| RECOMMENDATION_MODE | technical | 独立突破入口 |
+| WEEKLY_MA_BOTH_REQUIRED | True | 周线MA站上且上行 |
+| REQUIRE_L1_OR_L2 | True | 关闭L3 |
+| ALLOW_RESISTANCE_DROP_BREAKOUT | False | 禁止阻力回落伪突破 |
+| RECENT_BREAKOUT_DAYS | 5 | 原事件确认回看 |
+| BREAKOUT_HOLD_DAYS | 2 | 站稳确认日数 |
+| RETEST_TOLERANCE | 0.02 | 回踩接近锚点范围 |
+| CONFIRM_MAX_EXTENSION_PCT | 7 | 确认日距原锚点上限（%） |
+| BREAKOUT_MARGIN_OPTIMAL_LOW / HIGH | 1 / 3 | 幅度评分最佳区间（%） |
+| BREAKOUT_MARGIN_SCORE_ZERO | 7 | 大幅追高幅度分归零（%） |
+| BREAKOUT_RS_LOOKBACK | 20 | RS回看交易日 |
+| BREAKOUT_RS_MAX_ADJUSTMENT | 3 | RS排序影响绝对上限 |
+| BREAKOUT_RS_FULL_SCALE | 10 | RS满幅映射百分点 |
+| BREAKOUT_INDUSTRY_MIN_PEERS | 3 | 行业参照最低样本 |
+| MAX_ATR_PCT_BREAKOUT | 4 | ATR上限（%） |
+| REQUIRE_FINANCIAL_RISK / REQUIRE_RECENT_OPERATING | True / True | 独立财务risk和多维经营终审 |
+
+## 离线回归
+
+```shell
+python -B -m unittest discover -s tests -p test_recommendation_evidence_upgrades.py -v
+python -B -m unittest discover -s tests -p test_financial_evidence_upgrades.py -v
+python -B -m unittest discover -s tests -p test_breakout_verification_offline.py -v
+python -B -m unittest discover -s tests -p test_strategy_revision.py -v
+python -B test_momentum_gates.py
+python -B test_breakout_ab.py
+```
+
+合成数据/mock验证规则边界与接线，不发通知、不落库；最终通过数量以实际完成日志为准，不证明收益改善。下列既有独立回测不经过 `main_breakout` 财务/周线终审，初筛pending不会自动提升formal，因此不能视为已完整验证本次荐股证据链。
 
 ### 独立回测
 
@@ -20,179 +105,6 @@
 
 输出 JSON 包含 `summary`（最终权益、收益率、交易数、胜率等）和 `trades`（每笔交易的入场/出场日期、价格、盈亏及退出原因）。止盈止损使用策略配置中的固定比例；买入和卖出分别计手续费与印花税，并按滑点基点调整成交价。单根 K 线同时触及止盈和止损时采用止损优先的保守假设。仍持仓的头寸按最后收盘价计入最终权益，并在 `open_positions` 中单独列出。
 
-本策略与 `bottom_fishing_strategy.py`（抄底）并列，作为项目的第二支日线选股信号。整体骨架、数据层、基本面防雷、市场环境、决赛圈周线确认、漏斗日志、`--no-cache`、时间预算、看门狗、`Signal` 数据结构全部沿用现有实现，只替换「日线信号 + 评估」层。
-
-设计目标：在**牛市/中性市**捕捉「横盘整理末端 → 放量突破关键阻力位」的趋势启动点；在**熊市**大幅收缩或直接空仓，避免"突破即诱多"。
-
----
-
-### 一、策略定位与低位企稳口径（bottom_fishing 的 technical 模式）的差异
-
-> 名称为准：`bottom_fishing_strategy.py` 的生产默认口径是 **quality_value（优质低估低位）**，不是技术抄底；下表的阈值对照针对的是该模块的 **technical 对照口径（对外称「低位企稳」）**，即真正的技术抄底逻辑。
-
-| 维度 | bottom_fishing（低位企稳 / technical） | volume_breakout（放量突破） |
-| --- | --- | --- |
-| 入场时机 | 下跌末端、底背离、超卖反弹 | 整理末端、放量突破关键位 |
-| 位置偏好 | 近 20 日区间下半部（低位） | 近 60 日新高附近（相对高位） |
-| 量能要求 | 温和放量（1.0–2.5 倍最佳） | 明显放量（1.8–4.0 倍，历史分位数及成交额比率达标） |
-| 趋势背景 | MA20 不下行即可 | MA20 上行、MA60 走平或多头 |
-| 止损设置 | 2×ATR（较宽，容忍底部震荡） | 突破位下方 1×ATR（较紧，破位即撤） |
-| 止盈设置 | 固定 +10% | 固定 +15%（趋势延续目标更大） |
-| 熊市行为 | BEAR_MAX_PICKS=2 收缩 | BEAR_MAX_PICKS=0 直接空仓 |
-| 最大波动率 | ATR ≤ 3.33% 现价 | ATR ≤ 4.0% 现价（突破股波动天然更大） |
-
-**核心分歧点**：抄底买"位置低"，突破买"动能强"。抄底允许 MA20 微跌，突破必须 MA20 上行；抄底容忍 RSI 到 65，突破检查突破前一日 RSI ≤ 80（突破日本身就会推高 RSI）；抄底怕"追高"，突破本身就是追高——但用「近期无假突破 + 平台整理充分 + 上影线短」来过滤真正的追高陷阱。
-
----
-
-### 二、七层过滤漏斗
-
-沿用 `evaluate()` 的原因码风格，每层单独归因，日志漏斗可看到各层淘汰量。
-
-#### 层 1｜基本面防雷（继承）
-直接调用 `check_fundamentals(fund_data, config, code, name)`。ROE 年化 ≥ 5%、非金融负债率 ≤ 70%、金融负债率 ≤ 97%、商誉/净资产 ≤ 20%、扣非净利/净利 ≥ 0.5。数据缺失放行不误杀。失败码 `FAIL_FUND`。
-
-#### 层 2｜流动性 & 数据完整性（继承）
-- 近 20 日日均成交额 ≥ `MIN_AMOUNT`（3000 万，与抄底策略同一常量；原 500 万对主板几乎无筛选力），僵尸股淘汰，失败码 `FAIL_LIQUIDITY`
-- K 线数不足 `MIN_DAYS=60` 直接 `FAIL_DATA`
-- 停牌缺口 `FAIL_HALT_GAP`（相邻 bar 自然日间隔 > `MAX_BAR_GAP_DAYS=12`）：突破位（60/20 日最高价）、平台振幅、量比窗口都会跨缺口取值，判定失去意义
-
-#### 层 3｜日线技术面（本策略核心）
-
-**3.1 关键阻力位识别**
-
-对每只股票动态计算三级阻力位（不含当日）：
-
-- **L1** = 近 `BREAKOUT_LOOKBACK_HIGH=60` 日最高价 — 长期新高突破，最强信号
-- **L2** = 近 `BREAKOUT_LOOKBACK_PLATFORM=20` 日最高价 — 平台突破，中等信号
-- **L3** = MA60 均线 — 长期均线突破，最弱信号（用于低位整理后的均线站上）
-
-要求：`close > Lk × (1 + BREAKOUT_MIN_MARGIN=0.005)` 至少对某个 k ∈ {1,2,3} 成立，且 `Lk` 有效（前 N 日数据齐全）。突破级别越高得分越高（L1>L2>L3）。失败码 `FAIL_NO_BREAKOUT`。
-
-**3.2 放量确认**
-
-- 量比 `daily_vol_ratio` ≥ `VOLUME_BREAKOUT_MIN=1.8`（放量下限）
-- 量比 ≤ `VOLUME_BREAKOUT_MAX=4.0`（防天量出货）
-- 突破日成交额 ≥ `MIN_BREAKOUT_AMOUNT=1e8`（1 亿，大资金介入门槛；与 MIN_AMOUNT 独立，MIN_AMOUNT 是 20 日均值）
-
-失败码 `FAIL_VOL_INSUFFICIENT`（放量不足）/ `FAIL_CLIMAX_VOL`（天量）。
-
-**3.3 K 线形态过滤（防假突破）**
-
-- **阳线实体占比**：`(close − open) / (high − low)` ≥ `MIN_BODY_RATIO=0.5`（避免长上影假突破）
-- **收盘接近最高**：`close / high` ≥ `MIN_CLOSE_TO_HIGH=0.97`（避免尾盘跳水）
-- **当日涨幅下限**：`pct_chg` ≥ `MIN_BREAKOUT_PCT=2.0`%（有效突破幅度）
-- **当日涨幅上限**：`pct_chg` ≤ `MAX_BREAKOUT_PCT=7.0`%（涨停/接近涨停买不进，且次日易回调）
-- **跳空高开上限**：`open / prev_close − 1` ≤ `MAX_GAP_UP_PCT=2.0`%（大幅跳空追买风险大，沿用抄底策略阈值）
-
-失败码 `FAIL_FAKE_BREAKOUT`（上影长/尾盘跳水）/ `FAIL_CHASE`（追高）/ `FAIL_GAP`（跳空）。
-
-**3.4 突破前平台整理确认**
-
-要求突破发生前有可辨识的横盘整理，避免"单边上涨末端的最后一冲"被误判为突破：
-
-- 近 `PLATFORM_LOOKBACK=20` 日振幅 `(max_high − min_low) / min_low` ≤ `MAX_PLATFORM_RANGE=0.18`（18%）
-- **平台期收盘价离散度**：`std(close) / mean(close)` ≤ `MAX_PLATFORM_TIGHTNESS=0.04`（4%），窗口右端点固定在 `shift(PLATFORM_SHIFT=3)` 处，确保度量的是「突破发生前」的整理质量而非突破后的波动
-
-> 设计变更记录：初版用「短期 ATR / 长期 ATR ≤ 1.0」做波动率压缩门槛，合成数据测试发现突破本身会抬高 ATR，多日突破行情下该比值恒 >1，正常突破被误杀。改为 platform_tightness（std/mean），窗口右端点 shift(3) 避开突破 bar 污染。`atr_compression` 字段保留供诊断展示，不再参与否决。
-
-失败码 `FAIL_NO_PLATFORM`（振幅过大）/ `FAIL_PLATFORM_LOOSE`（离散度过大）。
-
-**3.5 趋势背景**
-
-- MA20 上行：`ma20 / ma20.shift(MA20_TREND_LOOKBACK=5) − 1` ≥ `MA20_TREND_MIN_SLOPE_BREAKOUT=0.0`（突破策略比抄底严格，抄底是 −0.04）
-- MA60 走平或上行：`ma60_slope` ≥ `MA60_TREND_MIN_SLOPE=-0.01`
-- 现价站上 MA20：`close ≥ ma20 × 0.98`（容忍 2%）
-
-失败码 `FAIL_TREND_DOWN`。
-
-**3.6 近期假突破过滤**
-
-近 `FAILED_BREAKOUT_LOOKBACK=10` 日内，若曾出现"收盘突破 L1 后 1～3 个交易日内跌回突破日 L1 下方"，则本次突破视为重复诱多，直接否决。失败码 `FAIL_RECENT_FAILED_BREAKOUT`。
-
-**3.7 RSI 上限（检查突破前一日）**
-
-`rsi14.shift(1)` ≤ `DAILY_RSI_ENTRY_MAX_BREAKOUT=80`。检查的是**突破前一日**的 RSI，而非突破日：
-
-- 突破日单日大涨会把 RSI14 从 ~50 推到 80+（极度窄幅整理后甚至到 95+），这是突破信号的预期行为，不应拦截
-- 若突破前 RSI 已 >80，说明股票已连涨多日、突破偏晚（追高风险），否决
-- 若突破前 RSI 正常、仅因突破日单日大涨而飙高，放行
-
-> 设计变更记录：初版检查突破日 RSI ≤ 75，合成数据测试发现极度窄幅整理后单日突破会把 RSI 推到 98，合法 L1 突破（评分 85.5 A级）被误杀。改为检查 shift(1) 并放宽到 80。
-
-失败码 `FAIL_RSI_HIGH`。
-
-**3.8 KDJ / MACD 下限否决（荐股控制）**
-
-失败码 `FAIL_MACD_WEAK` / `FAIL_KDJ_HIGH`，由 `REQUIRE_BR_MACD_NOT_WEAK`（默认开）与 `REQUIRE_BR_KDJ_NOT_HIGH`（默认开）控制。
-
-改动的动机：这两个指标此前**只是层 5 里的评分项**（`W_MOMENTUM_BR=10`，占满分 10%）。丢掉全部分档仍可守住 B 级 60 分准入线，因此它们对「推荐与否」没有任何约束力——这是本策略唯一的控制漏洞。
-
-闸门只拦两种形态，**刻意不要求金叉**：
-
-- `FAIL_MACD_WEAK`：**深度弱势 AND 仍在恶化**（双条件，见 `macd_not_deeply_weak`）
-  - 深度弱势：`柱值 / 收盘价 × 100 ≤ MACD_WEAK_HIST_PCT`（默认 −0.5%）
-  - 仍在恶化：末 `MACD_WEAK_DAYS+1`（默认 3）根柱值严格递减
-- `FAIL_KDJ_HIGH`（见 `kdj_not_overheated`）：
-  - `K > KDJ_K_HARD_MAX`（默认 85），或
-  - `K < D` 且 `K ≥ KDJ_DEAD_CROSS_K`（默认 80）
-
-**为什么不是「柱值递减就否决」**：MACD 柱度量的是**加速度**而非趋势，匀速上行的柱值必然向 0 收敛递减。实测标准「长期下跌 → 稳步回升」形态柱值为 `[+0.0088, +0.0082, +0.0076]`——递减但完全健康。单用递减条件会把整类健康形态判为走弱。加上「深度弱势」这一合取项后，正柱与小负柱都不再触发。
-
-**为什么死叉阈值必须贴近 K 上限**：匀速上行时 9 日 RSV 稳定在 ~0.72，K 与 D 在 70 附近交替领先（实测 K=71.222 / D=71.268，差 0.05）。阈值若设在中位（如 60），「K<D」会在约半数交易日成立，造成大面积误杀。
-
-**为什么放层 3.7 之后、层 4 之前**：归因上属「日线技术入场质量」，与 `FAIL_RSI_HIGH` 同层可比；同时不与层 4 观察池语义冲突（观察池要求各层已过、仅 ATR 超限）。
-
-> **实测结论：`FAIL_MACD_WEAK` 在本策略中结构性不可达。**
-> `brk_l2 = above_l2 & ~above_l2.shift(1)` —— 只认**首次**站上阻力位那天；该日 close 必须 > 前 20 日最高 ×1.005 且涨幅 ≥ `MIN_BREAKOUT_PCT`，这个上跳必然使 `ΔDIF > 0`；而柱值下降的条件是 `ΔDIF_t < hist_{t−1}/4`，横盘阶段 `hist_{t−1} ≤ 0`，不等式永不成立（参数扫描 36 个形态命中 0）。
-> 因此本策略的**实际新增控制力来自 KDJ 高位闸门**（可触发区间实测 K=85~86），MACD 侧保留为「突破口径被放宽（例如关闭 `REQUIRE_L1_OR_L2`、允许非首次突破）时的保险丝」。该结论已固化为 `test_momentum_gates.py` 的扫描断言：一旦口径放宽导致命中，测试会失败并提示复核。
-
-阈值定义在 `StrategyConfig`（`MACD_WEAK_DAYS` / `MACD_WEAK_HIST_PCT` / `KDJ_K_HARD_MAX` / `KDJ_DEAD_CROSS_K`），与 quality_value 模式共用，避免两处阈值漂移。
-
-**实证复核（本地缓存 798 只面板，2025-12-24 ~ 2026-09-18，technical/bull）**：新 KDJ 闸门在真实数据上可触发，已捕获两例——
-`600025` 2026-07-20（K=89.01 / D=86.45）与 `600039` 2026-09-01（K=85.04 / D=75.39），均走 `K > KDJ_K_HARD_MAX(85)` 分支。
-`FAIL_MACD_WEAK` 在真实数据上同样 0 次命中，与上面的结构性推理一致。
-
-**验证工具与两个必须知道的前提**（命令见 README「突破策略闸门 A/B 与漏斗归因」）：
-
-1. 层 3.8 **只在 `RECOMMENDATION_MODE == "technical"` 时执行**。生产默认 `quality_value`（`run_breakout.py` 用的就是它）下，`evaluate_breakout` 会先委派 `evaluate_quality_value`，本层只影响「放量突破」标签，**不影响荐股资格**；要让 KDJ/MACD 真正管荐股，需开启 `QV_ENFORCE_KDJ_MACD_VETO` 或切 technical 模式。
-2. `src/volume_breakout_backtest.py` 目前**恒不成交**（既有缺陷）：它只收 `tier == "formal"` 的信号，但 `evaluate_breakout()` 在构造 `BreakoutSignal` 时就显式写死 `tier="pending"`；`formal` 提升发生在 `main_breakout()` 的决赛圈终审（市场日期、财务核心项、补齐后否决项、周线数据充分性/新鲜度与条件、行业名额全过才置 formal），而该独立回测直接调用 `evaluate_breakout`、不经过该路径。因此该回测在任何输入下都是 0 事件/0 成交。已固化为 `test_breakout_ab.py` 最后一节的断言；修复会改变行为，按「改产线口径前先 A/B」的约定未擅自修改。
-3. 用 `--funnel` 先看漏斗再谈闸门：实测 80 只 × 120 日共 9600 次评估中 `FAIL_NO_BREAKOUT` 占 94.75%、随后 `FAIL_VOL_INSUFFICIENT`（`daily_vol_ratio < 1.8`）与 `FAIL_LIQUIDITY` 是主要淘汰项，**PASS = 0**——即漏斗在评分定级之前就已闭合。此时 A/B 对照表全为 0，不能用来判断闸门有效性。
-
-#### 层 4｜波动率风控
-
-ATR / 现价 ≤ `MAX_ATR_PCT_BREAKOUT=4.0`%。突破股天然波动更大，比抄底 3.33% 略放宽。ATR 缺失放行。失败码 `FAIL_VOLATILE`。
-
-> 被本层否决的标的会写入 `volatile_out`（`evaluate_breakout(..., volatile_out=[...])` 可选参数）：逐只打印代码/名称/评分/等级/ATR% 与上限及倍数/风险档/RSI/量比/已通过的突破条件，**仅在 CI 日志留档**（`notify_screening_result` 仍接收 `volatile` 参数以兼容调用签名，但飞书卡片不再渲染观察池——通知只发通过全部筛选闸门的正式推荐）。不落库、不参与追踪。注意本层位于层 5 评分定级**之前**，故留档中的评分等级仅作参考；抄底策略的对应层在评分定级之后，含义略有不同。
-
-#### 层 5｜综合评分与等级
-
-评分维度（合计 100 分，`W_*` 与抄底风格对齐）：
-
-- **W_BREAKOUT=35**：`0.55 × 级别系数（L1=1.0 / L2=0.75 / L3=0.5）+ 0.45 × 幅度 smoothstep（0.5%–5% 从 0 到 1）`。初版为纯乘法 `级别 × 幅度`，L2/L3 的级别系数把幅度分压得极低（常规 1–2% 幅度下 L2 仅约 4 分），B 级 60 分准入下 L2/L3 事实上无法通过、等于只推 L1，信号稀疏；改为加法混合后 L2 常规突破约 18 分，配合其他维度可达成准入
-- **W_VOLUME=25**：`0.7 × 放量质量 + 0.3 × 整理质量`（加权加法，避免单维度归零拖垮整体）。放量质量 = 量比 smoothstep（1.8–2.5 上升到峰、2.5–4.0 平滑下降、>4 归零）；整理质量 = platform_tightness 反向 smoothstep（std/mean 越小分越高）。初版用乘法 `vol_quality × compression_quality`，合成数据测试发现多日突破行情下 compression_quality 恒为 0（突破本身抬高 ATR），导致 volume_br_score 整体归零，改为加权加法
-- **W_PATTERN=15**：平台振幅越小分越高（5%–18% 反向 smoothstep）
-- **W_TREND=15**：`0.5 × MA20 斜率 + 0.3 × MA60 斜率 + 0.2 × 多头排列（close > MA20 > MA60）`
-- **W_MOMENTUM=10**：MACD 金叉/柱体放大 + KDJ 未高位钝化（K ≤ 80）+ RSI 未在超买
-
-等级门槛 `MIN_PASS_GRADE="B"`（≥60 分）；熊市 `BEAR_GRADE_BOOST=15`（比抄底 10 更严，因为突破在熊市胜率显著更低）。
-
-#### 层 6｜决赛圈周线确认（继承）
-
-复用 `check_weekly_trend` + `check_weekly_macd`：
-- 收盘站上周线 MA10（容忍 2%）且 MA10 上行
-- 周线 MACD 柱翻红或绿柱连续 2 周收窄
-- `WEEKLY_REQUIRE_CLOSED_BAR=True` 剔除本周未收盘 bar，避免周内漂移
-
-#### 层 7｜排序截取
-
-`SORT_BY = ["score", "breakout_level", "avg_amount", "code"]`，`SORT_ASC = [False, False, False, True]`。突破级别作为次级键，评分并列时优先 L1（60 日新高）。截取前 `MAX_PICKS` 只：
-
-- 牛市 5 只
-- 中性市 3 只（`NEUTRAL_MAX_PICKS`）
-- 熊市 0 只（`BEAR_MAX_PICKS_BREAKOUT=0`，直接空仓）
-
----
 
 ### 三、交易计划
 
@@ -206,99 +118,3 @@ ATR / 现价 ≤ `MAX_ATR_PCT_BREAKOUT=4.0`%。突破股天然波动更大，比
 - **风险收益比**：`MIN_RR_RATIO_BREAKOUT` 检查已删除——止损 ≤6%/止盈 15% 下 RR ≥2.5 恒成立，检查永不触发；`rr_ratio` 仅作展示与落库，波动率风控由层 4 的 `MAX_ATR_PCT_BREAKOUT` 承担
 
 ---
-
-### 四、与现有基础设施的对接
-
-**复用的函数/常量**（直接 `from src.bottom_fishing_strategy import ...`）：
-
-- 数据层：`get_daily_data`、`get_index_daily`、`get_fundamentals`、`get_stock_list`、`_fetch_weekly_dual`
-- 市场环境：`get_market_environment`、`compute_market_environment`、`_effective_regime`
-- 基本面：`check_fundamentals`、`_is_financial_stock`
-- 周线确认：`check_weekly_trend`、`check_weekly_macd`、`_drop_incomplete_weekly_bar`
-- 缓存：`CacheManager`
-- Baostock 生命周期：`_bs_login`、`_bs_logout`、`_bs_state`
-- 统计：`fetch_stats`（Baostock/AkShare 兜底计数）
-
-**独立的部分**：
-
-- `VolumeBreakoutConfig`：继承 `StrategyConfig` 全部字段，新增/覆盖突破专用阈值
-- `compute_breakout_signals(df, config)`：核心信号计算，替代 `compute_daily_signals`
-- `evaluate_breakout(...)`：评估函数，替代 `evaluate`
-- `main_breakout(...)`：编排函数，替代 `main`
-- `BreakoutSignal` dataclass：与 `Signal` 字段兼容（保证 `save_recommendations` 直接可用），额外携带 `breakout_level`、`breakout_margin`、`platform_range` 用于排序与展示
-
-**MySQL 落库**：`run_breakout.py` 复用 `stock_recommendation` 表和周度追踪链路，落库时写入 `strategy='volume_breakout'`。唯一键已从 `(rec_date, code)` 升级为 `(rec_date, code, strategy)`（程序启动时幂等迁移，历史行 `strategy` 回填 `'bottom_fishing'`），因此同一股票同日可被抄底与突破分别推荐并存；`run_breakout.py` 在落库前额外调用 `fetch_rec_codes_for_date` 做组合层同股去重与 `DAILY_TOTAL_MAX_PICKS=7` 合计上限（依赖运行顺序，后运行者去重）。
-
----
-
-### 五、参数速查表（VolumeBreakoutConfig 新增/覆盖字段）
-
-| 字段 | 值 | 说明 |
-| --- | --- | --- |
-| BREAKOUT_LOOKBACK_HIGH | 60 | L1 长期新高回看窗口（交易日） |
-| BREAKOUT_LOOKBACK_PLATFORM | 20 | L2 平台突破回看窗口 |
-| BREAKOUT_MA_LONG | 60 | L3 长期均线周期 |
-| BREAKOUT_MIN_MARGIN | 0.005 | 突破关键位的最小超越幅度（0.5%） |
-| VOLUME_BREAKOUT_MIN | 1.8 | 突破日量比下限 |
-| VOLUME_BREAKOUT_PEAK | 2.5 | 量能评分峰值 |
-| VOLUME_BREAKOUT_MAX | 4.0 | 量能评分归零点（>4 视为过度放量） |
-| MIN_BREAKOUT_AMOUNT | 1e8 | 突破日成交额下限（元） |
-| MIN_BODY_RATIO | 0.5 | 阳线实体占全天振幅比例下限 |
-| MIN_CLOSE_TO_HIGH | 0.97 | 收盘/最高 下限（防尾盘跳水） |
-| MIN_BREAKOUT_PCT | 2.0 | 突破日最小涨幅（%） |
-| MAX_BREAKOUT_PCT | 7.0 | 突破日最大涨幅（%，防追高） |
-| PLATFORM_LOOKBACK | 20 | 平台整理判定窗口 |
-| PLATFORM_SHIFT | 3 | 平台度量右端点偏移（避开突破 bar 污染） |
-| MAX_PLATFORM_RANGE | 0.18 | 平台期最大振幅（18%） |
-| MAX_PLATFORM_TIGHTNESS | 0.04 | 平台期收盘价 std/mean 上限（4%） |
-| ATR_COMPRESSION_LOOKBACK_SHORT | 10 | 短期 ATR 均值窗口（仅诊断，不参与否决） |
-| ATR_COMPRESSION_LOOKBACK_LONG | 30 | 长期 ATR 均值窗口（仅诊断） |
-| ATR_COMPRESSION_RATIO | 1.5 | 短期/长期 ATR 上限（仅诊断，突破本身会抬高 ATR） |
-| MA20_TREND_MIN_SLOPE_BREAKOUT | 0.0 | MA20 斜率下限（突破比抄底严） |
-| MA60_TREND_MIN_SLOPE | -0.01 | MA60 斜率下限 |
-| MA60_TREND_LOOKBACK | 20 | MA60 独立趋势回看窗口 |
-| FAILED_BREAKOUT_LOOKBACK | 10 | 近期假突破回看窗口 |
-| FAILED_BREAKOUT_CONFIRM_DAYS | 3 | 突破后确认失败的交易日窗口 |
-| DAILY_RSI_ENTRY_MAX_BREAKOUT | 80.0 | RSI 入场上限（检查突破前一日 shift(1)，突破日 RSI 天然飙高不拦截） |
-| MAX_ATR_PCT_BREAKOUT | 4.0 | 波动率上限（%，比抄底 3.33 放宽） |
-| FIXED_STOP_LOSS_PCT_BREAKOUT | 6.0 | 固定止损（%，ATR 缺失时用） |
-| FIXED_TAKE_PROFIT_PCT_BREAKOUT | 15.0 | 固定止盈（%） |
-| ATR_STOP_MULT_BREAKOUT | 1.0 | 突破位下方 ATR 止损倍数 |
-| ATR_TAKE_PROFIT_MULT | 5.0 | ATR 止盈倍数（与固定 15% 目标取更近者） |
-| REQUIRE_L1_OR_L2 | True | 开启后仅认 L1/L2 突破，L3（MA60）不触发信号 |
-| KDJ_K_MAX_BREAKOUT | 80.0 | 动能组 KDJ K 值上限（比抄底 55 放宽） |
-| ADAPTIVE_VOLUME_LOOKBACK | 60 | 个股历史量能分位数窗口 |
-| MIN_VOLUME_PERCENTILE | 0.80 | 突破日最低历史量能分位数 |
-| MIN_AMOUNT_RATIO | 1.5 | 突破日成交额/前20日中位数最低比率 |
-| BEAR_MAX_PICKS_BREAKOUT | 0 | 熊市直接空仓 |
-| NEUTRAL_MAX_PICKS | 3 | 中性市推荐上限 |
-| BEAR_GRADE_BOOST_BREAKOUT | 15.0 | 熊市评分门槛提升（比抄底 10 严） |
-| W_BREAKOUT | 35.0 | 突破强度权重 |
-| W_VOLUME_BR | 25.0 | 量能质量权重 |
-| W_PATTERN | 15.0 | 平台整理权重 |
-| W_TREND_BR | 15.0 | 趋势背景权重 |
-| W_MOMENTUM_BR | 10.0 | 动能确认权重 |
-| REQUIRE_BR_MACD_NOT_WEAK | True | 层 3.8 开关：MACD 柱深度弱势且仍在恶化 → `FAIL_MACD_WEAK`（本策略中结构性不可达，见上） |
-| REQUIRE_BR_KDJ_NOT_HIGH | True | 层 3.8 开关：KDJ 已在区间顶部 → `FAIL_KDJ_HIGH`（本策略的实际新增控制力来源） |
-| MACD_WEAK_DAYS | 2 | 柱值连续递减天数（定义在 StrategyConfig，与 quality_value 共用） |
-| MACD_WEAK_HIST_PCT | −0.5 | 深度弱势阈值：柱值/收盘 × 100 的上限（%） |
-| KDJ_K_HARD_MAX | 85.0 | K 值硬上限（层 5 的评分软阈值为 `KDJ_K_MAX_BREAKOUT=80`，硬线特意更宽） |
-| KDJ_DEAD_CROSS_K | 80.0 | 高位死叉判定：K<D 且 K ≥ 该值 |
-
----
-
-### 六、验证方式
-
-1. **单元冒烟**：`python -c "from src.volume_breakout_strategy import main_breakout; print(main_breakout())"`（在缓存有效的交易日应能返回 DataFrame 或 None）
-2. **与抄底结果对比**：同一天跑 `run.py` 和 `run_breakout.py`，检查两个策略的推荐集是否有交集、交集股票的评分差异（交集股票往往是"底部放量突破"的双信号，值得重点关注）
-3. **历史回溯**（可选）：把 `_window_dates` 临时改为固定历史日期，跑 2024/2025 年几个典型突破行情日，人工核对推荐结果
-4. **漏斗日志**：观察 `FAIL_NO_BREAKOUT`、`FAIL_VOL_INSUFFICIENT`、`FAIL_NO_PLATFORM`、`FAIL_FAKE_BREAKOUT` 的淘汰占比，判断参数是否过严或过松
-
----
-
-### 七、已知局限
-
-- **L3（MA60 突破）** 在低位整理股上容易触发，但这类"突破"往往只是反弹，胜率显著低于 L1/L2。可通过 `W_BREAKOUT` 权重差异让 L3 评分自然偏低，也可用 `REQUIRE_L1_OR_L2=True` 开关直接关闭 L3。
-- **平台整理判定** 只看振幅和 ATR 压缩，不识别形态学（杯柄、双底、三角形收敛）。后续可引入 `scipy.signal.find_peaks` 做形态识别。
-- **突破日成交额下限 1 亿** 对小盘股偏严，`MAIN_BOARD_ONLY=True` 下大部分主板股能满足，但若开启创业板需下调或按流通市值自适应。
-- **熊市空仓（BEAR_MAX_PICKS_BREAKOUT=0）** 会错过熊市末期的"反转突破"，但那类信号本身胜率不高，用空仓规避是合理代价。若需捕捉反转，可加"熊市末端豁免"开关（指数 RSI < 30 且斜率拐头时恢复 1 只）。

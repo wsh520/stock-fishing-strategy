@@ -33,6 +33,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import socket
 import sys
 import threading
@@ -128,7 +129,7 @@ _QV_REASON_CODES = (
     "FAIL_HALT_GAP", "FAIL_MACD_WEAK", "FAIL_KDJ_HIGH", "ERROR",
     # 2026-10-07 新增：已止跌但涨离 250 日低点超过 QV_MAX_GAIN_FROM_250D_LOW，
     # 不再符合「低位」定位。必须登记，否则漏斗日志把它算进 ERROR、无法归因。
-    "FAIL_OVEREXTENDED",
+    "FAIL_OVEREXTENDED", "FAIL_HISTORICAL_VALUATION", "FAIL_FINANCIAL_RISK", "FAIL_CYCLICAL_VALUATION",
 )
 
 # ===========================================================================
@@ -137,7 +138,7 @@ _QV_REASON_CODES = (
 
 @dataclass
 class StrategyConfig:
-    # quality_value：质量/估值/中长期低位必选，技术仅排序；technical 保留旧策略作对照。
+    # quality_value：质量/估值/低位与企稳资格，持续技术状态参与准入和排序。
     RECOMMENDATION_MODE: str = "quality_value"
     QUALITY_YEARS: int = 3
     QUALITY_MEDIAN_ROE_MIN: float = 10.0
@@ -214,46 +215,11 @@ class StrategyConfig:
     CONSOLIDATION_DAYS_MIN: int = 30     # 开始加分的最低天数
     CONSOLIDATION_DAYS_MAX: int = 120    # 满分的天数上限
     CONSOLIDATION_BONUS: float = 5.0     # 最大加分值
-    # ===== 维度短板门槛（防止单维高分掩盖其他维度缺陷）=====
-    # 质量分低于此值 → FAIL_QUALITY_FLOOR 否决（差公司再便宜也不买）。
-    # 估值分可以很高（PE低），但如果质量不行就是价值陷阱。
-    # 只判已核验（verified）样本：质量数据缺失/部分缺失/金融专项待核验的候选
-    # 仍按分层约定降级 pending（缺失不误杀），不被本门槛否决。
-    # 评分锚点下 verified 样本质量分恒 ≥50，默认值即保底防线；上调（如 60）
-    # 可拦截「已核验但平庸」的候选。
-    MIN_QUALITY_SCORE: float = 50.0
-    # 技术分低于此值 → 降为 pending（底部未确认，观察但不正式推荐）。
-    # 不直接否决是因为基本面确实好的票值得跟踪，只是当前不是好的入场点。
-    #
-    # ===== 2026-10-07 由 45.0 下调至 40.0（方案 A：只放宽技术分，不动止跌闸门）=====
-    # 【为什么改】实测 8 个决策日 × 主板约 765 只的完整链路产出仅 **0.2 只/日**
-    #（6/8 天空仓），远低于主人「每天推荐两三只」的期望。逐层定位发现：
-    #     668 → 407（流动性+低位）→ 102（PE）→ 32（3年质量）→ 9.1（止跌确认）→ 0.2（formal）
-    # **没有任何 formal 候选是被低位/PE/财务层拦掉的**，全部卡在最后一步降级 pending，
-    # 其中 `technical_weak`（本门槛）是主因之一。
-    # 本次只下调技术分门槛这一处，**不改止跌层口径**（weak 层仍降级 pending），
-    # 因此「仍在下跌途中」的股票依旧不会被推荐。
-    #
-    # 【实测效果：45 → 40 只新增 2 条，均值 1.71 → 2.00 只/日】
-    #   门槛 45/42 → 1.71 只/日（0 空仓）；门槛 40/38/35 → 2.00 只/日；门槛 30 → 7.00 只/日（过松）。
-    #   45→40 新增的两只实测特征（确认为「仍在低位的合格票」而非随便放行）：
-    #       2026-05-08 600987技术分 40.0  分位 0.344  距低点 +6.2%  PE  9.8  止跌 medium
-    #       2026-05-29 601021 技术分 41.2  分位 0.222  距低点 +13.7% PE 18.3  止跌 strong
-    #     新增样本质量分均值 73.6、距低点涨幅最大 +13.7%（< 15% 高位保护上限），
-    #     止跌层为 medium/strong（**无一weak**），无一越过 V 值高位保护。
-    #
-    # 【为什么 40 是安全的位置】主板 399 只技术分分布高度离散：
-    #   0 分 131 只、30 分 94 只、70 分 99 只，**45 恰好落在两个密集区之间的空隙**
-    #   （44~46 仅 3 只）。下调到 40 只跨过 40/42 两个小档，
-    #   属于「档内细分」而非「跨过密集区」⇒ 产出温和增加（+0.29 只/日）而非暴涨。
-    #   若继续下调到 30，会一次性放行 94 只密集区的股票（产出跳到 7.00 只/日），
-    #   那才是真正的放宽 —— **30 是一致性红线，不要再往下调**。
-    #
-    # 【方向一致性】本项下调只放行「技术形态已现（40~44 分档）但评分不高」的候选，
-    # 且必须同时满足：止跌层 strong/medium（不接飞刀）、距 250 日低点 ≤15%（高位保护）、
-    # 3 年财务 verified、行业 PE 分位 ≤0.6。放宽的仅是「入场时机的打分门槛」，
-    # 质量/估值/低位/止跌四道闸门全部未动 ⇒ 与「宁缺毋滥」不冲突。
+    # 年度资格已保证质量分>=50；默认不再重复设置无额外筛选作用的门槛。
+    MIN_QUALITY_SCORE: float = 0.0
     MIN_TECHNICAL_SCORE_FORMAL: float = 40.0
+    QV_TECHNICAL_STATE_SCORING: bool = True
+    QV_TECHNICAL_EVENT_WINDOW: int = 5
     CSI300_AK_SYMBOL: str = "sh000300"  # Baostock 格式为 sh.000300
     MARKET_MA_PERIOD: int = 20
     MARKET_SLOPE_LOOKBACK: int = 4
@@ -345,53 +311,39 @@ class StrategyConfig:
     RECENT_OPERATING_GROSS_MARGIN_DROP_MAX: float = 3.0
     RECENT_OPERATING_NET_MARGIN_DROP_MAX: float = 2.0
 
-    # quality_value 综合分 = 0.45×质量 + 0.30×估值 + 0.25×技术（0~100）。
-    # 综合分 < MIN_QV_SCORE 的候选直接否决（FAIL_QV_SCORE），弱市自然收敛到少推/不推。
-    # 设 0 关闭该闸门。
-    #
-    # 【重要】下限必须与硬闸门阈值对齐，否则硬闸门形同虚设：
-    #   · 质量分：_dimension_score 在阈值处恰好给 50 分（三档同时压线 → quality_score=50）。
-    #   · 估值分（仅 PE）：行业/绝对口径在各自准入上限处均锚定 40 分。
-    #   · 三道闸门全部恰好达标的综合分 = 0.45×50 + 0.30×40 + 0.25×技术分
-    #     = 34.5 + 0.25×技术分，上限 59.5（技术满分100时）。
-    #   若 MIN_QV_SCORE > 59.5，则「压线合格」100% 被淘汰。
-    #   当前设为 38（2026-10-07 由 50 下调，理由见下）。
-    #   如需关闭，显式设为 0。
-    # 运行时可读：qv_floor_equivalence() / describe_qv_floor() 会随配置实时算出等效门槛。
-    #
-    # ===== 2026-10-07 修复：由 50 下调至 38，并澄清语义 =====
-    # 【实测到的问题】原值 50 落在「名义在三项硬闸门之外、实际靠技术分补足」的
-    # 模糊地带：qv_floor_equivalence 算出压线合格样本要过 50 分需 **技术分 ≥62**
-    # （0.45×50 + 0.30×40 + 0.25×T ≥ 50 ⟹ T ≥ 62）。
-    # 即这道号称「综合分闸门」的机制，实际作用近似于**技术分 ≥62 的强技术筛选**——
-    # 而策略设计声明是「技术面仅排序、不作否决」（TECHNICAL_SCORE_WEIGHT=0.25 不否决）。
-    # 三项硬闸门（质量 ≥50 / 估值 ≥40 / 技术 ≥45）各自已独立把关，综合分闸门再按
-    # 技术分筛一遍属于**重复计权**，放大了技术面的实际否决权，与声明不符。
-    #
-    # 【38 的来历：三项权重的自然下限】
-    #   质量分压线 50 × 0.45 = 22.5
-    #   估值分压线 40 × 0.30 = 12.0
-    #   技术分压线 45 × 0.25 = 11.25  ← MIN_TECHNICAL_SCORE_FORMAL 独立把关
-    #   合计 = 45.75（「三项全部恰好压线合格」的理论最低分）
-    # 取 38 低于该值 ⇒ **压线合格者 100% 通过** ⇒ 该闸门只拦「三项中有明显短板」
-    # 的候选（靠某一项撑起总分的情况），不再承担额外的技术筛选职能。
-    # 这样「技术面不否决」的声明才成立，质量/估值短板仍被综合分兜底。
-    #
-    # 【方向一致性：对「宁缺毋滥」仍是收紧】下调看起来像放松，但它取消的是
-    # 「用技术分重复扣人」这一层；而技术分 ≥45 已由 MIN_TECHNICAL_SCORE_FORMAL
-    # 独立把关（未达标直接降 pending，根本到不了本闸门）。
-    # 真正需要收紧的「隐式技术筛选」由新闸门 QV_MAX_GAIN_FROM_250D_LOW
-    # （拦「已止跌但涨离底部」，只做减法）承担 —— 见该配置项注释。
-    # 上调到 60 会使压线合格者 100% 被淘汰（技术分需 >100 不可达），
-    # 等于把技术面变成唯一硬闸门，与策略定位冲突，慎用。
-    MIN_QV_SCORE: float = 38.0
-
+    # 综合分仅排序；需要额外综合门槛时显式设置>0。
+    MIN_QV_SCORE: float = 0.0
+    # 风险字段采用同报告期、真实公告日的独立证据，缺失不得标成已核验。
+    REQUIRE_FINANCIAL_RISK: bool = True
+    RECENT_OPERATING_YOY_TOLERANCE: float = 3.0
+    RECENT_OPERATING_CASHFLOW_TOLERANCE: float = 3.0
+    RECENT_OPERATING_CASH_CONVERSION_MIN: float = 0.8
+    REQUIRE_HISTORICAL_VALUATION: bool = True
+    HISTORICAL_VALUATION_LOOKBACK: int = 250
+    HISTORICAL_VALUATION_MIN_SAMPLES: int = 120
+    HISTORICAL_VALUATION_PERCENTILE_MAX: float = 0.60
+    HISTORICAL_VALUATION_WEIGHT: float = 0.30
+    # 行业相对便宜仍须防范整个行业高估；默认软风险提示，可配置行业专属硬上限。
+    INDUSTRY_PE_ABSOLUTE_CAPS: Optional[dict] = None
+    INDUSTRY_PE_WARN: float = 50.0
+    CYCLICAL_INDUSTRY_KEYWORDS: tuple = ("煤炭", "钢铁", "黑色金属", "有色", "石油", "化工", "化学原料", "采矿", "航运", "水上运输")
+    CYCLICAL_INDUSTRY_CODES: tuple = ("B06", "B07", "B08", "B09", "B10", "B11", "C25", "C26", "C30", "C31", "C32", "G55")
+    CYCLICAL_PEAK_PROFIT_MULT: float = 1.5
+    CYCLICAL_PEAK_AS_PENDING: bool = False
+    REQUIRE_CYCLICAL_NORMALIZED_VALUATION: bool = True
+    CYCLICAL_NORMALIZED_PE_MAX: float = 25.0
+    VALUATION_COMPARABLE_PROFITABILITY: bool = True
+    # 默认用近期收盘底部及ATR调整距离；legacy保持旧250日盘中极值+15%口径。
+    QV_LOW_ANCHOR_MODE: str = "recent_structure"
+    QV_RECENT_LOW_WINDOW: int = 60
+    QV_RECENT_LOW_MIN_AGE: int = 5
+    QV_RECENT_LOW_MAX_AGE: int = 40
+    QV_LOW_GAIN_ATR_MULT: float = 5.0
+    REQUIRE_COMPLETED_MARKET_DAY: bool = True
     # ===== P0：入场时机判读（左侧/右侧 + 止跌确认；仅加标签展示，绝不改推荐口径）=====
-    # quality_value（生产默认）的技术面权重为 25%（不否决、QV_ENFORCE_KDJ_MACD_VETO
-    # 默认 False），止跌确认闸门（QV_STABILIZATION_GATE）是唯一的技术准入条件。
-    # 后果：一只利润下滑、股价处于低位、MACD 仍在加速下跌的深度价值股能顺利通过全部闸门
-    # 被正式推荐——典型价值陷阱/接飞刀。开启后为每条推荐计算「左侧/右侧 + 是否仍在下跌」
-    # 的时机读数并写入决策简报，把择时判断显式交回人工（不改「哪些股票通过」）。
+    # 展示MA20/MA60位置及MACD风险；展示读数不替代止跌分层和技术分准入。
+    # 技术状态权重25%，formal同时要求技术分>=40和启用的有效底部证据。
+    # QV_ENFORCE_KDJ_MACD_VETO默认关闭，显式开启时增加相应硬否决。
     SURFACE_TIMING_READ: bool = True
     TIMING_MA_LONG: int = 60   # 时机判读用的长期均线周期（现价站上/跌破 MA60 区分右侧/左侧）
     # ===== 止跌确认闸门（全市场环境生效）=====
@@ -451,37 +403,7 @@ class StrategyConfig:
     QV_STABILIZATION_MODE: str = "strict"
     # risk_only 下 watch 层的 pending 标记（加入 missing → 不进正式推荐，仅进观察池）。
     QV_STABILIZATION_WATCH_PENDING: bool = True
-    # ===== V 值高位保护（2026-10-07 新增；配合「宁缺毋滥」原则）=====
-    # 【要解决的实测问题】
-    # 止跌闸门 strict 口径下，通过率随「便宜程度」单调反向（决策日 2026-09-21，
-    # 主板 796 只，按 250 日价格分位分档）：
-    #     分位 0.0~0.1 → 通过率 0%    （最便宜的 6 只全被拦）
-    #     分位 0.1~0.2 → 通过率 10%
-    #     分位 0.2~0.3 → 通过率 22%
-    #     分位 0.3~0.4 → 通过率 50%（最不便宜的 8 只放行一半）
-    # 机制：低位闸门要求「正在下跌/刚跌完」，止跌闸门要求「已止跌回升」，
-    # 二者方向相反 ⇒ 结果是**越便宜越买不到**，而被放行的 10 只距 250 日低点
-    # 中位已涨 +12.7%、最高 +22.1%（20% 已涨超 20%）。
-    # 即：策略名为「优质低估低位」，实际买的是「已启动的右侧票」。
-    #
-    # 【本项的作用：不是放松止跌闸门，而是补上闸门缺的那一半】
-    # 「宁缺毋滥」原则下真正该拦的不是「还在跌的便宜票」，而是
-    # **已经涨离底部、不再是「低位」的票** —— 那才是真正的「错推荐」。
-    # 本项给止跌闸门加一条对称约束：止跌确认成立时，还必须满足
-    # 「现价距 250 日低点不超过 V 值上限」，否则该股虽已止跌，但已涨离底部，
-    # 不再符合本策略的「低位」定位 → 否决（FAIL_OVEREXTENDED）。
-    #
-    # 【为什么这是收紧而非放松】
-    # 启用后放行集合 = (原 strict 放行集合) ∩ (距低点 ≤ 上限) ⊆ 原集合。
-    # 对「已涨 +12.7% 中位」的典型放行票，本项会拦掉相当一部分：
-    # 实测该批 38% 已涨超 15%。即它只做减法、不做加法，与「宁缺毋滥」一致。
-    # 效果是「宁可不推荐，也不推荐已经涨起来的票」，而不是「为了多推而放宽」。
-    #
-    # 【默认值】QV_MAX_GAIN_FROM_250D_LOW = 15.0（%）
-    # 取 15% 的依据：与 MAX_RECENT_GAIN_PCT(12%)/ENTRY 口径相近，且实测放行批的
-    # 距低点涨幅中位为 +12.7%、P75 为 +18.2% —— 15% 恰好切在「刚启动」与
-    # 「已启动一段」的分界，能滤掉追高又不会把全部放行票清零（保留约 62%）。
-    # 设 None 或 ≤0 关闭本项（回到改动前行为）。
+    # 旧250日极值距离上限，仅 QV_LOW_ANCHOR_MODE="legacy" 时生效。
     QV_MAX_GAIN_FROM_250D_LOW: Optional[float] = 15.0
 
     # ===== P1：250日低位分位进排序权重（默认 0=关闭，只影响排序不影响准入）=====
@@ -855,6 +777,34 @@ class StrategyConfig:
         if legacy is not None:
             object.__setattr__(self, "QV_STABILIZATION_GATE", bool(legacy))
         self._validate_score_weights()
+        self._validate_recommendation_config()
+
+    def _validate_recommendation_config(self) -> None:
+        if self.RECOMMENDATION_MODE not in {"quality_value", "technical"}:
+            raise ValueError("RECOMMENDATION_MODE must be quality_value or technical")
+        if self.QV_LOW_ANCHOR_MODE not in {"recent_structure", "legacy"}:
+            raise ValueError("QV_LOW_ANCHOR_MODE must be recent_structure or legacy")
+        for name in ("HISTORICAL_VALUATION_LOOKBACK", "HISTORICAL_VALUATION_MIN_SAMPLES",
+                     "QV_TECHNICAL_EVENT_WINDOW", "QV_RECENT_LOW_WINDOW",
+                     "QV_RECENT_LOW_MIN_AGE", "QV_RECENT_LOW_MAX_AGE"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"{name} must be a positive integer")
+        if self.HISTORICAL_VALUATION_MIN_SAMPLES > self.HISTORICAL_VALUATION_LOOKBACK:
+            raise ValueError("historical valuation sample minimum cannot exceed lookback")
+        if not self.QV_RECENT_LOW_MIN_AGE <= self.QV_RECENT_LOW_MAX_AGE < self.QV_RECENT_LOW_WINDOW:
+            raise ValueError("recent low ages must satisfy minimum <= maximum < window")
+        for name in ("HISTORICAL_VALUATION_PERCENTILE_MAX", "HISTORICAL_VALUATION_WEIGHT"):
+            value = float(getattr(self, name))
+            if not np.isfinite(value) or not 0 <= value <= 1:
+                raise ValueError(f"{name} must be finite and between 0 and 1")
+        for name in ("CYCLICAL_NORMALIZED_PE_MAX", "CYCLICAL_PEAK_PROFIT_MULT", "QV_LOW_GAIN_ATR_MULT"):
+            value = float(getattr(self, name))
+            if not np.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be finite and positive")
+        for industry, cap in (self.INDUSTRY_PE_ABSOLUTE_CAPS or {}).items():
+            if not str(industry).strip() or not np.isfinite(float(cap)) or float(cap) <= 0:
+                raise ValueError("industry PE caps require nonempty names and positive finite limits")
 
     def _validate_score_weights(self) -> None:
         """应用 P4 权重套件并校验综合分三项权重之和为 1.0。
@@ -1050,8 +1000,62 @@ def _cache_path(config: StrategyConfig, name: str) -> str:
     return os.path.join(config.CACHE_DIR, name)
 
 def _cache_fresh_today(path: str) -> bool:
-    if not os.path.exists(path): return False
-    return datetime.fromtimestamp(os.path.getmtime(path), BEIJING_TZ).date() == _beijing_now().date()
+    from src.market_data_integrity import quote_cache_valid
+    return os.path.exists(path) and quote_cache_valid(_read_cache_json(path + ".meta.json"), _beijing_now())
+
+
+def latest_completed_trade_day(config: StrategyConfig, cache: Optional[CacheManager] = None) -> Optional[str]:
+    """交易所日历独立验证当前应完成交易日，不能用行情自身证明新鲜。"""
+    from src.market_data_integrity import latest_completed_day, quote_phase
+    now = _beijing_now()
+    key = "completed_market_day_" + quote_phase(now)
+    if cache is not None and (value := cache.get(key)) is not None:
+        return value
+    rows = None
+    path = _cache_path(config, "trade_calendar_v1.json") if config.USE_CACHE else None
+    stored = _read_cache_json(path) if path and _cache_fresh(path, 1) else None
+    if stored and stored.get("through") == str(now.date()):
+        rows = stored.get("rows")
+    if rows is None and _bs_available():
+        try:
+            with bs_lock:
+                rs = bs.query_trade_dates(start_date=(now - timedelta(days=45)).strftime(_DATE_FMT), end_date=now.strftime(_DATE_FMT))
+            if rs.error_code == "0":
+                rows = rs.get_data().to_dict("records")
+        except Exception as exc:
+            logger.warning("交易日历主源失败: %s", exc)
+    if rows is None and _AK_AVAILABLE:
+        try:
+            raw = ak.tool_trade_date_hist_sina()
+            trading = set(pd.to_datetime(raw["trade_date"], errors="coerce").dropna().dt.strftime(_DATE_FMT))
+            # Provider's dated historical calendar must actually cover the requested date.
+            if trading and max(trading) >= now.strftime(_DATE_FMT):
+                rows = [{"calendar_date": d.strftime(_DATE_FMT), "is_trading_day": "1" if d.strftime(_DATE_FMT) in trading else "0"}
+                        for d in pd.date_range(now.date() - timedelta(days=45), now.date())]
+        except Exception as exc:
+            logger.warning("交易日历备用源失败: %s", exc)
+    day = latest_completed_day(rows, now)
+    if day is not None:
+        if path: _write_cache_json({"through": str(now.date()), "rows": rows}, path)
+        if cache is not None: cache.set(key, day)
+    return day
+
+
+def _closed_market_frame(frame: Optional[pd.DataFrame], config: StrategyConfig,
+                         cache: Optional[CacheManager] = None) -> Optional[pd.DataFrame]:
+    if frame is None or frame.empty or "date" not in frame:
+        return None
+    now = _beijing_now()
+    dates = pd.to_datetime(frame["date"], errors="coerce")
+    cutoff = now.date() if now.hour >= 15 else (now - timedelta(days=1)).date()
+    frame = frame.loc[dates.notna() & (dates.dt.date <= cutoff)].copy()
+    if frame.empty:
+        return None
+    expected = latest_completed_trade_day(config, cache) if config.REQUIRE_COMPLETED_MARKET_DAY else None
+    if config.REQUIRE_COMPLETED_MARKET_DAY and (expected is None or str(frame.iloc[-1]["date"])[:10] != expected):
+        logger.warning("指数收盘日期未核验：行情=%s，应完成交易日=%s", frame.iloc[-1]["date"], expected or "未知")
+        return None
+    return frame
 
 def _cache_fresh(path: str, ttl_days: float) -> bool:
     if not os.path.exists(path): return False
@@ -1070,6 +1074,9 @@ def _write_cache_csv(df: pd.DataFrame, path: str) -> None:
     try:
         df.to_csv(tmp, index=False)
         os.replace(tmp, path)
+        if os.path.basename(path).startswith(("daily_", "weekly_", "index_daily_")):
+            from src.market_data_integrity import quote_metadata
+            _write_cache_json(quote_metadata(df, _beijing_now()), path + ".meta.json")
     except Exception:
         pass
 
@@ -1767,16 +1774,18 @@ def _fetch_stock_pool_dual(config: StrategyConfig) -> list[dict]:
 # ===========================================================================
 
 def get_daily_data(code: str, config: StrategyConfig, cache: Optional[CacheManager] = None) -> Optional[pd.DataFrame]:
-    cache_key = f"daily_{code}"
+    from src.market_data_integrity import quote_phase
+    cache_key = f"daily_{code}_{config.DAILY_BARS}_{config.ADJUST}_{quote_phase(_beijing_now())}"
     if cache and (cached := cache.get(cache_key)) is not None: return cached
     df = _fetch_daily_dual(code, days=config.DAILY_BARS, config=config)
     if cache and df is not None: cache.set(cache_key, df)
     return df
 
 def get_index_daily(config: StrategyConfig, cache: Optional[CacheManager] = None) -> Optional[pd.DataFrame]:
-    cache_key = "index_daily_csi300"
+    from src.market_data_integrity import quote_phase
+    cache_key = "index_daily_csi300_" + quote_phase(_beijing_now())
     if cache and (cached := cache.get(cache_key)) is not None: return cached
-    df = _fetch_index_daily_dual(config.CSI300_AK_SYMBOL, config)
+    df = _closed_market_frame(_fetch_index_daily_dual(config.CSI300_AK_SYMBOL, config), config, cache)
     if cache and df is not None: cache.set(cache_key, df)
     return df
 
@@ -1860,7 +1869,8 @@ def compute_market_environment(df_index: pd.DataFrame, config: StrategyConfig) -
         desc += f"［双指标：斜率判 {slope_regime}，MA{ma_long_period}未同向确认，降级中性］"
     return {"regime": regime, "description": desc, "ma20": round(ma_now, 2), "slope": round(slope, 6),
             "close": round(close_now, 2), "ma60": round(ma_long_now, 2) if ma_long_now is not None else 0,
-            "trend": trend, "slope_regime": slope_regime}
+            "trend": trend, "slope_regime": slope_regime,
+            "decision_day": str(df.iloc[-1].get("date", _beijing_now().strftime(_DATE_FMT)))[:10]}
 
 def _effective_regime(regime: str, config: StrategyConfig) -> str:
     """Map unavailable market state to the configured conservative regime."""
@@ -1926,7 +1936,7 @@ def _apply_regime_hysteresis(result: dict, config: StrategyConfig) -> dict:
     raw = str(result.get("regime", "unknown")).lower()
     path = _cache_path(config, "market_regime_state.json")
     state = _read_cache_json(path) or {}
-    today = _beijing_now().strftime(_DATE_FMT)
+    today = str(result.get("decision_day") or _beijing_now().strftime(_DATE_FMT))[:10]
     updated = state.get("updated")
     if updated:
         try:
@@ -2266,7 +2276,12 @@ def compute_daily_signals(df: pd.DataFrame, config: StrategyConfig) -> Optional[
             volume_group = out["vol_price_continuous"].fillna(volume_group).clip(lower=0) / 25.0 * 30.0
         out["daily_score"] = (trend_group + out["momentum_group_score"] + volume_group).fillna(0).clip(0, 100).round(1)
 
+    from src.recommendation_factors import quality_value_technical
+    state_scores = quality_value_technical(out, config.QV_TECHNICAL_EVENT_WINDOW)
+    for column in state_scores:
+        out[column] = state_scores[column]
     return out
+
 
 def compute_risk_reward(entry_price: float, config: StrategyConfig, atr: Optional[float] = None) -> dict:
     """止损/止盈/盈亏比计算（仅展示与落库，不参与否决——波动率风控见 MAX_ATR_PCT）。
@@ -2366,6 +2381,9 @@ _MISSING_TAG_ZH = {
     "operating_trend": "近期经营证据未核验", "operating_weak": "近期经营走弱·观察",
     "stabilization_weak": "止跌弱确认·观察", "technical_weak": "技术证据不足·观察",
     "forward": "当年成长未核验", "forward_negative": "近期净利负增长待核验", "valuation_industry": "行业估值样本不足",
+    "historical_valuation": "自身历史估值未核验", "financial_risk": "财务风险证据缺失",
+    "industry_classification": "行业分类未核验", "cyclical_normalized_valuation": "周期正常化估值未核验",
+    "cyclical_peak_profit": "周期盈利高峰待核验", "recent_bottom_unconfirmed": "近期底部结构未确认",
 }
 
 def _missing_tags_zh(tags: str) -> str:
@@ -2600,6 +2618,14 @@ class Signal:
     # 定义：同一起止日期下，个股区间涨跌幅 − 沪深300区间涨跌幅（百分点）。
     # None 表示指数或对齐数据不足（不可计算），排序影响保持中性。
     relative_strength: Optional[float] = None
+    historical_pe_percentile: Optional[float] = None
+    historical_pe_samples: int = 0
+    financial_risk_status: str = "not_required"
+    cyclical_risk: str = "not_required"
+    normalized_pe: Optional[float] = None
+    technical_trend_score: Optional[float] = None
+    technical_momentum_score: Optional[float] = None
+    technical_volume_score: Optional[float] = None
 
     def to_dict(self) -> dict: return asdict(self)
 
@@ -3094,41 +3120,31 @@ def evaluate(daily_df: Optional[pd.DataFrame], code: str = "", name: str = "", c
 
 def enrich_annual_fundamentals(code: str, fund_data: Optional[dict], config: StrategyConfig,
                                as_of: Optional[str] = None) -> dict:
-    """年度数据独立缓存，决策日期隔离；缺失不伪造、不用季度年化替代。
+    """年度证据按代码、决策日和年数隔离缓存。
 
-    ===== 时点假定的显式化（2026-10-07）=====
-    背景：上游 `akshare.stock_financial_abstract` **丢弃了 publish_date**，
-    因此 `available_date` 只能保守假定为次年 5 月 1 日（`availability_assumed=True`）。
-    实测本地缓存 6,732 条年度记录 **100% 为假定值**。后果：
-      · 方向安全（宁可晚报，不会前视偏差）；
-      · 但 5 月 1 日前，该闸门实际使用的是 2 年前的数据（一年中约 1/3 时间）；
-      · **缓存文件名未编码该假定**，若将来数据源补上真实公告日，
-        旧的假定缓存不会自动失效重建 ⇒ 口径漂移且不可见。
-
-    本次修复（不改变取数口径，只补可观测性）：
-      1. 缓存内容额外写入 `availability_assumed` 与 `assumed_available_date`；
-      2. 缓存文件名从 `annual_quality_v1_*` 升级为 `annual_quality_v2_*`——
-         **版本号即假定标记**，旧缓存自然失效并按新口径重建，不需要手工清缓存；
-      3. 结果透出 `annual_availability_assumed`，供漏斗/通知声明真实时点风险。
+    v3 优先采用新浪原始接口的真实公告日；失败可回退财务摘要。
+    摘要缺公告日时保守假定次年5月1日，任一年度使用假定即透出标记。
+    旧v2缓存自然失效，避免假定日期遮蔽已经可用的真实披露。
     """
     from src.fundamental_quality import fetch_annual_quality
     result = dict(fund_data or {})
     day = str(as_of or _beijing_now().date())[:10]
     if "annual_rows" in result:
         return result
-    # v2：假定公告日标记进入版本号，数据源若补上真实 publish_date 可通过升版自动切换
-    path = _cache_path(config, f"annual_quality_v2_{code}_{day}_{config.QUALITY_YEARS}.json") if config.USE_CACHE else ""
+    # v3：真实公告优先；回退摘要的假定日期继续显式标记。
+    path = _cache_path(config, f"annual_quality_v3_{code}_{day}_{config.QUALITY_YEARS}.json") if config.USE_CACHE else ""
     cached = _read_cache_json(path) if path and _cache_fresh(path, config.FUND_CACHE_TTL_DAYS) else None
     if cached is not None:
         result["annual_rows"] = cached.get("annual_rows", [])
         result["annual_availability_assumed"] = bool(cached.get("availability_assumed", True))
         return result
+    import requests
     fetched = fetch_annual_quality(code, day, years=config.QUALITY_YEARS,
-                                   ak_client=ak if _AK_AVAILABLE else None)
+                                   ak_client=ak if _AK_AVAILABLE else None, request_get=requests.get)
     rows = fetched.get("annual_rows", [])
     result["annual_rows"] = rows
-    # 该批次是否全部为假定公告日（无一条带真实 publish_date）
-    _assumed = bool(rows) and all(
+    # 任一年度缺真实公告日，都保留假定日期提示。
+    _assumed = bool(rows) and any(
         isinstance(r, dict) and r.get("availability_assumed", True) for r in rows)
     result["annual_availability_assumed"] = _assumed
     if path and rows:
@@ -3149,10 +3165,11 @@ def enrich_recent_operating(code: str, fund_data: Optional[dict], config: Strate
     result = dict(fund_data or {})
     if not getattr(config, "REQUIRE_RECENT_OPERATING", True):
         return result
-    key = (f"recent_operating_{str(code).zfill(6)}_{str(as_of)[:10]}_"
+    key = (f"recent_operating_v2_{str(code).zfill(6)}_{str(as_of)[:10]}_"
            f"{float(getattr(config, 'RECENT_OPERATING_PROFIT_YOY_MIN', -10.0))!r}_"
            f"{float(getattr(config, 'RECENT_OPERATING_GROSS_MARGIN_DROP_MAX', 3.0))!r}_"
-           f"{float(getattr(config, 'RECENT_OPERATING_NET_MARGIN_DROP_MAX', 2.0))!r}")
+            f"{float(getattr(config, 'RECENT_OPERATING_NET_MARGIN_DROP_MAX', 2.0))!r}_"
+            f"{config.RECENT_OPERATING_YOY_TOLERANCE!r}_{config.RECENT_OPERATING_CASHFLOW_TOLERANCE!r}_{config.RECENT_OPERATING_CASH_CONVERSION_MIN!r}")
     evidence = cache.get(key) if cache is not None else None
     if isinstance(evidence, dict) and (str(evidence.get("code") or "").zfill(6) != str(code).zfill(6)
                                        or str(evidence.get("as_of") or "")[:10] != str(as_of)[:10]):
@@ -3164,7 +3181,10 @@ def enrich_recent_operating(code: str, fund_data: Optional[dict], config: Strate
                 str(code).zfill(6), str(as_of)[:10],
                 profit_yoy_min=float(getattr(config, "RECENT_OPERATING_PROFIT_YOY_MIN", -10.0)),
                 gross_margin_drop_max=float(getattr(config, "RECENT_OPERATING_GROSS_MARGIN_DROP_MAX", 3.0)),
-                net_margin_drop_max=float(getattr(config, "RECENT_OPERATING_NET_MARGIN_DROP_MAX", 2.0)))
+                net_margin_drop_max=float(getattr(config, "RECENT_OPERATING_NET_MARGIN_DROP_MAX", 2.0)),
+                yoy_decline_tolerance=config.RECENT_OPERATING_YOY_TOLERANCE,
+                cashflow_decline_tolerance=config.RECENT_OPERATING_CASHFLOW_TOLERANCE,
+                cash_conversion_min=config.RECENT_OPERATING_CASH_CONVERSION_MIN)
         except Exception as exc:
             evidence = {"status": "missing", "missing_tags": ["operating_fetch_error"],
                         "reasons": [type(exc).__name__]}
@@ -3175,6 +3195,28 @@ def enrich_recent_operating(code: str, fund_data: Optional[dict], config: Strate
         if cache is not None:
             cache.set(key, evidence)
     result["operating_trend"] = evidence
+    return result
+
+
+def enrich_financial_risk(code: str, fund_data: Optional[dict], config: StrategyConfig,
+                          cache: Optional[CacheManager], as_of: str) -> dict:
+    result = dict(fund_data or {})
+    if not config.REQUIRE_FINANCIAL_RISK or _is_financial_stock(code, "", config):
+        return result
+    key = f"financial_risk_v1_{code}_{as_of}_{config.MAX_DEBT_RATIO}_{config.MAX_GOODWILL_RATIO}_{config.MIN_DEDUCTED_PROFIT_RATIO}"
+    evidence = cache.get(key) if cache is not None else None
+    path = _cache_path(config, key + ".json") if config.USE_CACHE else None
+    if evidence is None and path and _cache_fresh(path, 1):
+        evidence = _read_cache_json(path)
+    if evidence is None:
+        from src.financial_risk import fetch_financial_risk
+        evidence = fetch_financial_risk(code, as_of, debt_max=config.MAX_DEBT_RATIO,
+                                        goodwill_max=config.MAX_GOODWILL_RATIO,
+                                        deducted_ratio_min=config.MIN_DEDUCTED_PROFIT_RATIO)
+        if path and evidence.get("status") in {"verified", "failed"}:
+            _write_cache_json(evidence, path)
+        if cache is not None: cache.set(key, evidence)
+    result["financial_risk"] = evidence
     return result
 
 
@@ -3312,6 +3354,7 @@ def build_industry_valuation_snapshot(config: StrategyConfig, cache: CacheManage
         return {}
     pe_by_ind: dict[str, list] = {}
     pb_by_ind: dict[str, list] = {}
+    peers_by_ind: dict[str, list] = {}
     lock = threading.Lock()
     index = get_index_daily(config, cache)
     if index is None or index.empty:
@@ -3352,6 +3395,8 @@ def build_industry_valuation_snapshot(config: StrategyConfig, cache: CacheManage
                     pe_by_ind.setdefault(ind, []).append(pe)
                 if pb is not None:
                     pb_by_ind.setdefault(ind, []).append(pb)
+                if pe is not None and pb is not None:
+                    peers_by_ind.setdefault(ind, []).append({"pe": pe, "pb": pb, "earnings_to_equity": pb / pe})
             hit = True
         finally:
             with lock:
@@ -3380,6 +3425,7 @@ def build_industry_valuation_snapshot(config: StrategyConfig, cache: CacheManage
         snapshot[ind] = {
             "pe": np.sort(np.asarray(pe_by_ind.get(ind, []), dtype=float)),
             "pb": np.sort(np.asarray(pb_by_ind.get(ind, []), dtype=float)),
+            "comparable_peers": peers_by_ind.get(ind, []),
         }
     if snapshot:
         logger.info("行业估值快照：%d 个行业纳入横截面（行业相对估值闸门生效），完成 %d/%d，命中 %d，耗时 %.1f 分钟",
@@ -3406,6 +3452,16 @@ def _industry_valuation_context(snapshot: Optional[dict], industry: str,
         return None
     pe_arr, pb_arr = bucket.get("pe"), bucket.get("pb")
     min_peers = int(getattr(config, "VALUATION_INDUSTRY_MIN_PEERS", 10))
+    comparable = "industry"
+    if config.VALUATION_COMPARABLE_PROFITABILITY and pe is not None and pb is not None and pe > 0 and pb > 0:
+        profitability = pb / pe
+        peers = [r["pe"] for r in bucket.get("comparable_peers", [])
+                 if profitability * .5 <= r["earnings_to_equity"] <= profitability * 2.0]
+        if len(peers) >= min_peers:
+            pe_arr = np.sort(np.asarray(peers, dtype=float))
+            comparable = "earnings_to_equity_band"
+        else:
+            comparable = "industry_insufficient_comparables"
     pe_pct = _percentile_of(pe_arr, pe) if (pe is not None and pe_arr is not None
                                             and len(pe_arr) >= min_peers) else None
     pb_pct = _percentile_of(pb_arr, pb) if (pb is not None and pb_arr is not None
@@ -3414,7 +3470,8 @@ def _industry_valuation_context(snapshot: Optional[dict], industry: str,
         return None
     peers = max(len(pe_arr) if pe_arr is not None else 0,
                 len(pb_arr) if pb_arr is not None else 0)
-    return {"mode": "industry", "pe_pct": pe_pct, "pb_pct": pb_pct, "peers": peers}
+    return {"mode": "industry", "industry": industry, "pe_pct": pe_pct, "pb_pct": pb_pct, "peers": peers,
+            "comparable_mode": comparable, "pe_peers": len(pe_arr) if pe_arr is not None else 0}
 
 
 def _tag_valuation_mode(frame: pd.DataFrame, snapshot: Optional[dict],
@@ -3615,7 +3672,7 @@ def bottom_structure_confirmed(technical: pd.DataFrame, config: StrategyConfig) 
 def assess_entry_timing(technical: pd.DataFrame, config: StrategyConfig) -> dict:
     """入场时机判读（P0）：为 quality_value 推荐补上「左侧/右侧 + 是否仍在下跌」的择时读数。
 
-    生产模式旁路了全部技术择时闸门，深价值股可能在下跌途中被推荐（价值陷阱）。本函数
+    生产模式采用独立的分层止跌和持续技术状态条件，深价值股可能在下跌途中被推荐（价值陷阱）。本函数
     **只产出展示标签与决策简报素材，绝不参与任何否决**，"哪些股票通过"与改动前完全一致。
 
     判读维度（全部取自 compute_daily_signals 已算出的列 + 本地 MA60，零额外取数）：
@@ -3897,8 +3954,35 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
             pb_high = pb > config.MAX_PB_MRQ
         if dual_valuation_guard and pb_high:
             return None, "FAIL_VALUATION"
+    from src.recommendation_factors import historical_valuation, cyclical_earnings_risk, normalized_earnings_valuation
+    history = historical_valuation(df, day, config.HISTORICAL_VALUATION_LOOKBACK, config.HISTORICAL_VALUATION_MIN_SAMPLES)
+    if history["status"] == "verified":
+        if config.REQUIRE_HISTORICAL_VALUATION and history["percentile"] > config.HISTORICAL_VALUATION_PERCENTILE_MAX:
+            return None, "FAIL_HISTORICAL_VALUATION"
+    elif config.REQUIRE_HISTORICAL_VALUATION:
+        missing.append("historical_valuation")
+    industry_name = str((val_context or {}).get("industry", ""))
+    industry_caps = config.INDUSTRY_PE_ABSOLUTE_CAPS or {}
+    industry_code = re.match(r"^([A-Z]\d{2})(?:\D|$)", industry_name.upper())
+    industry_cap = industry_caps.get(industry_name)
+    if industry_cap is None and industry_code:
+        industry_cap = industry_caps.get(industry_code.group(1))
+    if industry_cap is not None and pe is not None and pe > float(industry_cap):
+        return None, "FAIL_VALUATION"
     fund = fund_data or {}
     debt = finite(fund.get("debt_ratio"))
+    risk = fund.get("financial_risk")
+    risk_status = "not_required"
+    if config.REQUIRE_FINANCIAL_RISK and not _is_financial_stock(code, name, config):
+        from src.financial_risk import validated_financial_risk_status
+        risk_status = validated_financial_risk_status(risk, code, day)
+        if risk_status == "failed":
+            return None, "FAIL_FINANCIAL_RISK"
+        if risk_status != "verified":
+            missing.append("financial_risk")
+        else:
+            debt = finite(risk["metrics"].get("debt_ratio"))
+            fund = dict(fund, **{k: risk["metrics"].get(k) for k in ("debt_ratio", "goodwill_ratio", "deducted_profit_ratio")})
     from src.recent_operating import validated_operating_status, summarize_operating
     operating = fund.get("operating_trend")
     financial = _is_financial_stock(code, name, config)
@@ -3917,6 +4001,9 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
     goodwill = finite(fund.get("goodwill_ratio"))
     if goodwill is not None and goodwill > config.MAX_GOODWILL_RATIO:
         return None, "FAIL_FUND"
+    deducted_ratio = finite(fund.get("deducted_profit_ratio"))
+    if config.REQUIRE_FINANCIAL_RISK and deducted_ratio is not None and deducted_ratio < config.MIN_DEDUCTED_PROFIT_RATIO:
+        return None, "FAIL_FINANCIAL_RISK"
     quality = evaluate_annual_quality(
         fund.get("annual_rows", []), day, years=config.QUALITY_YEARS,
         median_roe_min=config.QUALITY_MEDIAN_ROE_MIN, min_roe=config.QUALITY_MIN_ROE,
@@ -3951,9 +4038,8 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
     if technical is None:
         return None, "FAIL_DATA"
     d = technical.iloc[-1]
-    tech_score = float(d["daily_score"])
-    # KDJ / MACD 下限否决（默认关闭）：quality_value 模式的原有设计是「技术面不作
-    # 否决」，此处只在显式开启 QV_ENFORCE_KDJ_MACD_VETO 时收紧，且只拦「动能连续
+    tech_score = float(d["qv_daily_score"] if config.QV_TECHNICAL_STATE_SCORING else d["daily_score"])
+    # KDJ / MACD 下限否决（默认关闭）：quality_value 模式的原有设计是「不额外启用KDJ/MACD硬否决」，此处只在显式开启 QV_ENFORCE_KDJ_MACD_VETO 时收紧，且只拦「动能连续
     # 走弱 / KDJ 高位滞涨」，不改变质量、估值、低位三大闸门的口径。
     if getattr(config, "QV_ENFORCE_KDJ_MACD_VETO", False):
         if not macd_not_deeply_weak(technical, config.MACD_WEAK_DAYS,
@@ -3967,6 +4053,25 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
     # 锚点：行业 PE 处于 60% 分位上限、绝对 PE 恰好达到 25 倍上限时，估值分均为 40 分。
     pe_pct_for_score = val_context.get("pe_pct") if industry_mode else None
     valuation_score = _valuation_pe_score(pe, pe_pct_for_score, config)
+    if history["status"] == "verified":
+        hw = float(np.clip(config.HISTORICAL_VALUATION_WEIGHT, 0, 1))
+        valuation_score = (1 - hw) * valuation_score + hw * 100 * (1 - history["percentile"])
+    from src.recommendation_factors import classify_cyclical_industry
+    cycle_class = classify_cyclical_industry(industry_name, config.CYCLICAL_INDUSTRY_CODES, config.CYCLICAL_INDUSTRY_KEYWORDS)
+    if cycle_class == "missing" and (config.REQUIRE_CYCLICAL_NORMALIZED_VALUATION or config.INDUSTRY_PE_ABSOLUTE_CAPS):
+        missing.append("industry_classification")
+    cyclical = cycle_class == "cyclical"
+    from src.recent_operating import validated_operating_ttm
+    cycle_operating = validated_operating_ttm(operating, code, day) if cyclical else None
+    cycle = cyclical_earnings_risk(quality.get("annual_rows", []), cycle_operating, config.CYCLICAL_PEAK_PROFIT_MULT) if cyclical else {"status": "not_required", "peak_ratio": None}
+    normalized = normalized_earnings_valuation(pe, quality.get("annual_rows", []), cycle_operating, config.QUALITY_YEARS) if cyclical else {"status": "not_required", "normalized_pe": None}
+    if cyclical and config.REQUIRE_CYCLICAL_NORMALIZED_VALUATION:
+        if normalized["status"] != "verified":
+            missing.append("cyclical_normalized_valuation")
+        elif normalized["normalized_pe"] > config.CYCLICAL_NORMALIZED_PE_MAX:
+            return None, "FAIL_CYCLICAL_VALUATION"
+    if cyclical and cycle["status"] == "peak" and config.CYCLICAL_PEAK_AS_PENDING:
+        missing.append("cyclical_peak_profit")
     score = round(config.QUALITY_SCORE_WEIGHT * quality_score +
                   config.VALUATION_SCORE_WEIGHT * valuation_score +
                   config.TECHNICAL_SCORE_WEIGHT * tech_score, 2)
@@ -3980,6 +4085,14 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
         rs_adj = float(np.clip(rs / 30.0 * rs_cap, -rs_cap, rs_cap))
     rank_score = round(score + rs_adj, 3)
     tags = ["优质低估低位"]
+    if history["status"] == "verified":
+        tags.append(f"自身历史PE分位{history['percentile']:.0%}（{history['samples']}个样本）")
+    if industry_mode and pe is not None and pe > config.INDUSTRY_PE_WARN:
+        tags.append("行业相对便宜但绝对PE偏高")
+    if normalized["status"] == "verified":
+        tags.append(f"周期正常化PE {normalized['normalized_pe']:.1f}（归母利润口径）")
+    if cyclical:
+        tags.append("周期盈利高点风险" if cycle["status"] == "peak" else "周期正常化盈利待核验" if cycle["status"] == "missing" else "周期盈利高点核验通过")
     hits = _signal_hits(d)
     tags.append("动能改善" if hits else "趋势待确认")
     tags.extend(hits)
@@ -4151,8 +4264,19 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
         # rationale 见 StrategyConfig.QV_MAX_GAIN_FROM_250D_LOW 的注释：
         # 「宁缺毋滥」下真正要拦的是「已涨离底部、不再是低位」的票，
         # 而不是「还在下跌但便宜」的票 —— 后者才是本策略该买的。
+        from src.recommendation_factors import assess_low_structure
+        low_structure = assess_low_structure(technical, day, config.QV_RECENT_LOW_WINDOW,
+                                             config.QV_RECENT_LOW_MIN_AGE, config.QV_RECENT_LOW_MAX_AGE,
+                                             config.QV_LOW_GAIN_ATR_MULT)
         _max_gain = getattr(config, "QV_MAX_GAIN_FROM_250D_LOW", None)
-        if _max_gain is not None and float(_max_gain) > 0 and stabilization_level not in ("disabled", "watch"):
+        if config.QV_LOW_ANCHOR_MODE == "recent_structure" and stabilization_level not in ("disabled", "watch"):
+            if low_structure["status"] != "verified":
+                missing.append("recent_bottom_unconfirmed")
+            elif low_structure["gain_pct"] > low_structure["allowed_gain_pct"]:
+                return None, "FAIL_OVEREXTENDED"
+            else:
+                tags.append(f"近期有效底部{low_structure['anchor_date']}，距底+{low_structure['gain_pct']:.1f}%")
+        elif config.QV_LOW_ANCHOR_MODE == "legacy" and _max_gain is not None and float(_max_gain) > 0 and stabilization_level not in ("disabled", "watch"):
             _pct_from_low = finite(timing.get("pct_from_low"))
             if _pct_from_low is None:
                 # 距 250 日低点无法计算（低点窗口数据不足）→ 不视为已满足，保守降级。
@@ -4243,7 +4367,12 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
         rank_score=rank_score,
         quality_score=quality_score, valuation_score=round(valuation_score, 2),
         position_250=round(position, 4), pe_ttm=pe, pb_mrq=pb,
-        quality_status=quality["status"], relative_strength=rs, **brief), "PASS"
+        quality_status=quality["status"], relative_strength=rs,
+        historical_pe_percentile=history["percentile"], historical_pe_samples=history["samples"],
+        financial_risk_status=risk_status, cyclical_risk=cycle["status"], normalized_pe=normalized["normalized_pe"],
+        technical_trend_score=finite(d.get("qv_trend_score")),
+        technical_momentum_score=finite(d.get("qv_momentum_score")),
+        technical_volume_score=finite(d.get("qv_volume_score")), **brief), "PASS"
 
 
 def _screen_quality_pool(config: StrategyConfig, cache: CacheManager, market_env: dict,
@@ -4263,8 +4392,10 @@ def _screen_quality_pool(config: StrategyConfig, cache: CacheManager, market_env
     stocks = get_stock_list(config, cache)
     cap = int(config.MAX_PICKS if max_picks is None else max_picks)
     # 行业估值横截面快照（#4a）：行业数据不可用 → 空 dict → 全市场回退 PE 绝对上限
-    industry_map = get_stock_industry(config, cache) if getattr(config, "USE_INDUSTRY_RELATIVE_VALUATION", False) else {}
-    snapshot = build_industry_valuation_snapshot(config, cache, stocks) if industry_map else {}
+    needs_industry = (config.USE_INDUSTRY_RELATIVE_VALUATION or config.REQUIRE_CYCLICAL_NORMALIZED_VALUATION
+                      or bool(config.INDUSTRY_PE_ABSOLUTE_CAPS) or config.USE_INDUSTRY_DEDUP)
+    industry_map = get_stock_industry(config, cache) if needs_industry else {}
+    snapshot = build_industry_valuation_snapshot(config, cache, stocks) if industry_map and config.USE_INDUSTRY_RELATIVE_VALUATION else {}
     # ===== 估值口径显式声明 =====
     # 回退到绝对阈值是合法降级，但**不能静默**：绝对口径（PE≤25）正是本项目刻意避开的
     # 「名单压向银行/地产/周期」口径；且回退日 PE 逐 bar 缺失会把候选压成 pending
@@ -4293,6 +4424,8 @@ def _screen_quality_pool(config: StrategyConfig, cache: CacheManager, market_env
             _pe = _finite_positive_or_none(daily.iloc[-1].get("peTTM")) if daily is not None and not daily.empty else None
             _pb = _finite_positive_or_none(daily.iloc[-1].get("pbMRQ")) if daily is not None and not daily.empty else None
             val_ctx = _industry_valuation_context(snapshot, industry_map.get(str(code), ""), _pe, _pb, config)
+        if val_ctx is None and industry_map.get(str(code)):
+            val_ctx = {"mode": "absolute", "industry": industry_map[str(code)]}
         eval_kwargs = dict(latest_trade_date=latest_trade_date,
                            val_context=val_ctx, index_df=index_df)
         # 仅内置 quality evaluator 接收 volatile_out；自定义 evaluator 仍保持旧签名，
@@ -4310,6 +4443,7 @@ def _screen_quality_pool(config: StrategyConfig, cache: CacheManager, market_env
             if not config.REQUIRE_RECENT_OPERATING:
                 fund = enrich_forward_growth(code, fund, config, cache)  # legacy 单项净利同比
         fund = enrich_recent_operating(code, fund, config, cache, as_of=pre.date)
+        fund = enrich_financial_risk(code, fund, config, cache, as_of=pre.date)
         return evaluator(daily, code, name, config, market_env, fund,
                          **eval_kwargs)
     results, processed, timed_out = run_concurrent_screen(stocks, screen, config, logger)
@@ -4351,11 +4485,13 @@ def _screen_quality_pool(config: StrategyConfig, cache: CacheManager, market_env
 
 
 def get_market_environment(config: StrategyConfig, cache: CacheManager) -> dict:
-    if (cached := cache.get("market_env")) is not None: return cached
+    from src.market_data_integrity import quote_phase
+    env_key = "market_env_" + quote_phase(_beijing_now())
+    if (cached := cache.get(env_key)) is not None: return cached
     df_index = get_index_daily(config, cache)
     result = compute_market_environment(df_index, config) if df_index is not None and not df_index.empty else {"regime": "unknown", "description": "未知（数据获取失败）", "ma20": 0, "slope": 0, "close": 0}
     result = _apply_regime_hysteresis(result, config)
-    cache.set("market_env", result)
+    cache.set(env_key, result)
     return result
 
 def _dedup_by_industry(df: pd.DataFrame, config: StrategyConfig, cache: Optional[CacheManager] = None) -> pd.DataFrame:

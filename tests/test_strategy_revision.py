@@ -23,7 +23,10 @@ def fund(**changes):
 
 
 def cfg(**changes):
-    options = dict(USE_CACHE=False, MIN_TECHNICAL_SCORE_FORMAL=0)
+    options = dict(USE_CACHE=False, MIN_TECHNICAL_SCORE_FORMAL=0,
+                   REQUIRE_FINANCIAL_RISK=False, REQUIRE_HISTORICAL_VALUATION=False,
+                   REQUIRE_CYCLICAL_NORMALIZED_VALUATION=False,
+                   QV_TECHNICAL_STATE_SCORING=False, QV_LOW_ANCHOR_MODE="legacy")
     options.update(changes)
     return m.StrategyConfig(**options)
 

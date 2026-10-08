@@ -38,7 +38,10 @@ class QualityRecommendations(unittest.TestCase):
         # 本文件的合成行情样本技术分恒 0（无趋势转折/放量布尔命中），不隔离则所有
         # 「应为 formal」的断言都会被该门槛降级；其自身行为由
         # test_recommendation_upgrades.TestDimensionFloors 与 test_quality_value_hardening 覆盖。
-        self.cfg = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False, MIN_TECHNICAL_SCORE_FORMAL=0)
+        self.cfg = m.StrategyConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False,
+                                    MIN_TECHNICAL_SCORE_FORMAL=0, REQUIRE_FINANCIAL_RISK=False,
+                                    REQUIRE_HISTORICAL_VALUATION=False, REQUIRE_CYCLICAL_NORMALIZED_VALUATION=False,
+                                    QV_TECHNICAL_STATE_SCORING=False, QV_LOW_ANCHOR_MODE="legacy")
         self.df = prices()
 
     def evaluate(self, df=None, fund=None, **kwargs):
@@ -128,8 +131,7 @@ class QualityRecommendations(unittest.TestCase):
         # 与 self.cfg 同口径隔离技术短板门槛：evaluate_breakout 在 quality_value 模式下
         # 委派 evaluate_quality_value，两条路径必须用相同配置才可比 tier
         b, reason = vb.evaluate_breakout(self.df, "600001", "工业企业",
-                                         vb.VolumeBreakoutConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False,
-                                                                 MIN_TECHNICAL_SCORE_FORMAL=0),
+                                         vb.VolumeBreakoutConfig(**vars(self.cfg)),
                                          {"regime": "bear"}, fundamentals(), latest_trade_date=DAY)
         self.assertEqual(reason, "PASS")
         self.assertEqual((b.tier, b.score, b.position_250), (a.tier, a.score, a.position_250))
@@ -176,7 +178,7 @@ class QualityRecommendations(unittest.TestCase):
     def test_main_default_does_not_invoke_market_or_weekly_gate(self):
         index = pd.DataFrame({"date": [DAY], "close": [100.]})
         for module, entry in ((m, m.main), (vb, vb.main_breakout)):
-            cfg = self.cfg if module is m else vb.VolumeBreakoutConfig(REQUIRE_RECENT_OPERATING=False, DAILY_SCORING_MODE="legacy", USE_CACHE=False)
+            cfg = self.cfg if module is m else vb.VolumeBreakoutConfig(**vars(self.cfg))
             with patch.object(module, "_bs_login", return_value=True), \
                  patch.object(module, "_bs_logout"), \
                  patch.object(module, "get_market_environment", return_value={"regime": "bear"}), \

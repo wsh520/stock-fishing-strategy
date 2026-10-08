@@ -17,6 +17,7 @@ _FIELDS = {
     "NPCUT": "deducted_profit", "MANANETR": "operating_cashflow",
     "SGPMARGIN": "gross_margin", "SNPMARGINCONMS": "net_margin",
 }
+_SUMMARY_FIELDS = dict(_FIELDS, ROEWEIGHTED="roe")
 
 
 def _day(value):
@@ -54,12 +55,16 @@ def parse_summary(payload):
         # Do not mix parent-company statements or foreign-currency amounts.
         if report.get("rType") != "合并期末" or report.get("rCurrency") != "CNY":
             continue
-        row = {"report_date": period, "available_date": report.get("publish_date")}
+        row = {"report_date": period, "available_date": report.get("publish_date"),
+               "source": SOURCE_URL, "data_source": report.get("data_source"),
+               "statement_basis": "consolidated", "currency": "CNY"}
         seen = set()
         for item in report.get("data", []):
             if not isinstance(item, dict) or str(item.get("item_group_no")) != "1":
                 continue
-            field = _FIELDS.get(item.get("item_field"))
+            field = _SUMMARY_FIELDS.get(item.get("item_field"))
+            if item.get("item_title") in {"归母净利润", "归属于母公司股东的净利润"}:
+                field = "attributable_profit"
             if field is None:
                 continue
             value = _number(item.get("item_value"))
@@ -80,25 +85,75 @@ def _minimum_period(day):
     return date(day.year - 1, 9, 30)
 
 
+def _supplemental_trends(usable, duplicates, latest):
+    """Optional evidence: Qn=YTDn-YTD(n-1); TTM=prior FY+YTD-prior YTD.
+
+    All inputs have passed disclosure gating; missing/duplicate operands produce
+    None. Ratios and margins are never subtracted as cumulative flow amounts.
+    """
+    metrics = {}
+    fields = ("revenue", "net_profit", "deducted_profit", "operating_cashflow", "attributable_profit")
+
+    def amount(period, field):
+        return None if period in duplicates else _number(usable.get(period, {}).get(field))
+
+    def quarter(period, field):
+        value = amount(period, field)
+        if period.month == 3:
+            return value
+        month = period.month - 3
+        previous = date(period.year, month, 30 if month in (6, 9) else 31)
+        previous_value = amount(previous, field)
+        return _number(value - previous_value) if value is not None and previous_value is not None else None
+
+    def ttm(period, field):
+        value = amount(period, field)
+        if period.month == 12:
+            return value
+        annual = amount(date(period.year - 1, 12, 31), field)
+        prior = amount(date(period.year - 1, period.month, period.day), field)
+        return _number(annual + value - prior) if all(v is not None for v in (value, annual, prior)) else None
+
+    prior_period = date(latest.year - 1, latest.month, latest.day)
+    for field in fields:
+        for label, derive in (("single_quarter", quarter), ("ttm", ttm)):
+            value, previous = derive(latest, field), derive(prior_period, field)
+            metrics[field + "_" + label] = value
+            metrics[field + "_" + label + "_yoy"] = (
+                _number((value / previous - 1) * 100)
+                if value is not None and previous is not None and previous > 0 else None)
+    return metrics
+
+
 def evaluate_operating_trend(rows, as_of, profit_yoy_min=-10.0,
-                             gross_margin_drop_max=3.0, net_margin_drop_max=2.0):
+                             gross_margin_drop_max=3.0, net_margin_drop_max=2.0,
+                             *, yoy_decline_tolerance=3.0,
+                             cashflow_decline_tolerance=3.0, cash_conversion_min=.8):
     """Return verified/weak/failed/missing using latest disclosed same-period data.
 
     Missing or stale evidence cannot verify. Known losses or severe profit
-    contraction fail even if another dimension is missing. Mild deterioration
-    is weak (observation only), not a data error. Negative prior-year profit is
+    contraction fail even if another dimension is missing.
+    Mild deterioration beyond yoy_decline_tolerance is weak (observation only).
+    Declines inside the tolerance pass individual growth checks; simultaneous
+    sales/profit/cash deterioration still vetoes. Cash declines within
+    cashflow_decline_tolerance pass only when current cumulative cash / net
+    profit meets cash_conversion_min. All percentages use percentage points.
+    Optional single-quarter / TTM evidence never fills core missing fields.
+    Negative prior-year profit is
     a turnaround, not a meaningful ordinary growth rate. Cash-flow changes use
     amounts when the prior base is nonpositive; no invented percentage growth.
     """
     day = _day(as_of)
     if day is None:
         raise ValueError("as_of must be a valid decision date")
-    limits = [_number(x) for x in (profit_yoy_min, gross_margin_drop_max, net_margin_drop_max)]
-    if any(x is None for x in limits) or limits[1] < 0 or limits[2] < 0:
+    limits = [_number(x) for x in (profit_yoy_min, gross_margin_drop_max, net_margin_drop_max,
+                                   yoy_decline_tolerance, cashflow_decline_tolerance,
+                                   cash_conversion_min)]
+    if any(x is None for x in limits) or any(x < 0 for x in limits[1:]):
         raise ValueError("operating thresholds must be finite, margin limits nonnegative")
     result = {"status": "missing", "as_of": day.isoformat(), "period": None, "available_date": None,
               "metrics": {}, "missing_tags": [], "reasons": [], "source": SOURCE_URL}
-    usable, duplicates = {}, set()
+    usable, duplicates, supplemental_rows = {}, set(), []
     for row in rows or []:
         if not isinstance(row, dict):
             continue
@@ -107,9 +162,13 @@ def evaluate_operating_trend(rows, as_of, profit_yoy_min=-10.0,
             continue
         if published is None or not period <= published <= day:
             continue
+        supplemental_rows.append(dict(
+            {field: _number(row.get(field)) for field in (*_FIELDS.values(), "attributable_profit")},
+            report_date=period.isoformat(), available_date=published.isoformat()))
         if period in usable:
             duplicates.add(period)
         usable[period] = row
+    result["supplemental_rows"] = supplemental_rows
     if not usable:
         result["missing_tags"] = ["operating_disclosure"]
         return result
@@ -146,7 +205,7 @@ def evaluate_operating_trend(rows, as_of, profit_yoy_min=-10.0,
             failed.append(field + "_nonpositive")
         if yoy is not None and field != "revenue" and yoy < limits[0] - 1e-10:
             failed.append(field + "_severe_contraction")
-        elif yoy is not None and yoy < -1e-10:
+        elif yoy is not None and yoy < -limits[3] - 1e-10:
             weak.append(field + "_declining")
     for field, maximum in (("gross_margin", limits[1]), ("net_margin", limits[2])):
         cur, prev = values[field]
@@ -169,8 +228,15 @@ def evaluate_operating_trend(rows, as_of, profit_yoy_min=-10.0,
         metrics["operating_cashflow_yoy"] = None
     if cash is not None and cash < 0:
         weak.append("operating_cashflow_negative")
-    if cash_change is not None and cash_change < 0:
+    profit = values["net_profit"][0]
+    conversion = cash / profit if cash is not None and profit is not None and profit > 0 else None
+    metrics["cash_conversion"] = conversion if conversion is not None and math.isfinite(conversion) else None
+    cash_yoy = metrics["operating_cashflow_yoy"]
+    if cash_change is not None and cash_change < 0 and (
+            cash_yoy is None or cash_yoy < -limits[4] - 1e-10
+            or metrics["cash_conversion"] is None or metrics["cash_conversion"] < limits[5]):
         weak.append("operating_cashflow_declining")
+    metrics.update(_supplemental_trends(usable, duplicates, latest))
     # Simultaneous deterioration in sales, earnings and operating cash is stronger evidence.
     if (metrics["revenue_yoy"] is not None and metrics["revenue_yoy"] < -1e-10
             and metrics["net_profit_yoy"] is not None and metrics["net_profit_yoy"] < -1e-10
@@ -230,9 +296,38 @@ def validated_operating_status(evidence, code, as_of):
     return status
 
 
+def validated_operating_ttm(evidence, code, as_of):
+    """Recompute TTM operands and their disclosures before using them for valuation.
+
+    Legacy evidence without operand rows can still support its core trend checks,
+    but cannot establish normalized cyclical valuation.
+    """
+    if validated_operating_status(evidence, code, as_of) not in {"verified", "weak"}:
+        return None
+    rows = evidence.get("supplemental_rows")
+    if not isinstance(rows, list) or not rows:
+        return None
+    checked = evaluate_operating_trend(rows, as_of)
+    if (checked["period"] != evidence.get("period")
+            or checked["available_date"] != evidence.get("available_date")):
+        return None
+    actual, claimed = checked["metrics"], evidence.get("metrics", {})
+    for field in ("net_profit_ttm", "attributable_profit_ttm"):
+        original = claimed.get(field)
+        value, recomputed = _number(original), _number(actual.get(field))
+        if value is None:
+            if original is not None or recomputed is not None:
+                return None
+        elif recomputed is None or not math.isclose(value, recomputed, rel_tol=1e-10, abs_tol=1e-8):
+            return None
+    return dict(evidence, metrics=dict(claimed, **{field: actual.get(field)
+                for field in ("net_profit_ttm", "attributable_profit_ttm")}))
+
+
 def fetch_operating_trend(code, as_of, profit_yoy_min=-10.0,
                           gross_margin_drop_max=3.0, net_margin_drop_max=2.0,
-                          request_get=None):
+                          request_get=None, *, yoy_decline_tolerance=3.0,
+                          cashflow_decline_tolerance=3.0, cash_conversion_min=.8):
     """One bounded read-only request; fetch/schema failures remain missing evidence."""
     symbol = str(code).strip()
     if not re.fullmatch(r"\d{6}", symbol):
@@ -250,12 +345,18 @@ def fetch_operating_trend(code, as_of, profit_yoy_min=-10.0,
         rows = parse_summary(response.json())
     except Exception as exc:
         result = evaluate_operating_trend([], as_of, profit_yoy_min,
-                                          gross_margin_drop_max, net_margin_drop_max)
+                                          gross_margin_drop_max, net_margin_drop_max,
+                                          yoy_decline_tolerance=yoy_decline_tolerance,
+                                          cashflow_decline_tolerance=cashflow_decline_tolerance,
+                                          cash_conversion_min=cash_conversion_min)
         result["missing_tags"].append("operating_fetch_error")
         result["error_type"] = type(exc).__name__
         result["code"] = symbol
         return result
     result = evaluate_operating_trend(rows, as_of, profit_yoy_min,
-                                      gross_margin_drop_max, net_margin_drop_max)
+                                      gross_margin_drop_max, net_margin_drop_max,
+                                          yoy_decline_tolerance=yoy_decline_tolerance,
+                                          cashflow_decline_tolerance=cashflow_decline_tolerance,
+                                          cash_conversion_min=cash_conversion_min)
     result["code"] = symbol
     return result
