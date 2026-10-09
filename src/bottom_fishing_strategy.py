@@ -2626,8 +2626,13 @@ class Signal:
     technical_trend_score: Optional[float] = None
     technical_momentum_score: Optional[float] = None
     technical_volume_score: Optional[float] = None
+    # Only consumed by final QV_PENDING logs, never notification/persistence rows.
+    bottom_diagnostics: Optional[dict] = None
 
-    def to_dict(self) -> dict: return asdict(self)
+    def to_dict(self) -> dict:
+        row = asdict(self)
+        row.pop("bottom_diagnostics", None)
+        return row
 
 def _grade_from_score(score: float, config: StrategyConfig) -> str:
     if score >= config.GRADE_A: return "A"
@@ -3203,7 +3208,8 @@ def enrich_financial_risk(code: str, fund_data: Optional[dict], config: Strategy
     result = dict(fund_data or {})
     if not config.REQUIRE_FINANCIAL_RISK or _is_financial_stock(code, "", config):
         return result
-    key = f"financial_risk_v1_{code}_{as_of}_{config.MAX_DEBT_RATIO}_{config.MAX_GOODWILL_RATIO}_{config.MIN_DEDUCTED_PROFIT_RATIO}"
+    # v2 preserves source labels/merge diagnostics; do not reuse older evidence.
+    key = f"financial_risk_v2_{code}_{as_of}_{config.MAX_DEBT_RATIO}_{config.MAX_GOODWILL_RATIO}_{config.MIN_DEDUCTED_PROFIT_RATIO}"
     evidence = cache.get(key) if cache is not None else None
     path = _cache_path(config, key + ".json") if config.USE_CACHE else None
     if evidence is None and path and _cache_fresh(path, 1):
@@ -4195,6 +4201,7 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
     _stab_mode = str(getattr(config, "QV_STABILIZATION_MODE", "strict") or "strict").strip().lower()
     if _stab_mode not in ("strict", "risk_only", "disabled"):
         _stab_mode = "strict"
+    low_structure = None
     stabilization_level = "confirmed"
     if getattr(config, "QV_STABILIZATION_GATE", True):
         _ma20_ok = False
@@ -4372,7 +4379,9 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
         financial_risk_status=risk_status, cyclical_risk=cycle["status"], normalized_pe=normalized["normalized_pe"],
         technical_trend_score=finite(d.get("qv_trend_score")),
         technical_momentum_score=finite(d.get("qv_momentum_score")),
-        technical_volume_score=finite(d.get("qv_volume_score")), **brief), "PASS"
+        technical_volume_score=finite(d.get("qv_volume_score")),
+        bottom_diagnostics=low_structure if "recent_bottom_unconfirmed" in missing else None,
+        **brief), "PASS"
 
 
 def _screen_quality_pool(config: StrategyConfig, cache: CacheManager, market_env: dict,
@@ -4453,7 +4462,8 @@ def _screen_quality_pool(config: StrategyConfig, cache: CacheManager, market_env
             # 仅保存诊断摘要；线程池结束后统一打印，不进入推荐记录或排序。
             pending_evidence[str(code)] = {
                 label: {key: evidence.get(key) for key in
-                        ("status", "period", "available_date", "missing_tags", "reasons", "error_type")
+                        ("status", "period", "available_date", "missing_tags", "reasons", "error_type",
+                         "data_source", "merge_diagnostics")
                         if evidence.get(key) is not None}
                 for label, evidence in (("近期经营", fund.get("operating_trend") or {}),
                                         ("财务风险", fund.get("financial_risk") or {}))
@@ -4464,6 +4474,8 @@ def _screen_quality_pool(config: StrategyConfig, cache: CacheManager, market_env
     if volatile_out:
         volatile_out[:] = sort_volatile(volatile_out)
         log_volatile_rejects(volatile_out, logger)
+    bottom_diagnostics = {str(sig.code): getattr(sig, "bottom_diagnostics", None)
+                          for sig, reason in results if sig is not None and reason == "PASS"}
     rows = [sig.to_dict() for sig, reason in results if sig is not None and reason == "PASS"]
     # 否决归因计数：让「今天为什么没推荐」在 quality_value 路径也可观测（此前只印候选数）
     from collections import Counter
@@ -4513,6 +4525,22 @@ def _screen_quality_pool(config: StrategyConfig, cache: CacheManager, market_env
                 row.get("stabilization_level"), row.get("quality_status"),
                 row.get("financial_risk_status"), row.get("operating_status"),
                 row.get("cyclical_risk"), row.get("operating_summary") or "无")
+            if "recent_bottom_unconfirmed" in blockers:
+                bottom = bottom_diagnostics.get(str(row.get("code"))) or {}
+                reason = bottom.get("reason", "data_missing")
+                reason_zh = {"too_new": "底部过新", "too_old": "底部过旧",
+                             "data_missing": "数据缺失"}.get(reason, reason)
+                logger.info(
+                    "[QV_PENDING_BOTTOM] %s(%s) | 底部锚点日期=%s | 距底交易bar数=%s | "
+                    "min_age=%s max_age=%s window=%s | gain_pct=%s allowed_gain_pct=%s | "
+                    "原因=%s（%s） | 缺失详情=%s",
+                    row.get("name"), row.get("code"), _fmt_cell(bottom.get("anchor_date")),
+                    _fmt_cell(bottom.get("age")),
+                    bottom.get("min_age", config.QV_RECENT_LOW_MIN_AGE),
+                    bottom.get("max_age", config.QV_RECENT_LOW_MAX_AGE),
+                    bottom.get("recent_window", config.QV_RECENT_LOW_WINDOW),
+                    _fmt_cell(bottom.get("gain_pct")), _fmt_cell(bottom.get("allowed_gain_pct")),
+                    reason, reason_zh, bottom.get("missing_detail") or "无")
             logger.info("[QV_PENDING_EVIDENCE] %s(%s) | 财务证据摘要=%s",
                         row.get("name"), row.get("code"),
                         pending_evidence.get(str(row.get("code"))) or "无（未取得证据摘要）")

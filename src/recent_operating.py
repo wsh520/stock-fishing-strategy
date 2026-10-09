@@ -56,7 +56,7 @@ def parse_summary(payload):
         if report.get("rType") != "合并期末" or report.get("rCurrency") != "CNY":
             continue
         row = {"report_date": period, "available_date": report.get("publish_date"),
-               "source": SOURCE_URL, "data_source": report.get("data_source"),
+               "source": SOURCE_URL, "report_source": "gjzb", "data_source": report.get("data_source"),
                "statement_basis": "consolidated", "currency": "CNY"}
         seen = set()
         for item in report.get("data", []):

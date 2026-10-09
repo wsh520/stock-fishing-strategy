@@ -20,7 +20,7 @@ def parse_balance(payload):
         if not isinstance(report, dict) or report.get("rType") != "合并期末" or report.get("rCurrency") != "CNY":
             continue
         row = dict(report_date=period, available_date=report.get("publish_date"),
-                   source=SOURCE_URL, data_source=report.get("data_source"),
+                   source=SOURCE_URL, report_source="fzb", data_source=report.get("data_source"),
                    statement_basis="consolidated", currency="CNY")
         seen = set()
         for item in report.get("data", []):
@@ -69,6 +69,8 @@ def evaluate_financial_risk(rows, as_of, debt_max=70., goodwill_max=20.,
     period = max(usable)
     row = usable[period]
     result.update(period=period.isoformat(), available_date=_day(row["available_date"]).isoformat())
+    if "merge_diagnostics" in row:
+        result["merge_diagnostics"] = row["merge_diagnostics"]
     if period < _minimum_period(day) or period in duplicates:
         result["missing_tags"] = ["financial_risk_stale" if period < _minimum_period(day) else "financial_risk_duplicate"]
         return result
@@ -113,19 +115,50 @@ def evaluate_financial_risk(rows, as_of, debt_max=70., goodwill_max=20.,
     return result
 
 
+def _compatible_report_origin(balance, summary):
+    """Only the observed Sina fzb=定期报告 / gjzb=其他 pair is an alias.
+
+    data_source classifies the provider's report, not its endpoint. Do not
+    generalize this exception to another provider, report kind or label pair.
+    """
+    if not balance.get("source") or balance.get("source") != summary.get("source"):
+        return False
+    origin = balance.get("data_source")
+    if origin and origin == summary.get("data_source"):
+        return True
+    return (balance.get("source") == SOURCE_URL
+            and balance.get("report_source") == "fzb"
+            and summary.get("report_source") == "gjzb"
+            and origin == "定期报告" and summary.get("data_source") == "其他")
+
+
 def combine_financial_rows(balance_rows, summary_rows):
-    """Never splice different periods, announcement dates, origins or bases."""
+    """Join one matching report, preserving the raw provenance of both tables."""
     rows = []
     for balance in balance_rows:
-        matches = [s for s in summary_rows
-                   if _day(s.get("report_date")) == _day(balance.get("report_date"))
-                   and _day(s.get("available_date")) == _day(balance.get("available_date"))
+        period, published = _day(balance.get("report_date")), _day(balance.get("available_date"))
+        same_period = [s for s in summary_rows
+                       if period is not None and _day(s.get("report_date")) == period]
+        matches = [s for s in same_period
+                   if published is not None and _day(s.get("available_date")) == published
                    and all(s.get(k) == balance.get(k) for k in
-                           ("source", "data_source", "currency", "statement_basis"))]
+                           ("code", "currency", "statement_basis"))
+                   and _compatible_report_origin(balance, s)]
         row = dict(balance)
+        provenance_keys = ("code", "source", "report_source", "data_source", "report_date",
+                           "available_date", "currency", "statement_basis")
+        row["merge_diagnostics"] = {
+            "status": "matched" if len(matches) == 1 else "ambiguous" if matches else "unmatched",
+            "matching_reports": len(matches),
+            "balance": {k: balance.get(k) for k in provenance_keys},
+            "summary_candidates": [{k: s.get(k) for k in provenance_keys} for s in same_period],
+        }
         if len(matches) == 1:
             row.update(net_profit=matches[0].get("net_profit"),
                        deducted_profit=matches[0].get("deducted_profit"))
+            row["merge_diagnostics"]["origin_match"] = (
+                "exact" if balance.get("data_source") == matches[0].get("data_source")
+                else "sina_periodic_summary")
         rows.append(row)
     return rows
 
@@ -149,7 +182,7 @@ def fetch_financial_risk(code, as_of, debt_max=70., goodwill_max=20.,
             response = request_get(SOURCE_URL, params=dict(paperCode=market + symbol,
                 source=source, type="0", page="1", num="12"), timeout=15)
             response.raise_for_status()
-            parsed[source] = parser(response.json())
+            parsed[source] = [dict(row, code=symbol) for row in parser(response.json())]
             if source == "fzb":
                 rows = parsed[source]
         rows = combine_financial_rows(parsed["fzb"], parsed["gjzb"])

@@ -74,19 +74,25 @@ def quality_value_technical(out, event_window=5):
 
 def assess_low_structure(out, as_of, recent_window=60, min_age=5, max_age=40, atr_multiple=5.):
     """Recent confirmed closing-price bottom; isolated intraday wicks are diagnostic."""
-    result = dict(status="missing", anchor=None, anchor_date=None, age=None,
-                  gain_pct=None, allowed_gain_pct=None, annual_extreme_gain_pct=None)
+    result = dict(status="missing", reason="data_missing", missing_detail=None,
+                  recent_window=recent_window, min_age=min_age, max_age=max_age,
+                  anchor=None, anchor_date=None, age=None, gain_pct=None,
+                  allowed_gain_pct=None, annual_extreme_gain_pct=None)
     if out is None or not {"date", "close", "low", "atr"}.issubset(out.columns):
+        result["missing_detail"] = "required_columns"
         return result
     dates = pd.to_datetime(out["date"], errors="coerce")
     frame = out.loc[dates.notna() & (dates <= pd.Timestamp(as_of))].copy()
     frame["_date"] = dates.loc[frame.index]
     frame = frame.sort_values("_date").reset_index(drop=True)
     if frame.empty or frame["_date"].duplicated().any() or frame.iloc[-1]["_date"] != pd.Timestamp(as_of):
+        result["missing_detail"] = ("no_eligible_bars" if frame.empty else
+                                    "duplicate_dates" if frame["_date"].duplicated().any() else "as_of_bar_missing")
         return result
     closes = pd.to_numeric(frame["close"], errors="coerce")
     atr = pd.to_numeric(pd.Series([frame.iloc[-1]["atr"]]), errors="coerce").iloc[0]
     if len(frame) < recent_window or not np.isfinite(closes.tail(recent_window)).all() or (closes.tail(recent_window) <= 0).any():
+        result["missing_detail"] = "insufficient_bars" if len(frame) < recent_window else "invalid_close"
         return result
     anchor_index = closes.tail(recent_window).idxmin()
     age = len(frame) - 1 - int(anchor_index)
@@ -95,13 +101,16 @@ def assess_low_structure(out, as_of, recent_window=60, min_age=5, max_age=40, at
     extreme = pd.to_numeric(frame["low"].tail(250), errors="coerce")
     if np.isfinite(extreme).all() and extreme.min() > 0:
         result["annual_extreme_gain_pct"] = float((close / extreme.min() - 1) * 100)
+    result.update(anchor=anchor, anchor_date=frame.loc[anchor_index, "_date"].strftime("%Y-%m-%d"),
+                  age=age, gain_pct=(close / anchor - 1) * 100)
     if not np.isfinite(atr) or atr <= 0:
+        result["missing_detail"] = "invalid_atr"
         return result
     # Bounded volatility adaptation: 10% minimum, 20% maximum.
     allowed = float(np.clip(atr_multiple * atr / close * 100, 10., 20.))
-    result.update(anchor=anchor, anchor_date=frame.loc[anchor_index, "_date"].strftime("%Y-%m-%d"),
-                  age=age, gain_pct=(close / anchor - 1) * 100, allowed_gain_pct=allowed,
-                  status="verified" if min_age <= age <= max_age else "unconfirmed")
+    result.update(allowed_gain_pct=allowed,
+                  status="verified" if min_age <= age <= max_age else "unconfirmed",
+                  reason="too_new" if age < min_age else "too_old" if age > max_age else "confirmed")
     return result
 
 
