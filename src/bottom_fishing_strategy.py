@@ -4415,6 +4415,8 @@ def _screen_quality_pool(config: StrategyConfig, cache: CacheManager, market_env
     if float(getattr(config, "MIN_QV_SCORE", 0.0) or 0.0) > 0:
         logger.info("综合分下限等效门槛：%s", describe_qv_floor(config))
 
+    pending_evidence = {}
+
     def screen(stock):
         code, name = stock["code"], stock["name"]
         daily = get_daily_data(code, config, cache)
@@ -4444,8 +4446,20 @@ def _screen_quality_pool(config: StrategyConfig, cache: CacheManager, market_env
                 fund = enrich_forward_growth(code, fund, config, cache)  # legacy 单项净利同比
         fund = enrich_recent_operating(code, fund, config, cache, as_of=pre.date)
         fund = enrich_financial_risk(code, fund, config, cache, as_of=pre.date)
-        return evaluator(daily, code, name, config, market_env, fund,
-                         **eval_kwargs)
+        outcome = evaluator(daily, code, name, config, market_env, fund,
+                            **eval_kwargs)
+        sig, reason = outcome
+        if sig is not None and reason == "PASS" and sig.tier != "formal":
+            # 仅保存诊断摘要；线程池结束后统一打印，不进入推荐记录或排序。
+            pending_evidence[str(code)] = {
+                label: {key: evidence.get(key) for key in
+                        ("status", "period", "available_date", "missing_tags", "reasons", "error_type")
+                        if evidence.get(key) is not None}
+                for label, evidence in (("近期经营", fund.get("operating_trend") or {}),
+                                        ("财务风险", fund.get("financial_risk") or {}))
+                if isinstance(evidence, dict)
+            }
+        return outcome
     results, processed, timed_out = run_concurrent_screen(stocks, screen, config, logger)
     if volatile_out:
         volatile_out[:] = sort_volatile(volatile_out)
@@ -4474,6 +4488,40 @@ def _screen_quality_pool(config: StrategyConfig, cache: CacheManager, market_env
     if pending_out is not None:
         pending_out.extend(pending.to_dict("records"))
     formal = frame[frame["tier"] == "formal"].copy()
+    logger.info("优质低估低位最终分层：候选 %d，正式资格通过 %d，待核验 %d（行业去重/名额截取前）",
+                len(frame), len(formal), len(pending))
+    if not pending.empty:
+        tag_counts, sole_counts, combination_counts = Counter(), Counter(), Counter()
+        dual_guard = bool(getattr(config, "QV_VALUATION_DUAL_GUARD", False))
+        for row in pending.to_dict("records"):
+            tags = list(dict.fromkeys(t.strip() for t in str(row.get("missing_tags") or "").split(",") if t.strip()))
+            # PB 默认仅提示，不应算作阻止 formal 的原因；未知缺项显式留痕。
+            blockers = [t for t in tags if dual_guard or t != "valuation_pb"]
+            if not blockers:
+                blockers = ["pending_reason_unknown"]
+            tag_counts.update(blockers)
+            if len(blockers) == 1:
+                sole_counts.update(blockers)
+            combination_counts[",".join(sorted(blockers))] += 1
+            logger.info(
+                "[QV_PENDING] %s(%s) | 行情日期=%s | 阻断原因=%s | 原因说明=%s | "
+                "全部标签=%s | 综合分=%s 技术分=%s（正式门槛=%s） | 止跌=%s | "
+                "年度质量=%s 财务风险=%s 近期经营=%s 周期风险=%s | 经营详情=%s",
+                row.get("name"), row.get("code"), row.get("date"), ",".join(blockers),
+                _missing_tags_zh(",".join(blockers)), ",".join(tags) or "无",
+                row.get("score"), row.get("daily_score"), config.MIN_TECHNICAL_SCORE_FORMAL,
+                row.get("stabilization_level"), row.get("quality_status"),
+                row.get("financial_risk_status"), row.get("operating_status"),
+                row.get("cyclical_risk"), row.get("operating_summary") or "无")
+            logger.info("[QV_PENDING_EVIDENCE] %s(%s) | 财务证据摘要=%s",
+                        row.get("name"), row.get("code"),
+                        pending_evidence.get(str(row.get("code"))) or "无（未取得证据摘要）")
+        logger.info("[QV_PENDING_SUMMARY] 阻断原因覆盖（同一候选可命中多项，数量不可相加）：%s",
+                    "，".join(f"{tag}（{_missing_tags_zh(tag)}）={count}" for tag, count in tag_counts.most_common()))
+        logger.info("[QV_PENDING_SUMMARY] 唯一阻断原因（仅被这一项阻断）：%s",
+                    "，".join(f"{tag}={count}" for tag, count in sole_counts.most_common()) or "无")
+        logger.info("[QV_PENDING_SUMMARY] 阻断组合（互斥，数量合计等于待核验数）：%s",
+                    "；".join(f"[{tags}]={count}" for tags, count in combination_counts.most_common()))
     if config.USE_INDUSTRY_DEDUP and not formal.empty:
         formal = _dedup_by_industry(formal, config, cache)
     # 估值口径逐行标注：写入 valuation_mode 列，供日志汇总与飞书卡片声明本次实际口径
