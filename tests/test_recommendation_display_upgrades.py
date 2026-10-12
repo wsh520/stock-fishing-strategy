@@ -53,7 +53,7 @@ class RecommendationDisplayTests(unittest.TestCase):
         body = self.body(payloads[1])
         for text in ("自身历史PE分位: 23.5%", "有效历史样本: 180", "正常化PE 18.6",
                      "多年归母利润中位数口径", "盈利高峰风险", "财务风险: 已核验通过",
-                     "技术子分: 趋势 32.0 / 动能 24.0 / 量能 18.0", "操作计划"):
+                     "技术子分: 趋势 32.0 / 动能 24.0 / 量能 18.0", "人工参考区间"):
             self.assertIn(text, body)
         self.assertNotIn("配置", body)
 
@@ -151,6 +151,25 @@ class RecommendationDisplayTests(unittest.TestCase):
         self.assertEqual(body.split("操作计划", 1)[1].split("**信心", 1)[0], original_plan)
         self.assertNotIn("999999", json.dumps(payloads, ensure_ascii=False))
         self.assertNotIn("不应展示的待核验票", json.dumps(payloads, ensure_ascii=False))
+    def test_manual_reference_bands_use_half_atr_and_are_not_execution_orders(self):
+        from src.bottom_fishing_strategy import describe_trade_plan
+        lines = describe_trade_plan(dict(close=10., stop_loss=8.5, take_profit=13.,
+                                         rr_ratio=2., atr14=1., quality_score=70.))
+        text = "\n".join(lines)
+        self.assertIn("人工参考区间（非自动交易指令）", text)
+        self.assertIn("止损参考带 8.00 ~ 9.00（参考中点 8.50）", text)
+        self.assertIn("止盈参考带 12.50 ~ 13.50（参考中点 13.00）", text)
+        self.assertIn("半宽为 0.5×ATR14", text)
+        self.assertIn("不代表到期必须卖出", text)
+
+    def test_missing_atr_keeps_single_reference_levels_and_manual_note(self):
+        from src.bottom_fishing_strategy import describe_trade_plan
+        text = "\n".join(describe_trade_plan(dict(close=10., stop_loss=8.5, take_profit=13.,
+                                                  quality_score=70.)))
+        self.assertIn("止损参考价 8.50", text)
+        self.assertIn("止盈参考价 13.00", text)
+        self.assertIn("非自动交易指令", text)
+        self.assertNotIn("止损参考带", text)
 
 
 if __name__ == "__main__":

@@ -237,6 +237,15 @@ def evaluate_operating_trend(rows, as_of, profit_yoy_min=-10.0,
             or metrics["cash_conversion"] is None or metrics["cash_conversion"] < limits[5]):
         weak.append("operating_cashflow_declining")
     metrics.update(_supplemental_trends(usable, duplicates, latest))
+    # 最新单季度同比用于揭示累计同比可能掩盖的边际恶化；目前仅形成独立弱信号，
+    # 不作为硬否决，避免季节性/低基数和财报修订导致过度误杀。
+    for field in ("revenue", "net_profit", "deducted_profit"):
+        q_yoy = metrics.get(field + "_single_quarter_yoy")
+        if q_yoy is not None and q_yoy < -limits[3] - 1e-10:
+            weak.append(field + "_latest_quarter_declining")
+    cash_q_yoy = metrics.get("operating_cashflow_single_quarter_yoy")
+    if cash_q_yoy is not None and cash_q_yoy < -limits[4] - 1e-10:
+        weak.append("operating_cashflow_latest_quarter_declining")
     # Simultaneous deterioration in sales, earnings and operating cash is stronger evidence.
     if (metrics["revenue_yoy"] is not None and metrics["revenue_yoy"] < -1e-10
             and metrics["net_profit_yoy"] is not None and metrics["net_profit_yoy"] < -1e-10
@@ -260,6 +269,13 @@ def summarize_operating(evidence, status=None):
         metrics = evidence.get("metrics", {})
         for field, label in (("revenue_yoy", "收入"), ("net_profit_yoy", "净利"),
                              ("deducted_profit_yoy", "扣非"), ("operating_cashflow_yoy", "经营现金流")):
+            value = _number(metrics.get(field))
+            if value is not None:
+                parts.append(f"{label}同比{value:+.1f}%")
+        for field, label in (("revenue_single_quarter_yoy", "最新单季收入"),
+                             ("net_profit_single_quarter_yoy", "最新单季净利"),
+                             ("deducted_profit_single_quarter_yoy", "最新单季扣非"),
+                             ("operating_cashflow_single_quarter_yoy", "最新单季经营现金流")):
             value = _number(metrics.get(field))
             if value is not None:
                 parts.append(f"{label}同比{value:+.1f}%")

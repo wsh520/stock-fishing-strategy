@@ -325,6 +325,7 @@ class StrategyConfig:
     HISTORICAL_VALUATION_WEIGHT: float = 0.30
     # 行业相对便宜仍须防范整个行业高估；默认软风险提示，可配置行业专属硬上限。
     INDUSTRY_PE_ABSOLUTE_CAPS: Optional[dict] = None
+    INDUSTRY_PE_ABSOLUTE_CAP_DEFAULT: Optional[float] = 50.0
     INDUSTRY_PE_WARN: float = 50.0
     CYCLICAL_INDUSTRY_KEYWORDS: tuple = ("煤炭", "钢铁", "黑色金属", "有色", "石油", "化工", "化学原料", "采矿", "航运", "水上运输")
     CYCLICAL_INDUSTRY_CODES: tuple = ("B06", "B07", "B08", "B09", "B10", "B11", "C25", "C26", "C30", "C31", "C32", "G55")
@@ -2335,6 +2336,17 @@ def describe_trade_plan(row: dict, config: Optional[StrategyConfig] = None) -> l
       - 建议持有周期：HOLD_DAYS_HINT_MIN ~ MAX，与周度追踪窗口（推荐后第 5/10/15/20
         个交易日）对齐，第 20 个交易日是到期离场判定日。
 
+    2026-10-12 展示层修正（纯文案，不改任何价位计算与离场口径；依据 audit_live_trading
+    实测：主板 31880 次「随机起点持有 20 个交易日」中 +30% 止盈触发率仅 5.9%、
+    −15% 止损触发率 10.9%，期内最大有利波动中位 +6.4%）：
+      1) 止盈目标（+30% 估值修复 / 突破 +15%）通常需要 20 个交易日以上才能触及，
+         而建议持有窗口就是 20 个交易日——旧文案「未触及按收盘价平仓」会让执行者
+         系统性在远低于止盈处离场。现在明示这一错配，是否延续持有由执行者决定，
+         策略自身的「20 日离场」口径不变（不自擅放宽持有期）。
+      2) rr_ratio 是「止盈/止损计划参数」的代数恒等式（quality_value 恒 2.0=30/15，
+         突破恒 ≥2.5=15/6），不随个股变化、不是概率估计，旧展示易被误读为个股
+         期望值，现补注说明。
+
     任一必需字段缺失（旧数据/异常输入）时整段不渲染，对既有调用与测试向后兼容。
     """
     close = _num_or_none(row.get("close"))
@@ -2344,27 +2356,61 @@ def describe_trade_plan(row: dict, config: Optional[StrategyConfig] = None) -> l
     band = max(0.0, float(getattr(cfg, "ENTRY_BAND_PCT", 1.5) or 0.0)) / 100.0
     if band > 0:
         lo, hi = close * (1 - band), close * (1 + band)
-        entry = f"建仓 {lo:.2f} ~ {hi:.2f}｜高于上沿不追，低于下沿按失效重估"
+        entry = f"参考关注区间 {lo:.2f} ~ {hi:.2f}（以信号日收盘为锚；非自动建仓指令）"
     else:
-        entry = f"建仓 {close:.2f}（信号日收盘价）"
-    lines = ["**操作计划**（次日开盘按区间建仓）", entry]
-    price_bits = []
+        entry = f"信号日收盘参考 {close:.2f}"
     stop = _num_or_none(row.get("stop_loss"))
     take = _num_or_none(row.get("take_profit"))
+    rr = _num_or_none(row.get("rr_ratio"))
+    atr = _num_or_none(row.get("atr14"))
+    price_bits = []
+    hold_lo = int(getattr(cfg, "HOLD_DAYS_HINT_MIN", 10) or 0)
+    hold_hi = int(getattr(cfg, "HOLD_DAYS_HINT_MAX", 20) or 0)
+    quality_mode = _num_or_none(row.get("quality_score")) is not None or _num_or_none(row.get("position_250")) is not None
+    if not quality_mode:
+        # 保持 technical/突破旧展示口径，避免改动非目标策略。
+        if band > 0:
+            legacy_entry = f"建仓 {close * (1-band):.2f} ~ {close * (1+band):.2f}｜高于上沿不追，低于下沿按失效重估"
+        else:
+            legacy_entry = f"建仓 {close:.2f}（信号日收盘价）"
+        legacy = ["**操作计划**（次日开盘按区间建仓）", legacy_entry]
+        if stop is not None and stop > 0:
+            legacy.append(f"止损 {stop:.2f}（{(stop / close - 1) * 100:+.1f}%）")
+        if take is not None and take > 0:
+            legacy.append(f"止盈 {take:.2f}（{(take / close - 1) * 100:+.1f}%）")
+        if rr is not None:
+            legacy.append(f"盈亏比 {rr:.2f}（止盈/止损计划值，非概率估计）")
+        if hold_lo > 0 and hold_hi >= hold_lo:
+            legacy.append(f"建议持有 {hold_lo}~{hold_hi} 个交易日")
+        return legacy
+    lines = ["**人工参考区间（非自动交易指令）**", entry]
+    # 区间半宽取 0.5×ATR，反映个股当下日常波动；止损/止盈中点仍沿用
+    # 策略计算的参考价，不改变筛选逻辑，亦不代表必然成交价。
+    half_band = 0.5 * atr if atr is not None and atr > 0 else None
     if stop is not None and stop > 0:
-        price_bits.append(f"止损 {stop:.2f}（{(stop / close - 1) * 100:+.1f}%）")
+        if half_band is not None:
+            sl_lo, sl_hi = max(0.01, stop - half_band), stop + half_band
+            price_bits.append(f"止损参考带 {sl_lo:.2f} ~ {sl_hi:.2f}（参考中点 {stop:.2f}）")
+        else:
+            price_bits.append(f"止损参考价 {stop:.2f}（{(stop / close - 1) * 100:+.1f}%）")
     if take is not None and take > 0:
-        price_bits.append(f"止盈 {take:.2f}（{(take / close - 1) * 100:+.1f}%）")
+        if half_band is not None:
+            tp_lo, tp_hi = max(0.01, take - half_band), take + half_band
+            price_bits.append(f"止盈参考带 {tp_lo:.2f} ~ {tp_hi:.2f}（参考中点 {take:.2f}）")
+        else:
+            price_bits.append(f"止盈参考价 {take:.2f}（{(take / close - 1) * 100:+.1f}%）")
     rr = _num_or_none(row.get("rr_ratio"))
     if rr is not None:
-        price_bits.append(f"盈亏比 {rr:.2f}")
+        price_bits.append(f"计划参数比 {rr:.2f}（非成功概率/期望收益）")
     if price_bits:
         lines.append(" | ".join(price_bits))
+    if atr is not None and atr > 0:
+        lines.append(f"区间说明：止盈/止损带以参考价为中点，半宽为 0.5×ATR14（ATR14={atr:.2f}）；需结合估值、基本面和实际行情人工判断。")
+    lines.append("建仓区间以信号日收盘为锚，仅作观察范围；跳空、基本面变化或市场环境变化时应重新评估，不机械追价/补仓。")
     hold_lo = int(getattr(cfg, "HOLD_DAYS_HINT_MIN", 10) or 0)
     hold_hi = int(getattr(cfg, "HOLD_DAYS_HINT_MAX", 20) or 0)
     if hold_lo > 0 and hold_hi >= hold_lo:
-        lines.append(f"建议持有 {hold_lo}~{hold_hi} 个交易日"
-                     f"（第 {hold_hi} 个交易日仍未触及止损/止盈，按收盘价平仓离场）")
+        lines.append(f"建议复核窗口 {hold_lo}~{hold_hi} 个交易日（仅为观察周期，不代表到期必须卖出）。")
     return lines
 
 
@@ -2374,7 +2420,7 @@ _MISSING_TAG_ZH = {
     "fund": "财务数据缺失", "fund_roe": "ROE缺失", "fund_debt": "负债率缺失",
     "fund_goodwill": "商誉缺失", "fund_deducted": "扣非缺失",
     "valuation_pe": "PE未核验", "valuation_pb": "PB未核验",
-    "fund_annual": "多年财务未核验", "market_date": "行情基准日期缺失",
+    "fund_annual": "多年财务未核验", "annual_availability_assumed": "年度财务公告日需人工核对", "market_date": "行情基准日期缺失",
     "financial_review": "金融企业待专项核验",
     "valuation": "估值缺失", "pct_chg": "涨幅数据缺失", "gap": "开盘价缺失",
     "macd_mom": "MACD柱数据缺失", "kdj": "KDJ数据缺失",
@@ -2429,7 +2475,7 @@ def describe(row: dict) -> str:
             f"综合规则分: {_fmt_cell(row.get('score'))} | 质量分: {_fmt_cell(row.get('quality_score'))}"
             f" | 估值分: {_fmt_cell(row.get('valuation_score'))} | 技术分: {_fmt_cell(row.get('daily_score'))}",
             f"收盘: {_fmt_cell(row.get('close'))} | PE: {_fmt_cell(row.get('pe_ttm'))}"
-            f" | PB: {_fmt_cell(row.get('pb_mrq'))} | 250日区间位置: {float(row.get('position_250', 0)):.1%}",
+            f" | PB: {_fmt_cell(row.get('pb_mrq'))} | 250日收盘价分位: {_fmt_cell(float(row.get('position_250')) * 100 if _num_or_none(row.get('position_250')) is not None else None, default='未核验')}%",
             f"入选依据: {row.get('signals_hit', '')}",
         ]
         lines.append(f"排序分: {_fmt_cell(row.get('rank_score'))}（规则排序，不代表成功概率）")
@@ -2586,6 +2632,8 @@ class Signal:
     daily_score: float; rsi: float; rsi7: float; rsi21: float; vol_ratio: float
     turnover_ratio: float; stop_loss: float; take_profit: float; rr_ratio: float
     market_env: str; has_divergence: bool
+    # 用于展示止盈/止损参考带；仅展示，不参与荐股资格和排序。
+    atr14: Optional[float] = None
     # ===== 荐股质量三维（TOP5 改进）=====
     signals_hit: str = ""             # 形态标签：实际触发的技术条件（逗号分隔）
     fund_status: str = "missing"      # 核验状态：财务 verified/partial/missing
@@ -3114,6 +3162,7 @@ def evaluate(daily_df: Optional[pd.DataFrame], code: str = "", name: str = "", c
         vol_ratio=round(float(d_last.get("daily_vol_ratio", 0)), 2),
         turnover_ratio=round(float(d_last.get("daily_turnover_ratio", 0)), 2),
         stop_loss=rr["stop_loss"], take_profit=rr["take_profit"], rr_ratio=rr["rr_ratio"],
+        atr14=round(float(atr_val), 4) if atr_val is not None and np.isfinite(atr_val) and atr_val > 0 else None,
         market_env=regime, has_divergence=has_div,
         signals_hit=",".join(hits), fund_status=fund_status,
         missing_tags=",".join(dict.fromkeys(t for t in missing_tags if t)),  # 去重保序
@@ -3942,6 +3991,12 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
         if pe_pct is not None:
             if pe_pct > pct_cap:
                 return None, "FAIL_VALUATION"
+            # 行业分位只能说明相对便宜；绝对护栏防止全行业估值泡沫。
+            industry_name = str(val_context.get("industry") or "")
+            caps = getattr(config, "INDUSTRY_PE_ABSOLUTE_CAPS", None) or {}
+            absolute_cap = caps.get(industry_name, getattr(config, "INDUSTRY_PE_ABSOLUTE_CAP_DEFAULT", None))
+            if absolute_cap is not None and pe > float(absolute_cap):
+                return None, "FAIL_VALUATION"
         elif pe > config.MAX_PE_TTM:
             return None, "FAIL_VALUATION"
     # --- PB 异常识别 / 可选双护栏 ---
@@ -4300,6 +4355,10 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
     _min_quality = float(getattr(config, "MIN_QUALITY_SCORE", 0.0) or 0.0)
     if _min_quality > 0 and quality["status"] == "verified" and quality_score < _min_quality:
         return None, "FAIL_QUALITY_FLOOR"
+    assumed_availability = any(bool(r.get("availability_assumed")) for r in quality.get("annual_rows", []))
+    if assumed_availability:
+        missing.append("annual_availability_assumed")
+        tags.append("年度财务可得日含保守假定，建议人工核对公告日期")
     effective_missing = (list(missing) if dual_valuation_guard else
                          [t for t in missing if t != "valuation_pb"])
     tech_floor = float(getattr(config, "MIN_TECHNICAL_SCORE_FORMAL", 0.0) or 0.0)
@@ -4363,9 +4422,10 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
         rsi=finite(d.get("rsi14")), rsi7=finite(d.get("rsi7")), rsi21=finite(d.get("rsi21")),
         vol_ratio=finite(d.get("daily_vol_ratio")), turnover_ratio=finite(d.get("daily_turnover_ratio")),
         stop_loss=rr["stop_loss"], take_profit=rr["take_profit"], rr_ratio=rr["rr_ratio"],
+        atr14=round(float(atr), 4) if atr is not None and np.isfinite(atr) and atr > 0 else None,
         market_env=(market_env or {}).get("regime", "unknown"),
         has_divergence=bool(d.get("bottom_divergence", False)), signals_hit=",".join(tags),
-        fund_status="verified" if quality["status"] == "verified" and debt is not None else "partial",
+        fund_status="verified" if quality["status"] == "verified" and debt is not None and not assumed_availability else "partial",
         weekly_status="not_required", missing_tags=",".join(dict.fromkeys(missing)),
         # 技术分短板：低于门槛降为 pending（基本面好但入场时机未到，跟踪观察）
         tier="formal" if formal_eligible else "pending",

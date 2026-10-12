@@ -159,15 +159,17 @@ class QualityRecommendations(unittest.TestCase):
         self.assertIn("建仓", text)
         self.assertIn("止损", text)
         self.assertIn("止盈", text)
-        self.assertIn("建议持有", text)
+        # 操作价位属于人工参考，不是强制交易指令。
+        self.assertIn("建议复核窗口", text)
 
     def test_trade_plan_fields_and_band(self):
         plan = " ".join(m.describe_trade_plan({"close": 10.0, "stop_loss": 9.5,
-                                               "take_profit": 11.0, "rr_ratio": 2.0}))
-        self.assertIn("建仓 9.85 ~ 10.15", plan)          # 10.00 × (1 ± ENTRY_BAND_PCT=1.5%)
-        self.assertIn("止损 9.50（-5.0%）", plan)
-        self.assertIn("止盈 11.00（+10.0%）", plan)
-        self.assertIn("建议持有 10~20 个交易日", plan)
+                                               "take_profit": 11.0, "rr_ratio": 2.0,
+                                               "quality_score": 70.}))
+        self.assertIn("参考关注区间 9.85 ~ 10.15", plan)
+        self.assertIn("止损参考价 9.50（-5.0%）", plan)
+        self.assertIn("止盈参考价 11.00（+10.0%）", plan)
+        self.assertIn("建议复核窗口 10~20 个交易日", plan)
 
     def test_trade_plan_omitted_without_close(self):
         # 旧数据/字段不全时整段不渲染，避免卡片出现 nan 或空洞的「操作计划」标题。

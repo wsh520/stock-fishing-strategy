@@ -43,6 +43,17 @@ class OperatingUpgradesTests(unittest.TestCase):
         self.assertEqual(result["metrics"]["net_profit_single_quarter"], 100)
         self.assertEqual(self.evaluate(dict(net_profit=None))["status"], "missing")
 
+    def test_latest_single_quarter_decline_is_separately_flagged(self):
+        rows = [row("2025-03-31", revenue=1000, net_profit=100, deducted_profit=90, operating_cashflow=110),
+                row("2025-06-30", revenue=2000, net_profit=400, deducted_profit=360, operating_cashflow=440),
+                row("2025-12-31", revenue=4000, net_profit=700, deducted_profit=630, operating_cashflow=770),
+                row("2026-03-31", revenue=1000, net_profit=100, deducted_profit=90, operating_cashflow=110),
+                row("2026-06-30", revenue=2000, net_profit=350, deducted_profit=315, operating_cashflow=385)]
+        result = evaluate_operating_trend(rows, "2026-09-01")
+        # 累计净利同比为负但处于容忍区间；最新单季净利由300降至250。
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("net_profit_latest_quarter_declining", result["reasons"])
+
     def test_cumulative_quarter_and_ttm_exact_arithmetic(self):
         rows = [row("2024-06-30", net_profit=50), row("2024-12-31", net_profit=120),
                 row("2025-03-31", net_profit=40), row("2025-06-30", net_profit=70),
