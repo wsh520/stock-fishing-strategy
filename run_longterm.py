@@ -27,7 +27,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from src.quality_longterm_strategy import LongTermQualityConfig, evaluate_quality_longterm
 from src.bottom_fishing_strategy import (
-    get_stock_list, get_index_daily, _market_environment,
+    get_stock_list, get_index_daily, get_market_environment,
     run_concurrent_screen, _rank_signals, build_industry_valuation_snapshot,
     get_stock_industry, CacheManager, _tag_valuation_mode, _bs_login, _bs_logout
 )
@@ -63,7 +63,7 @@ def main_longterm(config: LongTermQualityConfig, no_cache: bool = False,
         logger.info("=" * 60)
         
         index_df = get_index_daily(config, cache)
-        market_env = _market_environment(config, cache, index_df)
+        market_env = get_market_environment(config, cache)
         regime = market_env.get("regime", "unknown")
         
         logger.info("市场环境: %s（沪深300 MA20斜率: %.2f%%）", 
