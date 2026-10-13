@@ -202,7 +202,12 @@ def main(argv: list[str] | None = None):
         n_picks = 0 if output_df is None else len(output_df)
         logger.info("Step 2/4 完成 (%.1f 分钟)，正式推荐 %d 只，待核验候选 %d 只，波动率超限观察 %d 只",
                     (time.time() - t) / 60, n_picks, len(pending_rows), len(volatile_rows))
-        for _, r in (output_df or pd.DataFrame()).iterrows():
+        # 2026-10-14 生产事故修复：原写法 `output_df or pd.DataFrame()` 会对 DataFrame
+        # 求真值，pandas 对「真值歧义」直接抛 ValueError——**筛选产出任何 DataFrame
+        # （含空表）时必崩**，且崩点在落库（Step 3/4）与通知（Step 4/4）之前，
+        # 当日推荐全丢。DataFrame 只能用 `is None` / `.empty` 判断，禁止 or 短路。
+        _rows_df = output_df if output_df is not None else pd.DataFrame()
+        for _, r in _rows_df.iterrows():
             logger.info("  推荐: %s(%s) 评分 %s（排序分 %s）%s级 收盘 %s | 入选 %s | 持有 %d~%d 天",
                         r.get("name"), r.get("code"), r.get("score"),
                         "-" if pd.isna(r.get("rank_score")) else f"{float(r['rank_score']):.1f}",

@@ -305,6 +305,62 @@ class LongTermOfflineTest(unittest.TestCase):
         self.assertIn("DETECT_ACCELERATING_DECLINE", names)
         self.assertIn("DETECT_VOLUME_EXHAUSTION", names)
 
+    # ---------- 5) 入口脚本 main() 全路径（2026-10-14 生产事故回归）----------
+    def _run_main_with_screen_result(self, screen_result):
+        """以桩数据跑 run_longterm.main() 全流程，返回 (save_mock, notify_mock)。
+
+        覆盖取数/筛选/熔断/降级探测/落库/通知全部外部依赖，不联网、不连库。
+        """
+        import run_longterm
+        from unittest.mock import MagicMock, patch
+        import pandas as pd
+
+        index_df = pd.DataFrame({"date": ["2026-10-09", "2026-10-12", "2026-10-13"],
+                                 "close": [3900.0, 3950.0, 4000.0]})
+        with patch.object(self.bfs, "get_market_environment",
+                          return_value={"regime": "bull", "description": "偏多（测试）"}), \
+             patch.object(self.bfs, "get_index_daily", return_value=index_df), \
+             patch.object(self.bfs, "latest_completed_trade_day", return_value="2026-10-13"), \
+             patch.object(self.bfs, "market_crash_halt", return_value=None), \
+             patch.object(self.bfs, "is_data_degraded", return_value=False), \
+             patch.object(self.bfs, "_screen_quality_pool", return_value=screen_result), \
+             patch.object(run_longterm, "save_recommendations", MagicMock(return_value=1)) as save_mock, \
+             patch.object(run_longterm, "notify_screening_result", MagicMock()) as notify_mock:
+            # 不缺省 --no-save/--no-notify：必须真的走到落库与通知两步
+            run_longterm.main([])
+        return save_mock, notify_mock
+
+    def _screen_frame(self):
+        import pandas as pd
+        return pd.DataFrame([{
+            "code": "600001", "name": "测试票", "date": "2026-10-13", "close": 12.34,
+            "score": 71.5, "rank_score": 74.2, "grade": "B", "daily_score": 55.0,
+            "signals_hit": "长期优质低估低位,止跌中确认", "tier": "formal",
+            "holding_days_hint_min": 30, "holding_days_hint_max": 90,
+            "valuation_mode": "industry",
+        }])
+
+    def test_main_survives_dataframe_truthiness(self):
+        """2026-10-14 生产事故回归：筛选产出 DataFrame 时 main() 不得因真值歧义崩溃。
+
+        原写法 `output_df or pd.DataFrame()` 对任何 DataFrame（含空表）求真值，
+        pandas 抛 ValueError，且崩点在落库与通知**之前**——当日推荐全丢。
+        DataFrame 只允许 `is None` / `.empty` 判断。
+        """
+        # 1) 非空 DataFrame（事故形态：必须跑完并落库/通知）
+        save_mock, notify_mock = self._run_main_with_screen_result(self._screen_frame())
+        save_mock.assert_called_once()
+        self.assertEqual(save_mock.call_args.kwargs.get("strategy"), "longterm_quality")
+        notify_mock.assert_called_once()
+        # 2) 空 DataFrame（全部 pending 时 _screen_quality_pool 的合法返回）
+        save_mock, notify_mock = self._run_main_with_screen_result(self._screen_frame().iloc[0:0])
+        save_mock.assert_called_once()
+        notify_mock.assert_called_once()
+        # 3) None（熔断/无候选）：不得崩，通知仍须发出（今日无正式推荐卡片）
+        save_mock, notify_mock = self._run_main_with_screen_result(None)
+        save_mock.assert_called_once()
+        notify_mock.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
