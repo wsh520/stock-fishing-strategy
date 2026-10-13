@@ -31,7 +31,7 @@ from src.bottom_fishing_strategy import (
     run_concurrent_screen, _rank_signals, build_industry_valuation_snapshot,
     get_stock_industry, CacheManager, _tag_valuation_mode, _bs_login, _bs_logout
 )
-from store.mysql_store import save_recommendation
+from store.mysql_store import save_recommendations
 from notify.feishu import send_stock_recommendations
 
 logging.basicConfig(
@@ -180,7 +180,7 @@ def main_longterm(config: LongTermQualityConfig, no_cache: bool = False,
         # 10. 落库
         if not no_save and len(ranked) > 0:
             try:
-                saved = save_recommendation(ranked, strategy="longterm_quality")
+                saved = save_recommendations(ranked, strategy="longterm_quality")
                 logger.info("已保存%d条推荐记录到数据库（strategy=longterm_quality）", saved)
             except Exception as e:
                 logger.error("保存到数据库失败: %s", e)
