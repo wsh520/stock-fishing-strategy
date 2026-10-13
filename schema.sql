@@ -2,7 +2,7 @@
 -- A股日线量化选股策略 - MySQL 持久化表结构
 --
 -- 两张表：
---   1. stock_recommendation  每日推荐记录（run.py 每日选股后写入）
+--   1. stock_recommendation  每日推荐记录（run.py / run_breakout.py / run_longterm.py 选股后写入）
 --   2. stock_tracking        周度表现追踪（run_weekly_tracking.py 每周写入，
 --                            每条推荐最多追踪 4 周 ≈ 一个月）
 --
@@ -19,8 +19,13 @@
 --     升级为 (rec_date, code, strategy)（幂等迁移，历史行 strategy 回填默认值
 --     'bottom_fishing'），本文件为手动建库参考。
 --     只有 rec_tier='formal' 的正式推荐会落库（待核验候选不落库、不参与追踪）。
---     strategy 区分策略来源：bottom_fishing（抄底）/ volume_breakout（放量突破），
---     同一股票同日可被两套策略分别推荐并存，追踪与归因按来源分列。
+--     strategy 区分策略来源：bottom_fishing（优质低估低位）/ volume_breakout（放量突破）/
+--     longterm_quality（长期优质低估低位，恰好 16 字符），程序只接受这三个已注册值；
+--     同一股票同日可被多套策略分别推荐并存，追踪与归因按来源分列。
+--     signals_hit / missing_tags 必须是 TEXT（不是 VARCHAR(N)）：证据链实测 112~225
+--     字符且仍在增长，MySQL 1406 超长会让整批 INSERT 失败（当日全部推荐落不了库）。
+--     存量表由 _TEXT_COLUMN_UPGRADES 幂等 MODIFY 到 TEXT；ALTER 无权限时降级为按
+--     information_schema 真实容量截断（_clip_to_capacity），保证宁可不完整也要落库。
 -- ----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS stock_recommendation (
     id               BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '主键',
@@ -36,17 +41,17 @@ CREATE TABLE IF NOT EXISTS stock_recommendation (
     rsi21            DECIMAL(5, 1)   NULL COMMENT 'RSI21',
     vol_ratio        DECIMAL(8, 2)   NULL COMMENT '量比（对20日均量）',
     turnover_ratio   DECIMAL(8, 2)   NULL COMMENT '换手比（展示用）',
-    stop_loss        DECIMAL(10, 3)  NULL COMMENT '止损价（3×ATR 或固定15%）',
-    take_profit      DECIMAL(10, 3)  NULL COMMENT '止盈价（固定30%）',
+    stop_loss        DECIMAL(10, 3)  NULL COMMENT '止损价（max(3×ATR, 固定15%)，仅展示不参与否决）',
+    take_profit      DECIMAL(10, 3)  NULL COMMENT '止盈价（固定30%，仅展示不参与否决）',
     rr_ratio         DECIMAL(6, 2)   NULL COMMENT '风险收益比（仅展示，不参与否决）',
     market_env       VARCHAR(16)     NULL COMMENT '市场环境 bull/bear/neutral/unknown',
     has_divergence   TINYINT(1)      NOT NULL DEFAULT 0 COMMENT '是否底背离（双低点算法）1/0',
-    signals_hit      VARCHAR(255)    NULL COMMENT '入选依据（实际触发的技术条件，逗号分隔）',
+    signals_hit      TEXT            NULL COMMENT '入选依据（实际触发的技术条件，逗号分隔；TEXT 防 1406 整批失败）',
     fund_status      VARCHAR(16)     NULL COMMENT '财务核验 verified/partial/missing',
     weekly_status    VARCHAR(16)     NULL COMMENT '周线核验 confirmed/unverified/disabled',
     rec_tier         VARCHAR(8)      NULL COMMENT '推荐层级 formal/pending',
-    strategy         VARCHAR(16)     NOT NULL DEFAULT 'bottom_fishing' COMMENT '策略来源 bottom_fishing/volume_breakout',
-    missing_tags     VARCHAR(255)    NULL COMMENT '缺失项标签（逗号分隔）',
+    strategy         VARCHAR(16)     NOT NULL DEFAULT 'bottom_fishing' COMMENT '策略来源 bottom_fishing/volume_breakout/longterm_quality',
+    missing_tags     TEXT            NULL COMMENT '缺失项标签（逗号分隔；TEXT 防 1406 整批失败）',
     created_at       DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '写入时间',
     PRIMARY KEY (id),
     UNIQUE KEY uk_rec_date_code_strategy (rec_date, code, strategy),
