@@ -206,6 +206,13 @@ class VolumeBreakoutConfig(StrategyConfig):
     ATR_TAKE_PROFIT_MULT: float = 5.0        # ATR 目标与固定目标取较近者
     TIME_STOP_DAYS: int = 5                 # 回测中无延续的时间止损
     TRAILING_ATR_MULT: float = 2.0          # 回测移动止损倍数
+    # 建议持有周期：突破是 2~5 日短线口径（BREAKOUT_HOLD_DAYS=2 / TIME_STOP_DAYS=5），
+    # 必须显式覆写基类的 HOLD_DAYS_HINT——2026-10-13 基类因执行中期化调到 40~60，
+    # 若不覆写，突破卡片会跟着显示 40~60 天，与其短线定位矛盾。
+    # 覆写在构造 BreakoutSignal 时写入行内字段（holding_days_hint_min/max），
+    # 与长期 sleeve 同一机制：行内值优先，回落 config 也只落到本类。
+    HOLD_DAYS_HINT_MIN: int = 10
+    HOLD_DAYS_HINT_MAX: int = 20
     ADAPTIVE_VOLUME_LOOKBACK: int = 60       # 自身历史量能分位数窗口
     MIN_VOLUME_PERCENTILE: float = 0.80     # 当日成交量至少处于历史80%分位
     MIN_AMOUNT_RATIO: float = 1.5           # 当日成交额/前20日成交额中位数
@@ -1035,6 +1042,10 @@ def evaluate_breakout(
         breakout_level=breakout_level,
         breakout_margin=round(breakout_margin, 2),
         platform_range=round(float(d_last.get("platform_range", 0)), 2),
+        # 短线持有口径写入行内字段（describe_trade_plan 优先读行内值），
+        # 不随基类 HOLD_DAYS_HINT 的中期化调整而变长。
+        holding_days_hint_min=int(config.HOLD_DAYS_HINT_MIN),
+        holding_days_hint_max=int(config.HOLD_DAYS_HINT_MAX),
     )
     for key in ("breakout_score", "volume_br_score", "pattern_score", "trend_br_score", "momentum_br_score", "volume_ratio_score", "consolidation_score"):
         setattr(sig, key, round(float(d_last.get(key, 0)), 3))

@@ -4,7 +4,7 @@
 -- 两张表：
 --   1. stock_recommendation  每日推荐记录（run.py / run_breakout.py / run_longterm.py 选股后写入）
 --   2. stock_tracking        周度表现追踪（run_weekly_tracking.py 每周写入，
---                            每条推荐最多追踪 4 周 ≈ 一个月）
+--                            每条推荐最多追踪到第60个交易日 ≈ 三个月）
 --
 -- 使用：在 MySQL 5.7+ / 8.0 中执行本文件（先 CREATE DATABASE 并 USE）：
 --   CREATE DATABASE IF NOT EXISTS stock_fishing DEFAULT CHARSET utf8mb4;
@@ -42,7 +42,7 @@ CREATE TABLE IF NOT EXISTS stock_recommendation (
     vol_ratio        DECIMAL(8, 2)   NULL COMMENT '量比（对20日均量）',
     turnover_ratio   DECIMAL(8, 2)   NULL COMMENT '换手比（展示用）',
     stop_loss        DECIMAL(10, 3)  NULL COMMENT '止损价（max(3×ATR, 固定15%)，仅展示不参与否决）',
-    take_profit      DECIMAL(10, 3)  NULL COMMENT '止盈价（固定30%，仅展示不参与否决）',
+    take_profit      DECIMAL(10, 3)  NULL COMMENT '止盈价（固定+15%，仅展示不参与否决；突破/长期另有口径）',
     rr_ratio         DECIMAL(6, 2)   NULL COMMENT '风险收益比（仅展示，不参与否决）',
     market_env       VARCHAR(16)     NULL COMMENT '市场环境 bull/bear/neutral/unknown',
     has_divergence   TINYINT(1)      NOT NULL DEFAULT 0 COMMENT '是否底背离（双低点算法）1/0',
@@ -62,7 +62,8 @@ CREATE TABLE IF NOT EXISTS stock_recommendation (
   COLLATE = utf8mb4_unicode_ci COMMENT ='每日选股推荐记录';
 
 -- ----------------------------------------------------------------------------
--- 周度追踪表：推荐后第5/10/15/20个市场交易日，允许60日内补跑。
+-- 周度追踪表：推荐后第5/10/15/20/40/60个市场交易日（TRACK_HORIZONS，2026-10-13
+-- 执行中期化新增 40/60；生产建议持有窗口 40~60 个交易日），允许115日历日内补跑。
 -- 目标日停牌/缺价不填充。holding_trade_days=NULL 的历史行不混入固定期限归因。
 -- 存量迁移由 _ensure_tracking_schema 自动执行：保留所有历史行及周号、日期、价格，
 -- 同 rec_id+close_date 仅最早一行 legacy_duplicate=0，其他行标记为1；
@@ -76,7 +77,7 @@ CREATE TABLE IF NOT EXISTS stock_tracking (
     rec_id        BIGINT UNSIGNED NOT NULL COMMENT '关联 stock_recommendation.id',
     rec_date      DATE            NOT NULL COMMENT '推荐日期（冗余，便于直接查询）',
     code          VARCHAR(8)      NOT NULL COMMENT '股票代码（冗余）',
-    week_no       TINYINT         NOT NULL COMMENT '第几次追踪（1起，最多4）',
+    week_no       TINYINT         NOT NULL COMMENT '第几次追踪（=持有交易日数/5：1,2,3,4,8,12）',
     track_date    DATE            NOT NULL COMMENT '本次追踪执行日期',
     close_date    DATE            NOT NULL COMMENT '收盘价对应的实际交易日',
     holding_trade_days TINYINT UNSIGNED NULL COMMENT '推荐后市场交易日数；旧记录未知为NULL',

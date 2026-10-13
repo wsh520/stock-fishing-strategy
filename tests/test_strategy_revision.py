@@ -77,7 +77,12 @@ class RevisedRecommendationTests(unittest.TestCase):
         # 注：2026-10-07 起止跌确认层多了「V 值高位保护」（QV_MAX_GAIN_FROM_250D_LOW）。
         # 本用例把末 25 根 low 人为压到 1.0，等价于「已涨离低点极远」，
         # 在默认配置下会先被高位保护拦下（返回 None）——那不是本用例要测的东西。
-        # 故显式关闭高位保护，使断言聚焦于「止跌证据为非有限值时不得被提升为 medium」。
+        # 故显式关闭高位保护，使断言聚焦于「止跌证据为非有限值时不得被提升」。
+        # 2026-10-13 口径变化：medium 必须站上 MA20（QV_STABILIZATION_MEDIUM_
+        # REQUIRES_MA20，见 tests/test_stab_cooldown_20261013.py）后，BELOW_MA20_
+        # MACD_UP 形态的左侧通道已整体不再构成 medium——有限值同样只到 weak。
+        # 故「不得提升」的断言从 medium 改为 weak：有限/非有限左侧证据都到不了
+        # medium，且非有限时仍须保持 pending 观察（不放行）。
         base = cfg()
         base.QV_MAX_GAIN_FROM_250D_LOW = None
         original = m.compute_daily_signals
@@ -89,7 +94,8 @@ class RevisedRecommendationTests(unittest.TestCase):
             return result
         frame = mk_df(BELOW_MA20_MACD_UP)
         with patch.object(m, "compute_daily_signals", side_effect=lambda df, c: output(df, c)):
-            self.assertEqual(evaluate(frame=frame, config=base)[0].stabilization_level, "medium")
+            signal = evaluate(frame=frame, config=base)[0]
+            self.assertEqual((signal.stabilization_level, signal.tier), ("weak", "pending"))
         with patch.object(m, "compute_daily_signals", side_effect=lambda df, c: output(df, c, True)):
             signal, reason = evaluate(frame=frame, config=base)
             self.assertEqual((reason, signal.tier, signal.stabilization_level), ("PASS", "pending", "weak"))

@@ -227,8 +227,14 @@ check("ATR 缺失 → 回退固定 -15%",
       abs(rr_none["stop_loss"] / close - 1 + 0.15) < 1e-6)
 check("止损恒不为正（entry=5 元等极低价下仍 > 0）",
       m.compute_risk_reward(5.0, c, atr=1.0)["stop_loss"] > 0)
-check("低波动时 RR ≥ 2.0（与MAX_ATR_PCT 的 RR 对齐语义恢复）",
-      rr_low["rr_ratio"] >= 2.0)
+# 盈亏比结构（2026-10-13 执行中期化后）：止盈 +15% / 止损下限 15% ⇒ 低波动时
+# RR 恒等于 1.0。旧断言「RR≥2.0」对应 +30% 止盈口径，其「与 MAX_ATR_PCT 的 RR
+# 对齐」推导已废止——MAX_ATR_PCT=6.0 的现行依据是主板 ATR% 真实分布（≈P93），
+# 与 RR 算术无关。rr_ratio 仅作展示（卡片已注明「非成功概率/期望收益」）。
+check("低波动时 RR = 1.0（止盈+15% / 止损下限15%，中期化后的诚实结构）",
+      abs(rr_low["rr_ratio"] - 1.0) < 1e-6)
+check("高波动时 RR < 1.0（3×ATR 止损宽于止盈，波动股风险侧更大）",
+      rr_high["rr_ratio"] < 1.0)
 
 # ===========================================================================
 # ③ 技术分连续化
@@ -277,8 +283,11 @@ check("配置: 止跌闸门口径未被改动（QV_STABILIZATION_MODE 仍为 str
 check("配置: V 值高位保护仍在（MIN_TECHNICAL_SCORE_FORMAL 下调不放宽它）",
       c_a.QV_MAX_GAIN_FROM_250D_LOW == 15.0)
 check("配置: 质量/估值/低位三道闸门均未动",
-      c_a.MIN_QUALITY_SCORE == 50.0 and c_a.VALUATION_INDUSTRY_PERCENTILE_MAX == 0.60
+      c_a.MIN_QUALITY_SCORE == 0.0 and c_a.VALUATION_INDUSTRY_PERCENTILE_MAX == 0.60
       and c_a.LOW_POSITION_MAX == 0.40)
+# 注：MIN_QUALITY_SCORE=0.0 是 2026-10-12 复核后的现行口径（两道重复计权硬门已关闭：
+# 年度资格已保证质量分≥50、止跌闸门已保证技术面）。此断言在配置改值后曾一度陈旧
+# （仍写 50.0），2026-10-13 执行中期化时校正——旧 38/50 是 10-07 实验值，不是当前规则。
 
 # 核心不变量：MIN_QV_SCORE 仍低于「三项恰好压线合格」的理论最低分
 # （技术分门槛 45→40 后该值由 45.75 降为 44.5；综合分闸门不应因此变成技术分闸门）

@@ -223,7 +223,9 @@ class LongTermOfflineTest(unittest.TestCase):
         self.assertLessEqual(lt.MAX_PICKS, prod.MAX_PICKS)
         self.assertGreaterEqual(lt.MIN_QUALITY_SCORE, prod.MIN_QUALITY_SCORE)
         self.assertGreaterEqual(lt.MIN_TECHNICAL_SCORE_FORMAL, prod.MIN_TECHNICAL_SCORE_FORMAL)
-        self.assertGreaterEqual(lt.HOLD_DAYS_HINT_MIN, prod.HOLD_DAYS_HINT_MIN)
+        # 持有期关系（2026-10-13 生产中期化后）：生产 40~60、长期 30~90——两者的区分
+        # 已从「持有更长」转为「质量门槛更高 + 最大持有期更长」（长期仍覆盖最长期限）。
+        self.assertGreaterEqual(lt.HOLD_DAYS_HINT_MAX, prod.HOLD_DAYS_HINT_MAX)
         # 止跌口径必须与生产同为 strict（risk_only 会放行更多票）
         self.assertEqual(lt.QV_STABILIZATION_MODE, prod.QV_STABILIZATION_MODE)
 
@@ -271,17 +273,17 @@ class LongTermOfflineTest(unittest.TestCase):
         self.assertEqual((row["holding_days_hint_min"], row["holding_days_hint_max"]), (30, 90))
 
     def test_trade_plan_uses_row_holding_days(self):
-        """卡片渲染必须用行内的 30~90 天，而不是回落成生产的 10~20 天。"""
+        """卡片渲染必须用行内的 30~90 天，而不是回落成生产的 40~60 天。"""
         from src.bottom_fishing_strategy import describe_trade_plan
         row = {"code": "600000", "close": 10.0, "stop_loss": 8.0, "take_profit": 15.0,
                "rr_ratio": 1.875, "quality_score": 70.0, "position_250": 0.2,
                "holding_days_hint_min": 30, "holding_days_hint_max": 90}
         text = "\n".join(describe_trade_plan(row))
         self.assertIn("30~90", text)
-        # 无行内字段时才回落到 config 默认
+        # 无行内字段时才回落到 config 默认（2026-10-13 起为生产中期化口径 40~60）
         fallback = "\n".join(describe_trade_plan(
             {k: v for k, v in row.items() if not k.startswith("holding_days")}))
-        self.assertIn("10~20", fallback)
+        self.assertIn("40~60", fallback)
 
     def test_notify_labels_longterm(self):
         """飞书卡片标题与分组标签必须区分长期 sleeve。"""

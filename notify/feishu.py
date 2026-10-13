@@ -320,7 +320,7 @@ def notify_screening_result(
         candidate_label = "优质低估低位"
     if is_longterm:
         # 长期 sleeve 走 quality_value 资格，但持有期/止损止盈/质量门槛都不同，
-        # 卡片措辞必须自成一档，否则「30~90 天持有」会被读成生产的 10~20 天。
+        # 卡片措辞必须自成一档，否则「30~90 天持有」会被读成生产的 40~60 天。
         candidate_label = _LONGTERM_ROLE
     # 标题即「实际口径名 + 选股结果」，不再出现【抄底策略】优质低估低位荐股 这类自相矛盾的组合。
     if is_breakout:

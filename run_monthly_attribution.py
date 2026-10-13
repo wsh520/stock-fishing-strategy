@@ -25,10 +25,13 @@ _DEFAULT_DAYS = 90
 # 策略来源中文名，与 notify/feishu.py 的 _STRATEGY_ZH 保持一致。
 # 月报分组行会被飞书卡片逐字渲染，所以必须在这里就映射成中文——否则「按策略与持有期限」
 # 分组会直接把 bottom_fishing / volume_breakout 这类内部值印在群里的卡片上。
-_STRATEGY_ZH = {"bottom_fishing": "优质低估低位", "volume_breakout": "放量突破"}
+_STRATEGY_ZH = {"bottom_fishing": "优质低估低位", "volume_breakout": "放量突破",
+                "longterm_quality": "长期优质低估低位"}
 
-# 固定期限观测（与 store.mysql_store.TRACK_HORIZONS 同源口径，此处仅用于本地过滤展示）
-_FIXED_HORIZONS = (5, 10, 15, 20)
+# 固定期限观测（与 store.mysql_store.TRACK_HORIZONS 同源口径，此处仅用于本地过滤展示）。
+# 2026-10-13 执行中期化新增 40/60：生产建议持有窗口已放到 40~60 个交易日，
+# 「按策略与持有期限」分组因此能直接对比 20 日收割 vs 40/60 日收割的收益差。
+_FIXED_HORIZONS = (5, 10, 15, 20, 40, 60)
 
 
 def _setup_logging() -> None:
@@ -108,7 +111,10 @@ def build_stats(rows: list[dict], days: int) -> dict:
     # 直接 astype(int) 会抛 "cannot convert float NaN to integer"，把整个月报打挂。
     df["has_divergence"] = df["has_divergence"].fillna(0).astype(int)
 
-    # 每条推荐一行：信号字段取首条（同推荐恒定），收益取最新周，峰值取全部周最大值
+    # 每条推荐一行：信号字段取首条（同推荐恒定），收益取第 20 交易日观测，峰值取全部期限最大值。
+    # 注：总体口径暂保持「推荐后20交易日」——与历史月报可比；2026-10-13 起生产持有窗口
+    # 为 40~60 个交易日，待 40/60 观测积累 2~3 个月后，应把总体口径改到 60 并同步卡片文案
+    # （当前 40/60 的收益差已在「按策略与持有期限」分组中可见）。
     latest = df[df["holding_trade_days"].eq(20)].set_index("id")
     peak = df.groupby("id")["return_pct"].max().rename("peak_pct")
     weeks = df.groupby("id")["week_no"].max().rename("weeks")

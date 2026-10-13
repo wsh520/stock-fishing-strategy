@@ -36,9 +36,15 @@ except ImportError:
     _PYMYSQL_AVAILABLE = False
 
 # 查询窗口保留补跑余量；实际收益期限固定，不使用任意最新价。
-TRACK_MAX_AGE_DAYS = 60  # 为长假及周任务补跑保留余量；观测期限仍止于第20交易日
-TRACK_MAX_WEEKS = 4
-TRACK_HORIZONS = (5, 10, 15, 20)
+# 2026-10-13 执行中期化：观测期限从「止于第20交易日」扩展到 60 个交易日
+# （≈101 个日历天），故补跑窗口放到 115 天——覆盖 60 日窗口 + 长假/周任务余量。
+TRACK_MAX_AGE_DAYS = 115
+# week_no 语义 = 持有交易日数 / 5（1,2,3,4,8,12），上限随最长观测期限（60 日）走。
+TRACK_MAX_WEEKS = 12
+# 固定观测期限：5/10/15/20 为既有口径（保持历史可比），40/60 为 2026-10-13
+# 执行中期化新增——生产建议持有窗口已放到 40~60 个交易日（StrategyConfig
+# HOLD_DAYS_HINT_*），没有 40/60 观测则新窗口的收益无法被度量与归因。
+TRACK_HORIZONS = (5, 10, 15, 20, 40, 60)
 
 _ENV_KEYS = ("MYSQL_HOST", "MYSQL_USER", "MYSQL_PASSWORD", "MYSQL_DATABASE")
 
@@ -59,8 +65,8 @@ CREATE TABLE IF NOT EXISTS stock_recommendation (
     rsi21            DECIMAL(5, 1)   NULL COMMENT 'RSI21',
     vol_ratio        DECIMAL(8, 2)   NULL COMMENT '量比（对20日均量）',
     turnover_ratio   DECIMAL(8, 2)   NULL COMMENT '换手比（展示用）',
-    stop_loss        DECIMAL(10, 3)  NULL COMMENT '止损价（3×ATR 或固定15%）',
-    take_profit      DECIMAL(10, 3)  NULL COMMENT '止盈价（固定30%）',
+    stop_loss        DECIMAL(10, 3)  NULL COMMENT '止损价（max(3×ATR, 固定15%)，仅展示不参与否决）',
+    take_profit      DECIMAL(10, 3)  NULL COMMENT '止盈价（固定+15%，仅展示不参与否决；突破/长期另有口径）',
     rr_ratio         DECIMAL(6, 2)   NULL COMMENT '风险收益比',
     market_env       VARCHAR(16)      NULL COMMENT '市场环境 bull/bear/neutral/unknown',
     has_divergence   TINYINT(1)      NOT NULL DEFAULT 0 COMMENT '是否底背离（双低点算法）1/0',
@@ -68,7 +74,7 @@ CREATE TABLE IF NOT EXISTS stock_recommendation (
     fund_status      VARCHAR(16)     NULL COMMENT '财务核验 verified/partial/missing',
     weekly_status    VARCHAR(16)     NULL COMMENT '周线核验 confirmed/unverified/disabled',
     rec_tier         VARCHAR(8)      NULL COMMENT '推荐层级 formal/pending',
-    strategy         VARCHAR(16)     NOT NULL DEFAULT 'bottom_fishing' COMMENT '策略来源 bottom_fishing/volume_breakout',
+    strategy         VARCHAR(16)     NOT NULL DEFAULT 'bottom_fishing' COMMENT '策略来源 bottom_fishing/volume_breakout/longterm_quality',
     missing_tags     TEXT            NULL COMMENT '缺失项标签（逗号分隔）',
     created_at       DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '写入时间',
     PRIMARY KEY (id),
@@ -83,7 +89,7 @@ CREATE TABLE IF NOT EXISTS stock_tracking (
     rec_id        BIGINT UNSIGNED NOT NULL COMMENT '关联 stock_recommendation.id',
     rec_date      DATE            NOT NULL COMMENT '推荐日期（冗余，便于直接查询）',
     code          VARCHAR(8)      NOT NULL COMMENT '股票代码（冗余）',
-    week_no       TINYINT         NOT NULL COMMENT '第几次追踪（1起，最多4）',
+    week_no       TINYINT         NOT NULL COMMENT '第几次追踪（=持有交易日数/5：1,2,3,4,8,12）',
     track_date    DATE            NOT NULL COMMENT '本次追踪执行日期',
     close_date    DATE            NOT NULL COMMENT '收盘价对应的实际交易日',
     holding_trade_days TINYINT UNSIGNED NULL COMMENT '推荐后市场交易日数；旧记录未知为NULL',
@@ -496,9 +502,11 @@ def save_recommendations(df: Optional[pd.DataFrame], strategy: str = STRATEGY_BO
 
 
 def get_active_recommendations(max_age_days: int = TRACK_MAX_AGE_DAYS,
-                               max_weeks: int = TRACK_MAX_WEEKS) -> list[dict]:
+                               max_weeks: int = len(TRACK_HORIZONS)) -> list[dict]:
     """查询窗口内尚未完成固定期限的推荐；返回上次日期及已观测日期/期限。
 
+    max_weeks 形参名保留兼容，实际语义 = 需要完成的观测期限个数
+    （= len(TRACK_HORIZONS)）：completed_horizons 达到全部期限即退出追踪。
     tracked_weeks 保留兼容字段，含义改为不同收盘日数，历史错计周号不占额度。
     """
     if not is_configured():

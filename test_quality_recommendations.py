@@ -169,7 +169,39 @@ class QualityRecommendations(unittest.TestCase):
         self.assertIn("参考关注区间 9.85 ~ 10.15", plan)
         self.assertIn("止损参考价 9.50（-5.0%）", plan)
         self.assertIn("止盈参考价 11.00（+10.0%）", plan)
-        self.assertIn("建议复核窗口 10~20 个交易日", plan)
+        self.assertIn("建议复核窗口 40~60 个交易日", plan)
+
+    def test_execution_midterm_caliber_locked(self):
+        """锁定 2026-10-13 执行中期化口径（MVP：零准入改动，只改收割窗口）。
+
+        证据：audit_current_strict.out（14 决策日×799 面板）strict 幸存者 F20 −1.40%
+        而 F60 +3.55%——边缘在 60 个交易日；audit_live_trading（31880 次随机起点）
+        +30% 止盈在 20 日窗口触发率仅 5.9%。故持有 10~20→40~60、止盈 +30%→+15%，
+        止损 max(3×ATR,15%) 不动；准入闸门一律不动（推荐集合与改动前一致）。
+        """
+        cfg = m.StrategyConfig()
+        self.assertEqual((cfg.HOLD_DAYS_HINT_MIN, cfg.HOLD_DAYS_HINT_MAX), (40, 60))
+        self.assertEqual(cfg.FIXED_TAKE_PROFIT_PCT, 15.0)
+        # 止损侧不动：ATR 缺失兜底 15%，动态取 max(3×ATR, 15%)
+        self.assertEqual(cfg.FIXED_STOP_LOSS_PCT, 15.0)
+        rr = m.compute_risk_reward(10.0, cfg, atr=0.2)   # 3×ATR=6% < 15% → 固定下限接管
+        self.assertAlmostEqual(rr["stop_loss"], 8.5)
+        self.assertAlmostEqual(rr["take_profit"], 11.5)  # +15%
+        rr_wide = m.compute_risk_reward(10.0, cfg, atr=0.8)  # 3×ATR=24% > 15% → ATR 接管
+        self.assertAlmostEqual(rr_wide["stop_loss"], 7.6)
+        # 追踪口径必须覆盖新窗口，否则 40/60 日收益无法被度量
+        from store.mysql_store import TRACK_HORIZONS
+        self.assertIn(40, TRACK_HORIZONS)
+        self.assertIn(60, TRACK_HORIZONS)
+        # 突破是 2~5 日短线口径：显式覆写回 10~20，不随基类中期化变长
+        bo = vb.VolumeBreakoutConfig()
+        self.assertEqual((bo.HOLD_DAYS_HINT_MIN, bo.HOLD_DAYS_HINT_MAX), (10, 20))
+        self.assertEqual(bo.FIXED_TAKE_PROFIT_PCT_BREAKOUT, 15.0)  # 突破止盈本就近，不变
+        # 长期 sleeve 维持 30~90（上限仍长于生产）
+        from src.quality_longterm_strategy import LongTermQualityConfig
+        lt = LongTermQualityConfig()
+        self.assertEqual((lt.HOLD_DAYS_HINT_MIN, lt.HOLD_DAYS_HINT_MAX), (30, 90))
+        self.assertGreaterEqual(lt.HOLD_DAYS_HINT_MAX, cfg.HOLD_DAYS_HINT_MAX)
 
     def test_trade_plan_omitted_without_close(self):
         # 旧数据/字段不全时整段不渲染，避免卡片出现 nan 或空洞的「操作计划」标题。

@@ -489,20 +489,35 @@ class StrategyConfig:
     # 过窄的止损（如5%）会在价值回归启动前被正常波动震出；过窄的止盈（如10%）
     # 只吃到估值修复的零头，系统性截断盈利、压低盈亏比。
     FIXED_STOP_LOSS_PCT: float = 15.0   # ATR 缺失时的兜底止损；给价值股呼吸空间
-    FIXED_TAKE_PROFIT_PCT: float = 30.0  # 至少吃到估值修复的主体部分
+    # ===== 止盈 +30% → +15%（2026-10-13，执行中期化 MVP）=====
+    # 【为什么改】两条独立证据链共同指向「旧止盈在旧窗口里不可达」：
+    #   1) 当前口径前瞻实测（audit_current_strict.out，14 决策日×799 面板）：
+    #      strict 幸存者 19 条观测 F5 −0.13% / F20 −1.40% / **F60 +3.55%**——
+    #      边缘在 60 个交易日，而旧计划在第 20 个交易日就收割；
+    #   2) 主板 31,880 次「随机起点持有 20 个交易日」（audit_live_trading）：
+    #      **+30% 止盈触发率仅 5.9%**、−15% 止损触发率 10.9%、期内最大有利
+    #      波动中位仅 +6.4% —— 旧计划下多数交易以远未止盈的收盘价离场，
+    #      止损触发的概率约为止盈的 1.8 倍（真实落库推荐约 5.7 倍）。
+    # 【怎么改】止盈降到 +15%（40~60 日窗口内的可达目标），持有期同步放到
+    # 40~60 个交易日（见 HOLD_DAYS_HINT_*）。止损侧不动（max(3×ATR,15%) 的
+    # 下限修复经 30,213 次实测，触发率 25.5%→9.6%，无需再动）。
+    # 【边界】仅改执行/展示口径，**不动任何准入闸门**（推荐集合与改动前一致），
+    # 对「宁缺毋滥」零风险；分批止盈（+10% 走一半）由执行者自行决定。
+    FIXED_TAKE_PROFIT_PCT: float = 15.0
     ATR_PERIOD: int = 14
     ATR_STOP_MULT: float = 3.0          # 动态止损 = 入场价 - 3×ATR14；3倍覆盖正常波动
     USE_ATR_STOP: bool = True
     # ===== ATR 止损下限（2026-10-07 修复）=====
-    # 【为什么必须修】本策略定位为「优质低估低位」（左侧价值低吸），持有期
-    # HOLD_DAYS_HINT_MAX=20 个交易日。实测主板 30,213 次「随机起点持有 20 日」
-    # （真实日内极值）：
-    #     止损 = 3×ATR（当前口径，主板 ATR% 中位 3.08% → 约 -9.2%）
+    # 【为什么必须修】本策略定位为「优质低估低位」（左侧价值低吸）。实测主板
+    # 30,213 次「随机起点持有 20 日」（真实日内极值）：
+    #     止损 = 3×ATR（当时口径，主板 ATR% 中位 3.08% → 约 -9.2%）
     #         → 20 日内触发率 25.5%
     #     止损 = 固定 -15%
     #         → 20 日内触发率 10.3%
     # 即「3 倍 ATR 覆盖正常波动」的设计假设在本股票池上不成立：主板个股 20 个交易日
-    # 内的最大跌幅中位仅 -5.0%，但 3×ATR≈-9.2% 的止损仍会在四分之一的样本内被震出。
+    # 内的最大跌幅中位仅 -5.0%，但 3×ATR≈-9.2% 的止损仍会在四分之一样本内被震出。
+    # 2026-10-13 持有期放到 40~60 日后，窗口越长触及止损的概率只增不减——
+    # 15% 下限的必要性比 20 日窗口下更强（该实测是保守下界）。
     # 后果与策略哲学直接冲突——「宁缺毋滥」原则下，一个会被正常波动扫掉的止损
     # 等于把「本该拿住的价值修复」误杀成「交易失败」，而卖出理由（触及止损）
     # 恰恰是最不该发生的那一类。
@@ -516,7 +531,9 @@ class StrategyConfig:
     # 该项仅影响展示与落库的 stop_loss，不参与任何准入/排序/否决。
     ATR_STOP_FLOOR_PCT: Optional[float] = None  # None = 复用 FIXED_STOP_LOSS_PCT
     # 波动率风控：ATR 占现价百分比超过该值直接否决（FAIL_VOLATILE）。
-    # 与止损倍数对齐：3×ATR 止损 + 30% 止盈下 RR≥2.0 ⟺ ATR ≤ 10% 现价。
+    # 注：原注释「3×ATR 止损 + 30% 止盈下 RR≥2.0 ⟺ ATR ≤ 10%」是已作废的推导前提
+    # （止盈 2026-10-13 起为 +15%）；MAX_ATR_PCT=6.0 的现行依据是主板 ATR% 真实
+    # 分布（≈P93，见下），与 RR 算术无关。
     # 语义直白、且 ATR 缺失时不再隐含放行。
     # 止损/止盈/盈亏比（rr_ratio）仅作展示与落库，不参与否决。
     #
@@ -538,10 +555,20 @@ class StrategyConfig:
     # 高于上沿视为追高、放弃本轮（不为一个信号抬高成本）；低于下沿说明隔夜出现不利变动，
     # 按失效重估而不是「越低越买」。
     ENTRY_BAND_PCT: float = 1.5
-    # 建议持有周期（市场交易日）：与追踪口径对齐——run_weekly_tracking.py 在推荐后
-    # 第 5/10/15/20 个交易日观测表现，20 日既是观测终点，也是「到期离场」的判定日。
-    HOLD_DAYS_HINT_MIN: int = 10
-    HOLD_DAYS_HINT_MAX: int = 20
+    # ===== 建议持有周期 10~20 → 40~60 个交易日（2026-10-13，执行中期化 MVP）=====
+    # 【为什么改】当前口径前瞻实测（audit_current_strict.out，14 决策日×799 面板，
+    # strict 幸存者 19 条观测）：F5 −0.13% / F20 **−1.40%** / F60 **+3.55%**——
+    # 策略边缘（估值修复）在 60 个交易日才转正，而旧计划在第 20 个交易日就收割，
+    # 系统性截断盈利。多个独立样本方向一致（P4 保留组 F60 +3.17%、低位/PE 闸门
+    # F60 +10.68/+9.83pp）。止盈同步从 +30% 降到 +15%（20 日窗口触发率仅 5.9%，
+    # 40~60 日窗口下 +15% 才是可达目标），止损侧不动。
+    # 【边界】纯执行/展示口径：不动任何准入闸门、排序与分层，推荐集合与改动前
+    # 完全一致（对「宁缺毋滥」零风险）；周度追踪口径同步扩展到 40/60 个交易日
+    # （store.mysql_store.TRACK_HORIZONS），否则新窗口无法被度量。
+    # 【注意】放量突破策略是 2~5 日短线口径，已在 VolumeBreakoutConfig 显式覆写
+    # 回 10~20，不随本改动变长；长期 sleeve 维持 30~90（其上限仍长于生产）。
+    HOLD_DAYS_HINT_MIN: int = 40
+    HOLD_DAYS_HINT_MAX: int = 60
 
     MIN_AMOUNT: float = 30_000_000.0  # 近 20 日日均成交额下限（元）；原 500 万对主板几乎无筛选力，上调至 3000 万过滤低流动性标的
     MIN_DAYS: int = 60
@@ -2409,22 +2436,22 @@ def describe_trade_plan(row: dict, config: Optional[StrategyConfig] = None) -> l
 
     价位来源：
       - 建仓区间：信号日收盘价 × (1 ± ENTRY_BAND_PCT%)，次日开盘执行（见 config 注释）；
-      - 止损/止盈：直接取 row，口径由各自策略决定——优质低估低位=3×ATR 或固定 -15%
-        搭配固定 +30%（价值策略口径，给估值修复留足空间）；放量突破=突破位−1×ATR
-        与固定 -6% 取更紧者、固定 +15% 与 ATR 目标取更近者；
-      - 建议持有周期：HOLD_DAYS_HINT_MIN ~ MAX，与周度追踪窗口（推荐后第 5/10/15/20
-        个交易日）对齐，第 20 个交易日是到期离场判定日。
+      - 止损/止盈：直接取 row，口径由各自策略决定——优质低估低位=止损 max(3×ATR,
+        固定15%) 搭配固定 **+15%**（2026-10-13 起，执行中期化口径）；放量突破=
+        突破位−1×ATR 与固定 -6% 取更紧者、固定 +15% 与 ATR 目标取更近者；
+      - 建议持有周期：HOLD_DAYS_HINT_MIN ~ MAX（生产 40~60 个交易日，2026-10-13
+        起；长期 sleeve 行内 30~90；突破 10~20），与周度追踪窗口（推荐后第
+        5/10/15/20/40/60 个交易日）对齐，到期为复核判定日而非必须卖出。
 
-    2026-10-12 展示层修正（纯文案，不改任何价位计算与离场口径；依据 audit_live_trading
-    实测：主板 31880 次「随机起点持有 20 个交易日」中 +30% 止盈触发率仅 5.9%、
-    −15% 止损触发率 10.9%，期内最大有利波动中位 +6.4%）：
-      1) 止盈目标（+30% 估值修复 / 突破 +15%）通常需要 20 个交易日以上才能触及，
-         而建议持有窗口就是 20 个交易日——旧文案「未触及按收盘价平仓」会让执行者
-         系统性在远低于止盈处离场。现在明示这一错配，是否延续持有由执行者决定，
-         策略自身的「20 日离场」口径不变（不自擅放宽持有期）。
-      2) rr_ratio 是「止盈/止损计划参数」的代数恒等式（quality_value 恒 2.0=30/15，
-         突破恒 ≥2.5=15/6），不随个股变化、不是概率估计，旧展示易被误读为个股
-         期望值，现补注说明。
+    2026-10-13 执行中期化（纯口径，不改任何准入闸门；证据见 StrategyConfig
+    FIXED_TAKE_PROFIT_PCT / HOLD_DAYS_HINT_* 注释）：
+      · 持有 10~20 → 40~60 个交易日、止盈 +30% → +15%：当前口径 strict 幸存者
+        F20 −1.40% 而 F60 +3.55%（audit_current_strict.out，19 条观测），边缘在
+        60 日；旧计划在第 20 日收割，+30% 在 20 日窗口触发率仅 5.9%
+        （audit_live_trading，31880 次随机起点），多数交易远未止盈即离场。
+      · rr_ratio 是「止盈/止损计划参数」的代数恒等式（quality_value 恒 1.0=15/15
+        当止损触顶固定 15% 时，波动股为 15%/(3×ATR)；突破恒 ≥2.5=15/6），不随
+        个股变化、不是概率估计，展示时已加注，防止被误读为个股期望值。
 
     任一必需字段缺失（旧数据/异常输入）时整段不渲染，对既有调用与测试向后兼容。
     """
@@ -2443,13 +2470,14 @@ def describe_trade_plan(row: dict, config: Optional[StrategyConfig] = None) -> l
     rr = _num_or_none(row.get("rr_ratio"))
     atr = _num_or_none(row.get("atr14"))
     price_bits = []
-    # 持有期口径：Signal 自带字段优先（长期策略 30~90 天），否则回落到 config。
+    # 持有期口径：Signal 自带字段优先（长期 sleeve 30~90 天、突破 10~20 天均在
+    # 构造信号时写入行内），否则回落到 config（生产 40~60 天）。
     # notify 层的 describe(row) 没有 config 入口，只能靠行内字段传递——
     # 这正是它必须落在 Signal dataclass 上（会进 to_dict）而不是临时属性的原因。
     hold_lo = int(row.get("holding_days_hint_min")
-                  or getattr(cfg, "HOLD_DAYS_HINT_MIN", 10) or 0)
+                  or getattr(cfg, "HOLD_DAYS_HINT_MIN", 40) or 0)
     hold_hi = int(row.get("holding_days_hint_max")
-                  or getattr(cfg, "HOLD_DAYS_HINT_MAX", 20) or 0)
+                  or getattr(cfg, "HOLD_DAYS_HINT_MAX", 60) or 0)
     quality_mode = _num_or_none(row.get("quality_score")) is not None or _num_or_none(row.get("position_250")) is not None
     if not quality_mode:
         # 保持 technical/突破旧展示口径，避免改动非目标策略。
@@ -2757,9 +2785,10 @@ class Signal:
     technical_momentum_score: Optional[float] = None
     technical_volume_score: Optional[float] = None
     # 建议持有交易日窗口。默认 None = 由 describe_trade_plan 回落到 config.HOLD_DAYS_HINT_*。
-    # 长期策略（HOLD_DAYS_HINT 30~90）需要覆盖默认的 10~20，Signal 必须有正式字段承载：
+    # 长期策略（HOLD_DAYS_HINT 30~90）与放量突破（10~20）需要覆盖生产的 40~60，
+    # Signal 必须有正式字段承载：
     # 此前 evaluate_quality_longterm 写的是 signal.holding_days_hint_min 这个**不存在的属性**，
-    # 既不落库也不进卡片，等于没写 —— 卡片会一直显示生产口径的 10~20 天。
+    # 既不落库也不进卡片，等于没写 —— 卡片会一直显示生产口径的 40~60 天。
     holding_days_hint_min: Optional[int] = None
     holding_days_hint_max: Optional[int] = None
     # Only consumed by final QV_PENDING logs, never notification/persistence rows.

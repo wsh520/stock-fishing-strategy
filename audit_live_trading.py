@@ -3,7 +3,8 @@
 三个问题：
 A) 信号可产出性：53 只到达止跌层的候选，叠加真实年度财务核验后还剩多少？
 B) 定位自洽性：止跌闸门对「深度低位股」的杀伤；通过闸门的股票此前已涨多少（是否在追高）。
-C) 执行参数可行性：15% 止损 / 30% 止盈，在建议持有 10~20 交易日内各自触发概率。
+C) 执行参数可行性：15% 止损 / 15% 止盈（2026-10-13 中期化后的生产口径），
+   在 20 日测量窗口内各自触发概率（窗口固定 20 日以保持与历史结论可比）。
    若止损频繁触发而止盈几乎不可达 → 结构性正期望缺失。
 """
 import glob
@@ -181,10 +182,13 @@ def main():
         print(f"     证据构成：{g['via'].value_counts().to_dict()}")
 
     # ---------- C：执行参数可行性 ----------
-    print("\n" + "=" * 66)
-    print("【C】执行参数：15% 止损 / 30% 止盈 在 10~20 交易日内的触发概率")
-    print("=" * 66)
     n = 20
+    print("\n" + "=" * 66)
+    print(f"【C】执行参数：{cfg.FIXED_STOP_LOSS_PCT:.0f}% 止损 / {cfg.FIXED_TAKE_PROFIT_PCT:.0f}% 止盈 "
+          f"在 {n}-日窗口内的触发概率")
+    print(f"（参数取 StrategyConfig 现值：止盈 2026-10-13 起为 +15%、生产建议持有 40~60 日；"
+          f"本窗口固定 {n} 日，是与历史结论可比的测量口径）")
+    print("=" * 66)
     hits_sl = hits_tp = both = tot = 0
     dist_sl, dist_tp = [], []
     rng = np.random.default_rng(7)
@@ -212,8 +216,8 @@ def main():
             dist_sl.append(float(seg_lo.min() - 1) * 100)
             dist_tp.append(float(seg_hi.max() - 1) * 100)
     print(f"  样本 {tot} 次「随机起点持有 {n} 个交易日」（主板真实日内极值，含日内触及）")
-    print(f"     触及 −15% 止损： {hits_sl/tot*100:5.1f}%   ← 建议持有期内")
-    print(f"     触及 +30% 止盈： {hits_tp/tot*100:5.1f}%")
+    print(f"     触及 −{cfg.FIXED_STOP_LOSS_PCT:.0f}% 止损： {hits_sl/tot*100:5.1f}%   ← 建议持有期内")
+    print(f"     触及 +{cfg.FIXED_TAKE_PROFIT_PCT:.0f}% 止盈： {hits_tp/tot*100:5.1f}%")
     print(f"     两者都触及：     {both/tot*100:5.1f}%   （同日双触按止损保守处理）")
     print(f"     期内最大有利波动中位：{np.median(dist_tp):+.1f}%")
     print(f"     期内最大不利波动中位：{np.median(dist_sl):+.1f}%")
