@@ -14,6 +14,7 @@ import sys
 import os
 import time
 import traceback
+from datetime import date, timedelta
 
 import pandas as pd
 
@@ -23,9 +24,41 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
 from notify.feishu import (
     notify_screening_result,
 )
-from store.mysql_store import save_recommendations
+from store.mysql_store import save_recommendations, fetch_recent_recommended_codes
 
 logger = logging.getLogger("run")
+
+
+def _recent_recommended_codes(config, enabled: bool = True) -> set:
+    """查询冷却期内已落库推荐的代码，供 main() 的重复推荐冷却使用。
+
+    2026-10-13 新增。对应真实推荐追踪发现的问题「越跌越推」：云天化在
+    09-17/09-23/09-24 被连续推荐 3 次，推荐价 28.29 → 27.95 → 27.56 一路走低，
+    三次推荐后首日收益全为负。
+
+    【日历天近似是有意为之】冷却期按「交易日」定义，这里用 1.6 倍日历天回溯。
+    A 股 1 个交易日 ≈ 1.4 个日历天，取 1.6 倍**只会多圈进几只更早的推荐**
+    （拦得更严），绝不会漏掉本应被冷却的票——即误差方向恒为「只减不增」，
+    不会因为日历近似而放行本应被拦的票。
+
+    DB 未配置或查询失败时返回空集 → 冷却不生效。这里必须显式记录状态，
+    否则「看起来有冷却、实际没生效」与死闸门同样危险（_screen_quality_pool
+    也会再打一次日志，两处都能看到）。
+    """
+    days = int(getattr(config, "QV_REPEAT_COOLDOWN_DAYS", 0) or 0)
+    if not enabled or days <= 0:
+        logger.info("重复推荐冷却：关闭（QV_REPEAT_COOLDOWN_DAYS=%d）", days)
+        return set()
+    since = (date.today() - timedelta(days=int(days * 1.6) + 2)).isoformat()
+    try:
+        codes = fetch_recent_recommended_codes("bottom_fishing", since)
+    except Exception:
+        logger.warning("查询近期已推荐代码异常（冷却本次不生效）:\n%s",
+                       traceback.format_exc()[-400:])
+        return set()
+    logger.info("重复推荐冷却：已查库，since_date=%s（%d 个交易日窗口），命中历史推荐 %d 只",
+                since, days, len(codes))
+    return codes
 
 
 def _setup_logging() -> None:
@@ -149,8 +182,13 @@ def run(argv: list[str] | None = None):
         logger.info("Step 2/4 执行选股策略（明细见 strategy 日志）...")
         pending_rows: list[dict] = []
         volatile_rows: list[dict] = []
+        # 重复推荐冷却：查库拿近期已落库推荐的代码，交由策略层过滤（策略层不碰 DB）
+        recently_recommended = _recent_recommended_codes(config) if save_enabled else set()
+        if not save_enabled:
+            logger.info("重复推荐冷却：--no-save 模式下跳过（不查库，避免无意义连接）")
         output_df = main(config=config, cache=cache, pending_out=pending_rows,
-                         volatile_out=volatile_rows)
+                         volatile_out=volatile_rows,
+                         recently_recommended=recently_recommended)
         n_picks = 0 if output_df is None else len(output_df)
         logger.info("Step 2/4 完成 (%.1f 分钟)，正式推荐 %d 只，待核验候选 %d 只，波动率超限观察 %d 只",
                     (time.time() - t) / 60, n_picks, len(pending_rows), len(volatile_rows))

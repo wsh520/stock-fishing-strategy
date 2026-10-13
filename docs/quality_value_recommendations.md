@@ -15,7 +15,8 @@
 | 周期行业 | 按实际行业编码及名称分类；包括B06/B07/B08/B09/B10/B11、C25/C26/C30/C31/C32、G55。关闭相对估值仍分类，行业未知留pending。默认要求归母利润正常化PE≤25，缺证据pending |
 | 中长期位置 | 至少250根有效日线，当前收盘在250日收盘序列中秩分位≤40%；同价按中间名次计，不把完全横盘误判成最低位 |
 | 近期底部 | `QV_LOW_ANCHOR_MODE="recent_structure"`；近60日收盘最低点年龄5～40个交易日，距底上限为 `5×ATR/现价`，限制在10%～20%。底部未确认pending，涨离上限否决；250日盘中极值距离用于诊断，固定15%仅属legacy模式 |
-| 止跌 | `QV_STABILIZATION_MODE="strict"`；强/中确认通过，弱确认pending，无改善否决；窗口缺失不能当确认 |
+| 止跌 | `QV_STABILIZATION_MODE="strict"`；强/中确认通过，弱确认pending，无改善否决；窗口缺失不能当确认。**medium 必须站上 MA20**（`QV_STABILIZATION_MEDIUM_REQUIRES_MA20=True`，2026-10-13）：原左侧通道（MACD改善+无新低）不再构成 medium，降级为 weak→pending |
+| 重复推荐 | `QV_REPEAT_COOLDOWN_DAYS=10`（2026-10-13）：同一股票在冷却期内已落库推荐过则不再重复推送，移入待核验（可见不丢弃）。集合由 `run.py` 查库经 `store.fetch_recent_recommended_codes` 传入，策略层不碰 DB；未配置 DB 时不生效且会显式打印状态 |
 | 状态技术分 | `QV_TECHNICAL_STATE_SCORING=True`，趋势40+动能30+量价30，持续状态与最近5日衰减事件共同计分；技术分<40进入pending。旧事件日评分可显式关闭状态评分后对照 |
 | 额外分数线 | `MIN_QV_SCORE=0`、`MIN_QUALITY_SCORE=0`，默认关闭重复综合分/质量分硬门；年度资格与技术40门仍生效。38/50等旧值不是当前默认 |
 | 行情与风控 | 独立交易日历确认北京时间应完成交易日，指数与个股必须核验；合法OHLC、成交额、停牌缺口及ATR风控仍独立生效。金融企业留专项pending |
@@ -41,9 +42,18 @@ PB/PE 是 TTM 盈利与 MRQ 净资产构成的估值盈利能力 proxy，不是�
 | strict等级 | 证据 | 处理 |
 |---|---|---|
 | strong | 收盘≥MA20且MA20近5日不下行，并站上MA60 | 通过止跌维度 |
-| medium | MA20确认；或MACD柱连续3日改善且最近5日最低价≥其前20日最低价 | 通过止跌维度 |
-| weak | 仅MACD改善、低点证据不足或仍下移 | pending |
+| medium | **必须站上 MA20**（收盘≥MA20 且 MA20 近5日不下行）；或站上MA60且近5日未创新低 | 通过止跌维度 |
+| weak | 仅MACD改善、低点证据不足、仍下移，或 MACD 改善但**收盘仍在 MA20 下方** | pending |
 | 无确认 | MA20与MACD均无足够改善 | `FAIL_STABILIZATION` |
+
+**2026-10-13 收紧说明**：旧口径的 medium 有一条不要求站上 MA20 的左侧通道
+（`_ma20_ok or (_macd_improving and _no_new_low)`）。真实落库推荐追踪
+（`diag_real_recs.py`，2026-09-08~10-09，31 条正式推荐）显示：48% 的推荐自带
+「左侧·MA20下方待企稳」标签，这 15 只 F5 **全部下跌**、中位 -3.67%、胜率 0%，
+而同期沪深300 上涨（09-16→09-21 +1.32%）。即「尚未企稳」被当成已确认放行，
+是推荐后下跌的第一大来源。现默认要求 medium 必须站上 MA20，该通道降级为
+weak→pending；放行集合只减不增（真实 A/B：8 只降级、0 只升级，见
+`diag_stab_ma20_ab.py`）。设为 `False` 可回到旧口径做对照。
 
 `risk_only`、`disabled` 为显式对照配置，不是默认规则。`QV_ENFORCE_KDJ_MACD_VETO=False` 只关闭额外KDJ/MACD否决，不关闭strict止跌、状态技术40及近期底部检查。
 
@@ -69,7 +79,23 @@ python -B -m unittest discover -s tests -p test_financial_evidence_upgrades.py -
 python -B -m unittest discover -s tests -p test_recent_operating.py -v
 python -B -m unittest discover -s tests -p test_strategy_revision.py -v
 python -B -m unittest discover -s tests -p test_breakout_verification_offline.py -v
+python tests/test_stab_cooldown_20261013.py
 python -B -m unittest test_fundamental_quality test_quality_recommendations test_quality_value_hardening test_recommendation_upgrades test_minimal_quality_repairs -q
 ```
 
 这些命令用于合成数据/mock离线回归，不发送通知、不连接数据库。旧规则测试通过显式配置隔离职责，不能据此推断旧配置仍是默认。最终通过数量以完成后的测试日志为准；文档不预报未完成结果，也不声称已跑实盘或收益改善。
+
+`tests/test_stab_cooldown_20261013.py` 锁定 2026-10-13 两项收紧（medium 需站上 MA20、
+重复推荐冷却），其中 A/B 部分读取 `cache/daily_*_qfq.csv` 真实行情；缺少缓存时
+该项会跳过并如实反映，其余断言仍生效。
+
+## 真实推荐追踪（2026-10-13 新增，只读诊断）
+
+```shell
+python diag_real_recs.py        # 40 条落库推荐逐条算 F1/F3/F5/F10、止损止盈触发、分组归因
+python diag_stab_ma20_ab.py     # 对同一批真实推荐重放 evaluate，A/B 两口径只差新开关
+```
+
+产物 `audit_real_recs_out.csv` 可直接用于回答「今天为什么没推 X」与
+「推荐后实际涨跌」两类问题。已知口径边界：行情缓存截至 2026-09-30，
+F10 样本极少；10-08 之后的推荐暂无后续行情。

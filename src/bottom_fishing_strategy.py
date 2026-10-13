@@ -383,6 +383,28 @@ class StrategyConfig:
     # 覆盖 QV_STABILIZATION_GATE；保持 None 表示「未指定」，不抹掉新配置项的值。
     QV_BEAR_TIMING_GATE: Optional[bool] = None
 
+    # ===== 止跌 medium 层是否必须站上 MA20（2026-10-13 新增，默认 True=收紧）=====
+    # 【为什么改】真实落库推荐追踪（diag_real_recs.py，2026-09-08~10-09 共 40 条，
+    # 前复权收盘口径）发现 strict 的 medium 层有一条「左侧通道」：
+    #     medium = _ma20_ok OR (_macd_improving AND _no_new_low)
+    # 第二条分支**不要求收盘站上 MA20**，于是「MACD 柱连续 3 日改善 + 近 5 日未
+    # 创新低」的股票可以在**仍在下跌趋势中**的情况下拿到 medium 并进入 formal。
+    # 实测后果：31 条正式推荐里 15 条（48%）自带「左侧·MA20下方待企稳」标签，
+    # 这 15 条 F5 **全部下跌**、中位数 -3.67%、胜率 0%（最差立讯精密 F5 -7.42%
+    # 且触发止损）；同期沪深300 是上涨的（09-16→09-21 +1.32%、09-17→09-21
+    # +1.78%），排除「大盘拖累」解释。即「尚未企稳」被当成已确认放行，
+    # 这是推荐后下跌的第一大来源。
+    # 【怎么改】默认 True：medium 只认 _ma20_ok（站上 MA20 且 MA20 走平/上行）；
+    # 未站上 MA20 的左侧通道降级为 weak → missing.append("stabilization_weak")
+    # → tier=pending，只进观察池不进正式推荐。
+    # 【为什么这样改是安全的】放行集合只减不增：新 medium 集合 {ma20_ok} 是
+    # 旧集合 {ma20_ok} ∪ {macd改善且无新低} 的真子集，不存在「旧口径拦、新口径
+    # 放」的股票，符合「宁缺毋滥」最高优先级。
+    # 【代价】正式推荐产出进一步下降（本来就已接近空仓）。这是收紧的必然成本，
+    # 宁缺毋滥下「空仓」优于「推荐未企稳的票」。
+    # 设为 False 可回到 2026-10-13 之前的口径做 A/B 对照（仅测试用）。
+    QV_STABILIZATION_MEDIUM_REQUIRES_MA20: bool = True
+
     # ===== P0：止跌闸门判据重构（risk_only 模式，默认关闭=保持原 strict 口径）=====
     # 横截面实测（本地缓存 798 只）：strict 口径下 180 只估值合格候选被止跌闸门砍掉
     # 145 只（80.6%），其中 140 只**唯一**的败因是「收盘在 MA20 下方」；
@@ -566,6 +588,26 @@ class StrategyConfig:
     # unknown 经 _effective_regime 折叠为 bear，自动适用熊市上限。
     NEUTRAL_MAX_PICKS: int = 4
     BEAR_MAX_PICKS: int = 2
+    # ===== 重复推荐冷却（2026-10-13 新增，默认 10 个交易日）=====
+    # 同一只股票在冷却期内被推荐过一次后，本次运行不再重复推送为正式推荐。
+    #
+    # 【为什么需要】真实落库推荐追踪（diag_real_recs.py，2026-09-08~10-09）发现
+    # 存在「越跌越推」闭环：云天化(600096) 于 09-17 / 09-23 / 09-24 被连续推荐 3 次，
+    # 推荐价 28.29 → 27.95 → 27.56 一路走低，三次推荐后 F1 分别为 -0.67% / -1.40%
+    # / -1.45%（全负）；盐津铺子(002847)、西藏药业(600211)、新乳业(002946) 各推 2 次。
+    # 机制：下跌 → 250 日分位更低、更「便宜」→ 再次满足全部准入 → 再推 → 再跌。
+    # 对使用者而言这是**同一只正在亏钱的票被反复推送**，会显著放大
+    # 「推荐后总是下跌」的体感，也让每日卡片信息量下降。
+    #
+    # 【为什么这样改是安全的】只减不增：不动任何闸门判定，仅在排序完成后把
+    # 命中票从 formal 移入 pending_out（可见、可查，但不推送、不落库）。
+    #
+    # 【口径边界】冷却集合由调用方查库后传入（run.py → store.fetch_recent_recommended_codes），
+    # 策略层不依赖 DB。未配置 DB / 查询失败 / 未传入集合时该机制整体不生效——
+    # 因此 _screen_quality_pool 每次都会显式打印冷却是否真的生效，
+    # 杜绝「看起来有冷却、实际没生效」这种死闸门。
+    # 设为 0 可完全关闭（仅测试用）。
+    QV_REPEAT_COOLDOWN_DAYS: int = 10
     # 市场级熔断：沪深300 近 MARKET_CRASH_LOOKBACK 个交易日累计跌幅低于该阈值（%）
     # → 本次运行不推荐。急跌期间全市场同步满足 RSI 超卖 / MA5 拐头 / 创新低底背离，
     # 抄底信号会批量触发，而 MA20_TREND_MIN_SLOPE 是个股级过滤，抓不到系统性风险。
@@ -4357,9 +4399,18 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
         elif _stab_mode == "disabled":
             stabilization_level = "disabled"
         else:
+            # 2026-10-13 收紧：medium 层默认**必须站上 MA20**。
+            # 原式 `_ma20_ok or (_macd_improving and _no_new_low)` 的第二条分支不要求
+            # 站上 MA20，使「仍在下跌趋势中」的股票能拿 medium 进 formal。真实落库
+            # 追踪显示这批「左侧·MA20下方」票 F5 15 只全跌、胜率 0%，同期沪深300 上涨。
+            # 依据见 StrategyConfig.QV_STABILIZATION_MEDIUM_REQUIRES_MA20 的注释。
+            # 放行集合只减不增：新 medium = 旧 medium 的真子集。
+            _medium_needs_ma20 = bool(getattr(config, "QV_STABILIZATION_MEDIUM_REQUIRES_MA20", True))
             if _ma20_ok and _above_ma60:
                 stabilization_level = "strong"
-            elif _ma20_ok or (_macd_improving and _no_new_low):
+            elif _ma20_ok:
+                stabilization_level = "medium"
+            elif (_macd_improving and _no_new_low) and not _medium_needs_ma20:
                 stabilization_level = "medium"
             elif _macd_improving:
                 stabilization_level = "weak"
@@ -4491,11 +4542,42 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
         **brief), "PASS"
 
 
+def _apply_repeat_cooldown(formal: pd.DataFrame, frame: pd.DataFrame,
+                           cooldown_codes: set, cooldown_days: int,
+                           pending_out: Optional[list]) -> pd.DataFrame:
+    """重复推荐冷却：把冷却期内已推过的票移出 formal，并转入 pending_out。
+
+    【为什么】真实落库推荐追踪发现「越跌越推」：云天化 09-17/09-23/09-24 连推 3 次，
+    推荐价 28.29 → 27.95 → 27.56 一路走低，三次推荐后 F1 全为负。
+    跌 → 更低位更便宜 → 再满足准入 → 再推 → 再跌，对使用者就是同一只亏钱票被反复推送。
+
+    【口径边界】只减不增：不动任何闸门判定，只在最终分层后过滤 formal。
+    命中票**不丢弃**——转入 pending_out 保留可见性，便于回答「今天为什么没推 X」；
+    但不推送、不落库、不参与追踪归因。
+    """
+    if not cooldown_codes or formal is None or getattr(formal, "empty", True):
+        return formal
+    hit_mask = formal["code"].astype(str).isin(cooldown_codes)
+    if not bool(hit_mask.any()):
+        return formal
+    hit_codes = sorted(set(formal.loc[hit_mask, "code"].astype(str)))
+    for _c in hit_codes:
+        logger.info("  冷却命中: %s（%s 个交易日内已落库推荐过，本次不重复推送）",
+                    _c, cooldown_days)
+    logger.info("重复推荐冷却：%d 只命中，转入待核验（不丢弃、不推送）", len(hit_codes))
+    if pending_out is not None and frame is not None:
+        pending_out.extend(
+            frame.loc[frame["code"].astype(str).isin(hit_codes)
+                      & frame["tier"].eq("formal")].to_dict("records"))
+    return formal.loc[~hit_mask].copy()
+
+
 def _screen_quality_pool(config: StrategyConfig, cache: CacheManager, market_env: dict,
                          latest_trade_date: Optional[str], pending_out: Optional[list] = None,
                          evaluator=None, max_picks: Optional[int] = None,
                          index_df: Optional[pd.DataFrame] = None,
-                         volatile_out: Optional[list] = None) -> Optional[pd.DataFrame]:
+                         volatile_out: Optional[list] = None,
+                         recently_recommended: Optional[set] = None) -> Optional[pd.DataFrame]:
     """先廉价行情筛选、后年度财务核验；核验完所有候选才排序和行业限额。
 
     max_picks：本次推荐数量上限（由 main 按市场环境 resolve_max_picks 解析后传入）；
@@ -4503,9 +4585,24 @@ def _screen_quality_pool(config: StrategyConfig, cache: CacheManager, market_env
     index_df：沪深300日线，用于计算近60日相对强度（复用主流程已取得的指数数据，不额外取数）。
     行业相对估值开启时，先用全池日线构建「行业 PE/PB 横截面快照」（复用缓存，不额外取数），
     再据此为每只候选计算行业内分位上下文 val_context 传入评估器；快照不可用时自动回退绝对阈值。
+    recently_recommended：近期已落库推荐的代码集合（由调用方查库传入，策略层不碰 DB）。
+    见 StrategyConfig.QV_REPEAT_COOLDOWN_DAYS：命中冷却的票不进正式推荐，只记 pending 并打日志。
     """
     evaluator = evaluator or evaluate
     stocks = get_stock_list(config, cache)
+    # ===== 重复推荐冷却（2026-10-13 新增，默认开启，只减不增）=====
+    # 真实推荐追踪显示「越跌越推」：云天化 3 次、盐津铺子/西藏药业/新乳业各 2 次，
+    # 每次推荐后 F1 均为负。跌→更低位更便宜→再满足准入→再推 的闭环。
+    # 冷却只拦「已在冷却期内被推过的同一只票」，不改变任何闸门判定，故放行集合只减不增。
+    # 机制必须可观测：即使未配置 DB（集合为空），也要把状态打进日志，
+    # 否则「看起来有冷却、实际没生效」和死闸门一样危险。
+    _cooldown_days = max(0, int(getattr(config, "QV_REPEAT_COOLDOWN_DAYS", 0) or 0))
+    _cooldown_set = set(recently_recommended or ())
+    _cooldown_on = bool(_cooldown_days > 0)
+    logger.info("重复推荐冷却：%s（冷却期 %d 个交易日，已落库近期推荐 %d 只）",
+                "启用" if _cooldown_on and _cooldown_set else
+                ("未生效（库中无近期推荐记录或未配置 DB）" if _cooldown_on else "关闭"),
+                _cooldown_days, len(_cooldown_set))
     cap = int(config.MAX_PICKS if max_picks is None else max_picks)
     # 行业估值横截面快照（#4a）：行业数据不可用 → 空 dict → 全市场回退 PE 绝对上限
     needs_industry = (config.USE_INDUSTRY_RELATIVE_VALUATION or config.REQUIRE_CYCLICAL_NORMALIZED_VALUATION
@@ -4607,6 +4704,11 @@ def _screen_quality_pool(config: StrategyConfig, cache: CacheManager, market_env
     if pending_out is not None:
         pending_out.extend(pending.to_dict("records"))
     formal = frame[frame["tier"] == "formal"].copy()
+    # ===== 重复推荐冷却：只拦「冷却期内已推过的同一只票」，不改任何闸门判定 =====
+    # 逐只打日志（见 _apply_repeat_cooldown）：若这里不输出，后续「今天为什么没推 X」
+    # 将无从排查——不可观测的风控等于没有风控。
+    if _cooldown_on and _cooldown_set:
+        formal = _apply_repeat_cooldown(formal, frame, _cooldown_set, _cooldown_days, pending_out)
     logger.info("优质低估低位最终分层：候选 %d，正式资格通过 %d，待核验 %d（行业去重/名额截取前）",
                 len(frame), len(formal), len(pending))
     if not pending.empty:
@@ -4774,13 +4876,17 @@ def run_concurrent_screen(
 
 
 def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] = None,
-         pending_out: Optional[list] = None, volatile_out: Optional[list] = None) -> Optional[pd.DataFrame]:
+         pending_out: Optional[list] = None, volatile_out: Optional[list] = None,
+         recently_recommended: Optional[set] = None) -> Optional[pd.DataFrame]:
     """执行选股主流程，返回正式推荐（formal）DataFrame。
 
     pending_out：可选 list，传出「待核验候选」（财务/周线数据缺失、不与正式推荐混排），
     由调用方决定是否展示——数据缺失不等于筛选通过，宁可少荐。
     volatile_out：可选 list，传出「波动率风控否决」明细（技术面已达标、仅 ATR 超限），
     仅用于 CI 日志留档（**不发送飞书**），不落库、不参与追踪与归因。
+    recently_recommended：近期已落库推荐的代码集合，供重复推荐冷却使用
+    （见 StrategyConfig.QV_REPEAT_COOLDOWN_DAYS）。由调用方查库后传入，
+    策略层不直接访问 DB；不传则冷却不生效（测试/回测路径即为此默认值）。
     """
     if config is None: config = StrategyConfig()
     if cache is None: cache = CacheManager(expire_hours=config.CACHE_EXPIRE_HOURS)
@@ -4837,7 +4943,8 @@ def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] 
         if config.RECOMMENDATION_MODE == "quality_value":
             return _screen_quality_pool(config, cache, market_env, latest_trade_date, pending_out,
                                         max_picks=max_picks, index_df=index_df,
-                                        volatile_out=volatile_out)
+                                        volatile_out=volatile_out,
+                                        recently_recommended=recently_recommended)
 
         stock_list = get_stock_list(config, cache)
         if not stock_list:

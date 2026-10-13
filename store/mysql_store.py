@@ -64,12 +64,12 @@ CREATE TABLE IF NOT EXISTS stock_recommendation (
     rr_ratio         DECIMAL(6, 2)   NULL COMMENT '风险收益比',
     market_env       VARCHAR(16)      NULL COMMENT '市场环境 bull/bear/neutral/unknown',
     has_divergence   TINYINT(1)      NOT NULL DEFAULT 0 COMMENT '是否底背离（双低点算法）1/0',
-    signals_hit      VARCHAR(255)    NULL COMMENT '入选依据（实际触发的技术条件，逗号分隔）',
+    signals_hit      TEXT            NULL COMMENT '入选依据（实际触发的技术条件，逗号分隔）',
     fund_status      VARCHAR(16)     NULL COMMENT '财务核验 verified/partial/missing',
     weekly_status    VARCHAR(16)     NULL COMMENT '周线核验 confirmed/unverified/disabled',
     rec_tier         VARCHAR(8)      NULL COMMENT '推荐层级 formal/pending',
     strategy         VARCHAR(16)     NOT NULL DEFAULT 'bottom_fishing' COMMENT '策略来源 bottom_fishing/volume_breakout',
-    missing_tags     VARCHAR(255)    NULL COMMENT '缺失项标签（逗号分隔）',
+    missing_tags     TEXT            NULL COMMENT '缺失项标签（逗号分隔）',
     created_at       DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '写入时间',
     PRIMARY KEY (id),
     UNIQUE KEY uk_rec_date_code_strategy (rec_date, code, strategy),
@@ -109,13 +109,38 @@ CREATE TABLE IF NOT EXISTS stock_tracking (
 # 存量表补列（幂等）：CREATE TABLE IF NOT EXISTS 不会给已存在的表加新列，
 # 首次升级到「荐股质量分层」版本时按 information_schema 探测后 ALTER 补齐
 _RECOMMENDATION_ALTERS = {
-    "signals_hit": "ADD COLUMN signals_hit VARCHAR(255) NULL COMMENT '入选依据（实际触发的技术条件，逗号分隔）' AFTER has_divergence",
+    "signals_hit": "ADD COLUMN signals_hit TEXT NULL COMMENT '入选依据（实际触发的技术条件，逗号分隔）' AFTER has_divergence",
     "fund_status": "ADD COLUMN fund_status VARCHAR(16) NULL COMMENT '财务核验 verified/partial/missing' AFTER signals_hit",
     "weekly_status": "ADD COLUMN weekly_status VARCHAR(16) NULL COMMENT '周线核验 confirmed/unverified/disabled' AFTER fund_status",
     "rec_tier": "ADD COLUMN rec_tier VARCHAR(8) NULL COMMENT '推荐层级 formal/pending' AFTER weekly_status",
     "strategy": "ADD COLUMN strategy VARCHAR(16) NOT NULL DEFAULT 'bottom_fishing' COMMENT '策略来源 bottom_fishing/volume_breakout' AFTER rec_tier",
-    "missing_tags": "ADD COLUMN missing_tags VARCHAR(255) NULL COMMENT '缺失项标签（逗号分隔）' AFTER rec_tier",
+    "missing_tags": "ADD COLUMN missing_tags TEXT NULL COMMENT '缺失项标签（逗号分隔）' AFTER rec_tier",
 }
+
+# ===== 文本列容量升级（幂等，非破坏，不改任何已有数据）=====
+# 2026-10-13 修复生产报错：(1406, "Data too long for column 'signals_hit' at row 1")。
+#
+# 【根因】signals_hit / missing_tags 原为 VARCHAR(255)。荐股证据链逐年变长
+# （「优质低估低位」+「自身历史PE分位16%（250个样本）」+「行业估值分位PE16%/PB27%」
+# +「近期有效底部2026-09-09，距底+7.8%」+「止跌中确认」+ 六项经营证据明细
+# +「右侧雏形·站上MA20（仍在MA60下方）」），单条实测已达 112~147 字符，
+# 且仍在增长；一旦超过列定义（或存量库列定义短于代码 DDL），MySQL 直接
+# **整批 INSERT 失败** —— 当日全部推荐一条都落不了库。
+#
+# 【为什么升级为 TEXT 而不是截断】入选依据是事后复盘「为什么推了这只」的
+# 唯一凭据，也是周报/归因的人读证据链。截断会让最有价值的部分（经营证据明细）
+# 静默丢失，而 TEXT 容量 64KB 远超需求，改动不涉及任何数据与索引。
+#
+# 【三重防御】1) 新建表 DDL 直接用 TEXT；2) 存量表幂等 MODIFY 到 TEXT；
+# 3) 若 ALTER 因权限失败，降级为按**实际列容量**截断并 warning——
+#    保证「宁可不完整也要落库」，绝不让整批推荐丢失（见 _clip_to_capacity）。
+_TEXT_COLUMN_UPGRADES = {
+    "signals_hit": "MODIFY COLUMN signals_hit TEXT NULL COMMENT '入选依据（实际触发的技术条件，逗号分隔）'",
+    "missing_tags": "MODIFY COLUMN missing_tags TEXT NULL COMMENT '缺失项标签（逗号分隔）'",
+}
+_TEXT_TYPES = ("text", "mediumtext", "longtext", "tinytext")
+# 列实际字符容量缓存：VARCHAR 为 CHARACTER_MAXIMUM_LENGTH；TEXT 记 None 表示不需截断。
+_text_column_capacity: dict = {}
 
 # 追踪表补列：周收益率、月收益率
 _TRACKING_ALTERS = {
@@ -197,6 +222,32 @@ def _ensure_tables(conn) -> None:
             if col not in existing:
                 cur.execute(f"ALTER TABLE stock_recommendation {alter}")
                 logger.info("stock_recommendation 已补充列: %s", col)
+        # ===== 文本列容量升级 + 实际容量探测（2026-10-13）=====
+        # 幂等：已是 TEXT 就跳过 MODIFY。无论升级成功与否，都记录**实际**列容量
+        # 供落库前截断兜底——存量库的列可能短于代码 DDL，不能假设它就是 255。
+        cur.execute(
+            "SELECT COLUMN_NAME, COLUMN_TYPE, CHARACTER_MAXIMUM_LENGTH "
+            "FROM information_schema.COLUMNS "
+            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'stock_recommendation' "
+            "AND COLUMN_NAME IN ('signals_hit', 'missing_tags')"
+        )
+        cols = {str(r[0]): (str(r[1]).lower(), r[2]) for r in cur.fetchall()}
+        for col, alter in _TEXT_COLUMN_UPGRADES.items():
+            if col not in cols:
+                continue
+            col_type, max_len = cols[col]
+            if col_type in _TEXT_TYPES:
+                _text_column_capacity[col] = None      # TEXT：无需截断
+                continue
+            _text_column_capacity[col] = int(max_len) if max_len is not None else 255
+            try:
+                cur.execute(f"ALTER TABLE stock_recommendation {alter}")
+                _text_column_capacity[col] = None      # 升级成功 → 无需截断
+                logger.info("stock_recommendation.%s 已由 %s(%s) 升级为 TEXT（证据链超长，"
+                            "整批 INSERT 会失败）", col, col_type.upper(), max_len)
+            except Exception as e:  # noqa: BLE001 无 ALTER 权限时降级为截断，不阻断落库
+                logger.warning("升级 %s 为 TEXT 失败（将按实际容量 %s 截断后落库）: %s",
+                               col, max_len, e)
         # 存量表唯一键升级（幂等）：(rec_date, code) → (rec_date, code, strategy)，
         # 允许同一股票同日被两套策略分别推荐并存；须在 strategy 列补齐之后执行。
         # 历史存量行 strategy 回填默认值 'bottom_fishing'，与原唯一键语义兼容。
@@ -265,6 +316,48 @@ def _f(v: Any) -> Optional[float]:
     return float(v)
 
 
+def _clip_to_capacity(value: Any, column: str, code: str) -> Optional[str]:
+    """按**实际列容量**裁剪文本，裁剪时 warning。容量未知（未探测/TEXT）则原样返回。
+
+    这是 1406 的最后一道防线：万一 TEXT 升级失败（库账号无 ALTER 权限），
+    也要保证「单条超长」退化为「该条截断」，而不是「整批 INSERT 失败、
+    当日全部推荐都丢失」。这是两种完全不同的故障等级。
+    """
+    s = "" if value is None else str(value).strip()
+    if not s:
+        return None
+    limit = _text_column_capacity.get(column)
+    if limit is None or len(s) <= limit:
+        return s
+    # 保留尾部省略号，便于识别"这是被裁剪过的"
+    clipped = s[:max(1, limit - 3)] + "..."
+    logger.warning("%s 超长（%d 字符 > 列容量 %d）已截断: %s。"
+                   "请确认该列是否已升级为 TEXT，否则入选依据会不完整",
+                   column, len(s), limit, code)
+    return clipped
+
+
+def _ensure_schema_cached() -> None:
+    """提前确保表结构就绪，让文本列容量缓存在构建 rows 之前可用。
+
+    save_recommendations 先构建 rows 再 _ensure_tables，而截断兜底依赖
+    _ensure_tables 探测到的**实际**列容量。若顺序反了，容量缓存为空 →
+    截断静默失效 → 1406 原样复现。故这里先探一次；_tables_ready 全局缓存
+    保证插入阶段的再次调用是 no-op，不产生额外连接开销。
+    连接失败只 warning：落库阶段本来就会再试一次。
+    """
+    if _tables_ready:
+        return
+    try:
+        conn = _connect()
+        try:
+            _ensure_tables(conn)
+        finally:
+            conn.close()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("预探测表结构失败（落库阶段会重试；文本列将不做截断）: %s", e)
+
+
 def save_recommendations(df: Optional[pd.DataFrame], strategy: str = STRATEGY_BOTTOM_FISHING) -> int:
     """将选股结果写入 stock_recommendation，(rec_date, code, strategy) 重复时检查入库时间。
 
@@ -300,6 +393,8 @@ def save_recommendations(df: Optional[pd.DataFrame], strategy: str = STRATEGY_BO
 
     rows = []
     keys = []  # 用于查询已存在记录的 (rec_date, code, strategy) 组合
+    # 必须在构建 rows 之前完成：文本列容量缓存来自 _ensure_tables 的 information_schema 探测
+    _ensure_schema_cached()
     for _, r in df.iterrows():
         rec_date_str = str(r["date"])
         code_str = str(r["code"])
@@ -312,12 +407,12 @@ def save_recommendations(df: Optional[pd.DataFrame], strategy: str = STRATEGY_BO
             _f(r.get("stop_loss")), _f(r.get("take_profit")), _f(r.get("rr_ratio")),
             str(r.get("market_env", "") or "") or None,
             1 if bool(r.get("has_divergence")) else 0,
-            str(r.get("signals_hit", "") or "") or None,
+            _clip_to_capacity(r.get("signals_hit"), "signals_hit", code_str),
             str(r.get("fund_status", "") or "") or None,
             str(r.get("weekly_status", "") or "") or None,
             "formal",
             strategy,
-            str(r.get("missing_tags", "") or "") or None,
+            _clip_to_capacity(r.get("missing_tags"), "missing_tags", code_str),
         ))
 
     insert_sql = """
@@ -460,6 +555,43 @@ def fetch_rec_codes_for_date(rec_date: str) -> set[str]:
             conn.close()
     except Exception as e:
         logger.warning("查询当日已推荐代码失败（降级为不去重）: %s", e)
+        return set()
+
+
+def fetch_recent_recommended_codes(strategy: str, since_date: str) -> set[str]:
+    """查询 since_date（含）以来该 strategy 已落库的 formal 推荐代码集合，供冷却期使用。
+
+    【为什么需要】真实落库推荐追踪（diag_real_recs.py，2026-09-08~10-09）显示
+    存在「越跌越推」循环：云天化(600096) 在 09-17/09-23/09-24 被连续推荐 3 次，
+    推荐价 28.29 → 27.95 → 27.56 一路走低，而三次推荐后 F1 分别为
+    -0.67% / -1.40% / -1.45%，全部为负；盐津铺子(002847)、西藏药业(600211)、
+    新乳业(002946) 各被推荐 2 次。机制是「跌了 → 250日分位更低、更便宜 →
+    再次满足准入 → 再推 → 再跌」。对使用者而言这是**同一只亏损票被反复推送**，
+    放大「推荐后总是下跌」的体感。
+
+    【为什么放在 store 层】策略层不直接依赖 DB，由调用方（run.py）查询后以
+    「集合」形式传入，策略层只做纯过滤；测试/回测路径不传则该机制整体不生效。
+    未配置 MySQL 或查询失败时返回空集并 warning（降级为不冷却，与落库可选
+    哲学一致），但调用方必须把「冷却是否真的生效」打进日志——不可观测的
+    风控等于没有风控。
+
+    since_date 格式 YYYY-MM-DD，由调用方按交易日历回溯，不在此处做日期运算。
+    """
+    if not is_configured():
+        return set()
+    sql = ("SELECT DISTINCT code FROM stock_recommendation "
+           "WHERE strategy = %s AND rec_date >= %s")
+    try:
+        conn = _connect()
+        try:
+            _ensure_tables(conn)
+            with conn.cursor() as cur:
+                cur.execute(sql, (str(strategy), str(since_date)))
+                return {str(row[0]) for row in cur.fetchall()}
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.warning("查询近期已推荐代码失败（降级为不启用冷却）: %s", e)
         return set()
 
 
