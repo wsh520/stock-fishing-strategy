@@ -1,0 +1,127 @@
+name: Daily Stock Screening (Long-term Quality)
+
+on:
+  schedule:
+    # 北京时间21:30（比原策略晚30分钟，避免资源冲突）
+    - cron: '30 13 * * 1-5'  # UTC 13:30 = 北京 21:30
+  workflow_dispatch:
+    inputs:
+      reuse_cache:
+        description: '尝试复用缓存（手动运行时）'
+        type: boolean
+        default: true
+      no_save:
+        description: '不保存到数据库（测试用）'
+        type: boolean
+        default: false
+      no_notify:
+        description: '不推送飞书通知（测试用）'
+        type: boolean
+        default: false
+      compare_mode:
+        description: '对比原策略与长期版（同时运行两套策略）'
+        type: boolean
+        default: false
+
+jobs:
+  longterm-quality-screen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180  # 3小时超时
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+      
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      
+      - name: Cache Python dependencies
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+      
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      # 行情缓存管理（长期版策略独立缓存key）
+      - name: Restore quote cache (scheduled runs)
+        if: github.event_name == 'schedule'
+        uses: actions/cache@v3
+        with:
+          path: cache/
+          key: longterm-baostock-cache-${{ github.run_id }}
+          restore-keys: |
+            longterm-baostock-cache-
+      
+      - name: Inspect restored quote cache (manual runs)
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.reuse_cache == 'true'
+        uses: actions/cache@v3
+        with:
+          path: cache/
+          key: longterm-baostock-cache-${{ github.run_id }}
+          restore-keys: |
+            longterm-baostock-cache-
+      
+      # 清理缓存（定时任务 或 手动不复用缓存）
+      - name: Purge cache if needed
+        if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.reuse_cache == 'false')
+        run: |
+          rm -rf cache/daily_*.csv cache/weekly_*.csv cache/index_daily_*.csv
+          rm -rf cache/*.meta.json
+          echo "已清理行情缓存"
+      
+      # 执行长期版选股策略
+      - name: Run long-term quality screening
+        env:
+          FEISHU_WEBHOOK_URL: ${{ github.event_name == 'schedule' && secrets.FEISHU_WEBHOOK_URL || secrets.FEISHU_WEBHOOK_URL_TEST }}
+          MYSQL_HOST: ${{ secrets.MYSQL_HOST }}
+          MYSQL_PORT: ${{ secrets.MYSQL_PORT }}
+          MYSQL_USER: ${{ secrets.MYSQL_USER }}
+          MYSQL_PASSWORD: ${{ secrets.MYSQL_PASSWORD }}
+          MYSQL_DATABASE: ${{ secrets.MYSQL_DATABASE }}
+        run: |
+          ARGS=""
+          
+          # 测试选项
+          if [ "${{ github.event.inputs.no_save }}" = "true" ]; then
+            ARGS="$ARGS --no-save"
+          fi
+          
+          if [ "${{ github.event.inputs.no_notify }}" = "true" ]; then
+            ARGS="$ARGS --no-notify"
+          fi
+          
+          # 对比模式
+          if [ "${{ github.event.inputs.compare_mode }}" = "true" ]; then
+            ARGS="$ARGS --compare"
+          fi
+          
+          echo "执行命令: python run_longterm.py $ARGS"
+          python run_longterm.py $ARGS
+      
+      # 保存缓存（手动运行时保存，定时任务不保存以确保每次重拉）
+      - name: Save quote cache
+        if: always() && github.event_name == 'workflow_dispatch'
+        uses: actions/cache/save@v3
+        with:
+          path: cache/
+          key: longterm-baostock-cache-${{ github.run_id }}
+      
+      # 上传运行日志
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: longterm-quality-logs-${{ github.run_number }}
+          path: |
+            *.log
+            cache/market_regime_state.json
+          if-no-files-found: ignore
+          retention-days: 7
