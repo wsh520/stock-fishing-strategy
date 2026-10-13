@@ -11,12 +11,31 @@
 | **持有周期** | 10-20个交易日 | 30-90个交易日 |
 | **质量要求** | 连续3年ROE中位≥10% | 连续5年ROE中位≥12%，且稳定 |
 | **现金流** | 3年累计现金流/净利润≥0.8 | 5年累计现金流/净利润≥1.0 |
-| **止跌判定** | 必须站上MA20或MACD改善 | 只拒绝"加速下跌"，不强制MA20 |
+| **止跌判定** | 必须站上MA20或MACD改善 | 同生产 strict 口径（MA20确认或MACD改善且未创新低） |
 | **底部窗口** | 低点年龄5-40天 | 低点年龄3-90天（允许充分磨底） |
 | **止损/止盈** | -15% / +30% | -20% / +50% |
 | **推荐数量** | 牛5/中4/熊2 | 牛3/中2/熊1（更精选） |
 | **估值要求** | 行业分位≤60% | 行业分位≤50%（更便宜） |
 | **投资资质** | 无专项评估 | 长期投资资质评分（60分准入） |
+
+> **2026-10-13 口径修订说明**（此前文档描述与代码不符，已按实际生效值更正）：
+>
+> 1. **止跌判定回到 `strict`**。原设计写「只拒绝加速下跌」（`QV_STABILIZATION_MODE="risk_only"`），
+>    已撤回。`risk_only` 把「站上 MA20」从否决降级为标签，等于**放行更多票**，与项目
+>    「宁缺毋滥」的最高优先级原则冲突；基类实测也表明 strict 保留组前瞻收益更优。
+>    「拒绝加速下跌」的意图改由**独立接线**的 `DETECT_ACCELERATING_DECLINE` 承担
+>    （MA20 近5日跌幅 > 5% → `FAIL_ACCELERATING_DECLINE`），只拦真正危险的形态，
+>    且不影响「未站上 MA20 但也无危险证据」的一批票。
+> 2. **底部窗口 120 天**（不是 90）。`QV_RECENT_LOW_MAX_AGE=90` 必须严格小于
+>    `QV_RECENT_LOW_WINDOW`，否则基类 `__post_init__` 校验直接抛 ValueError。
+> 3. **最低质量分 60 分**（不是 65）。65 与年度资格闸门（中位ROE≥12% + 最低ROE≥8% +
+>    现金转换≥0.9）重复计权，会把绝大多数已 verified 的候选二次淘汰，使策略恒 0 推荐。
+> 4. **技术分门槛保持 40 分**（不是 30）。技术面在本策略中只做「不追高」的最低约束，
+>    下调到 30 会让技术证据不足的票混入正式推荐。
+> 5. **删除 PB 豁免类配置**（`ALLOW_PB_FALLBACK` / `PB_FALLBACK_*`）。它们从未被任何
+>    代码读取，且方向是**放宽**（PE超标但PB<1.0可豁免）。
+> 6. **删除** `QV_LOW_GAIN_MIN_PCT` / `QV_LOW_GAIN_MAX_PCT`：从未被读取，实际距底涨幅
+>    由 `QV_LOW_GAIN_ATR_MULT` 经 ATR 自适应给出并夹在 [10%, 20%]。
 
 ---
 
@@ -53,17 +72,20 @@ REQUIRE_ROE_STABILITY: bool = True
 MAX_ROE_CV: float = 0.5  # 变异系数（标准差/均值）上限
 ```
 
-### 2. 更合理的止跌判定
+### 2. 止跌判定：与生产同源 + 独立的加速下跌否决
 
-**核心改变**：从"必须站上MA20"改为"只拒绝加速下跌"
+**核心改变**：在生产 strict 口径之上，**额外**加一条独立的否决项。
 
 ```python
-QV_STABILIZATION_MODE: str = "risk_only"  # 强制改为risk_only模式
+QV_STABILIZATION_MODE: str = "strict"   # 与生产同源，不放宽
 
-# 只有这一种形态被否决：MACD深度弱势 AND 仍在恶化
-if MACD柱值/收盘价 <= -0.8% and 连续3日递减:
-    return None, "FAIL_STABILIZATION"
+# 独立否决：只有这一种形态被拦（真正的「下跌仍在加速」）
+if MA20近5日跌幅 < -5%:
+    return None, "FAIL_ACCELERATING_DECLINE"
 ```
+
+为什么不直接用 `risk_only`：它把「站上 MA20」从否决降级为标签，等于放行更多票，
+与「宁缺毋滥」冲突。而「拒绝加速下跌」的意图用一个**独立、只做减法**的否决项表达更准确。
 
 ### 3. 更宽松的底部窗口
 
@@ -95,7 +117,7 @@ QV_LOW_GAIN_ATR_MULT: float = 8.0  # 5→8倍ATR
 ## 三、完整筛选流程
 
 ```
-1. 基础数据检查
+1. 基础数据检查（数据/时效/停牌缺口）
    ↓
 2. 流动性过滤（日均成交额≥5000万）
    ↓
@@ -103,30 +125,41 @@ QV_LOW_GAIN_ATR_MULT: float = 8.0  # 5→8倍ATR
    ↓
 4. 估值闸门（行业分位≤50% 或 绝对PE≤25）
    ↓
-5. 5年质量检查
-   - 连续5年ROE中位≥12%、最低≥8%
+5. 5年质量检查（与生产同源，evaluate_annual_quality）
+   - 连续5年ROE中位≥12%、最低≥8%、现金转换≥0.9
+   - 各年净利润与经营现金流均为正
+   ↓
+6. 近期经营 + 财务风险（同生产口径）
+   ↓
+7. 近期底部确认（3-90天，距底涨幅 ≤ ATR自适应上限[10%,20%]）
+   ↓
+8. 止跌确认（strict 模式：MA20确认 或 MACD改善且未创新低）
+   ↓
+9. 加速下跌否决（MA20近5日跌幅>5% → FAIL_ACCELERATING_DECLINE）
+   ↓
+10. 技术状态评分（≥40分，与生产同口径）
+   ↓
+11. 长期专项闸门（仅在取到年度财务后执行）
    - ROE稳定性：变异系数≤0.5
-   - 5年累计现金流/净利润≥1.0
-   - 盈利持续性：5年中至少3年正增长
+   - 盈利持续性：近5年年报的4次同比中至少3次为正
+   - 5年累计经营现金流/净利润≥1.0
+   - 长期投资资质综合评分≥60
+   - 相对强度：近60日跑输沪深300不超过15个百分点
    ↓
-6. 近期经营与财务风险（同原策略）
+12. 质量分下限（≥60）+ 波动率风控（ATR≤6%）
    ↓
-7. 近期底部确认（3-90天，距底≤35%）
-   ↓
-8. 止跌判定（risk_only模式，只拒绝加速下跌）
-   ↓
-9. 技术状态评分（≥30分即可，vs 原40分）
-   ↓
-10. 长期投资资质评分（≥60分）
-    ↓
-11. 相对强度硬门槛（近60日跑输≥-15%）
-    ↓
-12. 波动率风控（ATR≤6%）
-    ↓
 13. 排序：55%质量 + 35%估值 + 10%技术
-    ↓
-14. 行业分散（每行业最多2只）+ 数量截取（牛3/中2/熊1）
+   ↓
+14. 组合层：市场级熔断 → regime 数量上限（牛3/中2/熊1）→ 行业分散
+   ↓
+15. 落库（strategy=longterm_quality）+ 飞书通知（仅 formal）
 ```
+
+> **注**：第 11 步的年度财务闸门**必须**放在「取到财务数据之后」。
+> `_screen_quality_pool` 采用两趟评估——第一趟 `fund_data=None` 做廉价行情预筛，
+> 通过后才取财务数据做第二趟。若在第一趟就执行年度财务闸门，此时 `annual_rows` 为空，
+> 三项全部判为 insufficient，**每一只股票都会在预筛阶段被否决**，
+> 财务数据永远取不到，策略恒定 0 推荐（2026-10-13 修复的正是这个缺陷）。
 
 ---
 
@@ -193,7 +226,7 @@ python run_longterm.py --no-save --no-notify
 # 1. ROE稳定性评估
 def evaluate_roe_stability(annual_rows, min_years=5) -> dict
 
-# 2. 盈利持续性评估
+# 2. 盈利持续性评估（N 条年报 → N-1 次同比）
 def evaluate_earnings_consistency(annual_rows, min_years=5, min_positive_years=3) -> dict
 
 # 3. 长期现金流质量评估
@@ -202,23 +235,47 @@ def evaluate_longterm_cash_quality(annual_rows, min_years=5) -> dict
 # 4. 长期投资资质综合评分
 def compute_longterm_quality_score(annual_rows, pe, pe_pct, config) -> dict
 
-# 5. 长期版评估主函数
+# 5. 加速下跌检测（独立否决项）
+def _detect_accelerating_decline(technical, config) -> dict
+
+# 6. 缩量见底检测（仅展示标签，不参与准入）
+def _detect_volume_exhaustion(technical, config) -> dict
+
+# 7. 长期版评估主函数
 def evaluate_quality_longterm(daily_df, code, name, config, ...) -> tuple[Signal, str]
 ```
 
 ### 配置继承关系
 
 ```python
-StrategyConfig (原基础配置)
+StrategyConfig (生产基础配置)
     ↓ 继承
 LongTermQualityConfig (长期版配置)
-    ↓ 覆盖关键参数
+    ↓ 覆盖关键参数（全部为「收紧」方向）
     - QUALITY_YEARS: 3 → 5
-    - HOLD_DAYS_HINT_MAX: 20 → 90
-    - QV_STABILIZATION_MODE: "strict" → "risk_only"
-    - MAX_PICKS: 5 → 3
-    - etc.
+    - QUALITY_MEDIAN_ROE_MIN: 10 → 12
+    - QUALITY_MIN_ROE: 5 → 8
+    - QUALITY_CASH_CONVERSION_MIN: 0.8 → 0.9
+    - MIN_QUALITY_SCORE: 0 → 60
+    - VALUATION_INDUSTRY_PERCENTILE_MAX: 0.60 → 0.50
+    - HISTORICAL_VALUATION_PERCENTILE_MAX: 0.60 → 0.50
+    - MIN_AMOUNT: 3000万 → 5000万
+    - MAX_PICKS / NEUTRAL_ / BEAR_: 5/4/2 → 3/2/1
+    - HOLD_DAYS_HINT: 10~20 → 30~90
+    - FIXED_STOP_LOSS_PCT: 15 → 20；FIXED_TAKE_PROFIT_PCT: 30 → 50
+    - QV_RECENT_LOW_*: 60/5/40 → 120/3/90
+    - QUALITY/VALUATION/TECHNICAL 权重: 0.45/0.30/0.25 → 0.55/0.35/0.10
+    - 新增长期专项: REQUIRE_ROE_STABILITY / REQUIRE_EARNINGS_CONSISTENCY /
+      LONGTERM_CASH_QUALITY_MIN / MIN_LONGTERM_QUALITY_SCORE /
+      REQUIRE_RELATIVE_STRENGTH / DETECT_ACCELERATING_DECLINE
+    - 保持与生产一致（不收紧也不放宽）:
+      QV_STABILIZATION_MODE="strict"、MIN_TECHNICAL_SCORE_FORMAL=40、MAX_ATR_PCT=6
 ```
+
+> **RECOMMENDATION_MODE 必须是 `"quality_value"`**：基类 `_validate_recommendation_config`
+> 只接受 `{quality_value, technical}`，填 `"quality_longterm"` 会在**构造时**直接抛
+> `ValueError`。本策略走的就是 quality_value 荐股资格（`evaluate_quality_longterm`
+> 内部委派 `evaluate_quality_value`）；对外展示名由 `LONGTERM_LABEL` 承载。
 
 ---
 
@@ -228,7 +285,13 @@ LongTermQualityConfig (长期版配置)
 2. **分批建仓**：初始30%，确认趋势后加仓至70%
 3. **行业轮动**：根据经济周期调整行业偏好
 4. **引入基本面动量**：ROE加速改善的公司优先级更高
+5. **前瞻验证**：长期口径（5年质量 + 30~90 天持有）尚未做前瞻收益实测，
+   当前只验证了「逻辑自洽 + 不宽于生产口径」，收益有效性待验证
 
 ---
 
-**总结**：长期版策略通过提高质量门槛、放宽止跌判定、延长持有周期，将原策略从"中短期价值投机"重新定位为"长期价值投资"，适合追求稳健回报、能够承受短期波动的价值投资者。
+**总结**：长期版策略通过提高质量门槛、新增盈利持续性与现金流质量闸门、延长持有周期，
+在**完全复用生产 quality_value 筛选骨架**的前提下叠加一层长期专项收紧，
+把中短期价值投机重新定位为长期价值投资。所有收紧项均已接线并登记否决归因码，
+不存在「配置里写了但代码从不读取」的死配置。
+

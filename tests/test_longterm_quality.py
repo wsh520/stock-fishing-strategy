@@ -119,15 +119,18 @@ class TestEarningsConsistency(unittest.TestCase):
             {"net_profit": 130},
             {"net_profit": 140},
         ]
+        # 2026-10-13：min_years=5 只取最后 5 条年报 → 4 次同比（原实现要求
+        # min_years+1=6 条年报，但上游只按 QUALITY_YEARS=5 取数 → 恒 insufficient）。
+        # 「连续5个完整年度」能得到的同比次数就是 4 次。
         result = evaluate_earnings_consistency(annual_rows, 5, 3)
-        
+
         self.assertEqual(result["status"], "verified")
-        self.assertEqual(result["positive_growth_years"], 5)
-        self.assertEqual(result["total_years"], 5)
+        self.assertEqual(result["positive_growth_years"], 4)
+        self.assertEqual(result["total_years"], 4)
         self.assertAlmostEqual(result["consistency_score"], 100.0, places=1)
     
     def test_moderate_consistency(self):
-        """中等持续：5年中3年正增长"""
+        """中等持续：5年年报中3次同比为正（窗口为最后5条→4次同比）"""
         annual_rows = [
             {"net_profit": 90},
             {"net_profit": 100},  # +
@@ -136,11 +139,45 @@ class TestEarningsConsistency(unittest.TestCase):
             {"net_profit": 120},  # +
             {"net_profit": 115},  # -
         ]
+        # 取最后 5 条：[100,110,105,120,115] → 同比 +,-,+,- → 2 正 4 次
         result = evaluate_earnings_consistency(annual_rows, 5, 3)
-        
+        # 2 < min_positive_years=3 → 判为 inconsistent（这是正确的保守行为：
+        # 达不到最低正增长年数就不算「持续」，宁缺毋滥）
+        self.assertEqual(result["status"], "inconsistent")
+        self.assertEqual(result["positive_growth_years"], 2)
+        self.assertEqual(result["total_years"], 4)
+
+    def test_moderate_consistency_exactly_at_threshold(self):
+        """边界：5年年报中3次同比为正 → 恰好达门槛，verified"""
+        annual_rows = [
+            {"net_profit": 90},
+            {"net_profit": 100},  # +
+            {"net_profit": 110},  # +
+            {"net_profit": 115},  # +
+            {"net_profit": 120},  # -
+            {"net_profit": 118},  # -
+        ]
+        # 取最后 5 条：[100,110,115,120,118] → 同比 +++- → 3 正 4 次
+        result = evaluate_earnings_consistency(annual_rows, 5, 3)
         self.assertEqual(result["status"], "verified")
         self.assertEqual(result["positive_growth_years"], 3)
-        self.assertAlmostEqual(result["consistency_score"], 60.0, places=1)
+        self.assertEqual(result["total_years"], 4)
+        self.assertAlmostEqual(result["consistency_score"], 75.0, places=1)
+
+    def test_loss_to_profit_not_counted_as_growth(self):
+        """去年亏损今年扭亏：同比增长率无意义，不计入正增长也不算失败"""
+        annual_rows = [
+            {"net_profit": -50},
+            {"net_profit": -20},
+            {"net_profit": 10},   # 扭亏，但去年为负 → 不计正增长
+            {"net_profit": 30},   # +
+            {"net_profit": 50},   # +
+            {"net_profit": 60},   # +
+        ]
+        result = evaluate_earnings_consistency(annual_rows, 5, 3)
+        self.assertEqual(result["status"], "verified")
+        self.assertEqual(result["positive_growth_years"], 3)
+        self.assertEqual(result["total_years"], 4)
     
     def test_inconsistent(self):
         """不一致：正增长年数不足"""
@@ -154,12 +191,13 @@ class TestEarningsConsistency(unittest.TestCase):
         ]
         result = evaluate_earnings_consistency(annual_rows, 5, 3)
         
+        # 窗口 = 最后 5 条 [110,105,95,105,100] → 同比 -,-,-,+ → 仅 1 次正增长
         self.assertEqual(result["status"], "inconsistent")
-        self.assertEqual(result["positive_growth_years"], 2)
+        self.assertEqual(result["positive_growth_years"], 1)
         self.assertEqual(result["consistency_score"], 0)
     
     def test_insufficient_data(self):
-        """数据不足"""
+        """数据不足：年报条数少于 min_years"""
         annual_rows = [
             {"net_profit": 100},
             {"net_profit": 110},
@@ -282,12 +320,22 @@ class TestLongTermConfig(unittest.TestCase):
         self.assertEqual(config.QUALITY_MIN_ROE, 8.0)
         self.assertEqual(config.QUALITY_CASH_CONVERSION_MIN, 0.9)
         
-        # 止跌模式
-        self.assertEqual(config.QV_STABILIZATION_MODE, "risk_only")
+        # 止跌模式：2026-10-13 由 "risk_only" 撤回为 "strict"（与生产同源）。
+        # risk_only 把「站上 MA20」从否决降级为标签 = 放行更多票，
+        # 与项目「宁缺毋滥」的最高优先级原则冲突；「拒绝加速下跌」的意图
+        # 改由独立接线的 DETECT_ACCELERATING_DECLINE 承担（只做减法）。
+        self.assertEqual(config.QV_STABILIZATION_MODE, "strict")
+
+        # RECOMMENDATION_MODE 必须是 quality_value：基类只接受
+        # {quality_value, technical}，填其它值会在构造时抛 ValueError。
+        self.assertEqual(config.RECOMMENDATION_MODE, "quality_value")
+        self.assertEqual(config.LONGTERM_LABEL, "长期优质低估低位")
         
         # 底部窗口
         self.assertEqual(config.QV_RECENT_LOW_MIN_AGE, 3)
         self.assertEqual(config.QV_RECENT_LOW_MAX_AGE, 90)
+        # 基类硬校验：min <= max < window（严格小于）
+        self.assertLess(config.QV_RECENT_LOW_MAX_AGE, config.QV_RECENT_LOW_WINDOW)
         
         # 持有周期
         self.assertEqual(config.HOLD_DAYS_HINT_MIN, 30)

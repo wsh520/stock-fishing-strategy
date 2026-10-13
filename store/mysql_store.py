@@ -126,7 +126,17 @@ _TRACKING_ALTERS = {
 # 策略来源合法值（落库前校验，防止脏数据污染按策略分列的追踪/归因）
 STRATEGY_BOTTOM_FISHING = "bottom_fishing"
 STRATEGY_VOLUME_BREAKOUT = "volume_breakout"
-KNOWN_STRATEGIES = (STRATEGY_BOTTOM_FISHING, STRATEGY_VOLUME_BREAKOUT)
+# 长期优质低估低位（run_longterm.py）：与 bottom_fishing 同走 quality_value 荐股资格，
+# 但质量/现金流/持有期口径更严（5年、ROE稳定性、30~90天），是**独立 sleeve**。
+# 2026-10-13 登记：此前 run_longterm.py 传 "longterm_quality" 落库，但该值不在
+# KNOWN_STRATEGIES 里 → save_recommendations 静默改写成 "bottom_fishing" 并只打一条
+# warning。后果是长期策略的推荐与生产 sleeve 混在同一 strategy 下：
+#   · 唯一键 (rec_date, code, strategy) 冲突 → 同日同股只能存一条，长期结果被丢弃；
+#   · 周度追踪与信号归因按 strategy 分列时无法区分两种口径，胜率被混算。
+# 恰好 16 字符，与 stock_recommendation.strategy VARCHAR(16) 上限一致。
+STRATEGY_LONGTERM_QUALITY = "longterm_quality"
+KNOWN_STRATEGIES = (STRATEGY_BOTTOM_FISHING, STRATEGY_VOLUME_BREAKOUT,
+                    STRATEGY_LONGTERM_QUALITY)
 
 _tables_ready = False  # 进程内只确保一次建表
 
@@ -278,8 +288,15 @@ def save_recommendations(df: Optional[pd.DataFrame], strategy: str = STRATEGY_BO
         logger.info("MySQL 未配置（MYSQL_HOST/USER/PASSWORD/DATABASE），跳过推荐结果落库")
         return 0
     if strategy not in KNOWN_STRATEGIES:
-        logger.warning("未知策略来源 %r，按 %r 落库", strategy, STRATEGY_BOTTOM_FISHING)
-        strategy = STRATEGY_BOTTOM_FISHING
+        # 2026-10-13：由「warning + 静默改写」改为直接抛错。
+        # 静默改写是本项目里最难查的一类 bug：调用方以为自己的 sleeve 独立落库，
+        # 实际全部并入 bottom_fishing，唯一键冲突导致结果丢失、归因口径被混算，
+        # 而日志只有一行 warning，混在几千行筛选日志里根本看不见。
+        # 未注册的 strategy 是**编程错误**（新增策略忘了登记），必须快速失败。
+        raise ValueError(
+            f"未注册的策略来源 {strategy!r}；已注册: {list(KNOWN_STRATEGIES)}。"
+            f"新增策略请先在 store.mysql_store 登记常量并加入 KNOWN_STRATEGIES，"
+            f"否则会被并入 {STRATEGY_BOTTOM_FISHING!r} sleeve，造成同日同股覆盖与归因混算。")
 
     rows = []
     keys = []  # 用于查询已存在记录的 (rec_date, code, strategy) 组合

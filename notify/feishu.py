@@ -78,7 +78,8 @@ def _stock_card(header_title: str, body_md: str, color: str = "green") -> dict:
     }
 
 
-_STRATEGY_ZH = {"bottom_fishing": "优质低估低位", "volume_breakout": "放量突破"}
+_STRATEGY_ZH = {"bottom_fishing": "优质低估低位", "volume_breakout": "放量突破",
+                "longterm_quality": "长期优质低估低位"}
 # 卡片标题前缀 = 该次运行**实际生效的资格口径名**，而不是落库用的 strategy 值。
 # 原因：DB 的 strategy='bottom_fishing' 是一个覆盖两种口径的 sleeve 标识——
 #   · quality_value（生产默认）：多年质量 + 行业相对低估 + 250 日低位，**不是技术抄底**；
@@ -86,7 +87,11 @@ _STRATEGY_ZH = {"bottom_fishing": "优质低估低位", "volume_breakout": "放�
 # 此前统一显示为【抄底策略】，会把前者（绝大多数）误标成后者，故按实际口径取名。
 # 例：【优质低估低位】选股结果 / 【放量突破】选股结果 / 【低位企稳】选股结果（technical）
 _LOW_POSITION_ROLE = "低位企稳"
-_STRATEGY_ROLE_ZH = {"bottom_fishing": "优质低估低位", "volume_breakout": "放量突破"}
+# 2026-10-13 新增：长期 sleeve 的口径名。run_longterm.py 用它，
+# 使「长期 30~90 天持有」的卡片不会被标题写成「优质低估低位」而与生产 sleeve 混淆。
+_LONGTERM_ROLE = "长期优质低估低位"
+_STRATEGY_ROLE_ZH = {"bottom_fishing": "优质低估低位", "volume_breakout": "放量突破",
+                     "longterm_quality": _LONGTERM_ROLE}
 # 飞书通知每策略最多展示的股票数。
 #策略层已按 MAX_PICKS/NEUTRAL_MAX_PICKS/BEAR_MAX_PICKS 截取正式推荐。
 #
@@ -302,6 +307,7 @@ def notify_screening_result(
         df = df.loc[formal].copy()
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     is_breakout = strategy == "volume_breakout"
+    is_longterm = strategy == "longterm_quality"
     candidate_label = "放量突破" if is_breakout else "低位企稳"
     # quality_mode：本次跑的是 quality_value 资格（周线确认 not_required 是其标志），
     # 与 technical（真正的技术抄底）区分开——两者的入选逻辑完全不同，标题不应混用。
@@ -312,9 +318,15 @@ def notify_screening_result(
                        for frame in (df, pending))
     if quality_mode:
         candidate_label = "优质低估低位"
+    if is_longterm:
+        # 长期 sleeve 走 quality_value 资格，但持有期/止损止盈/质量门槛都不同，
+        # 卡片措辞必须自成一档，否则「30~90 天持有」会被读成生产的 10~20 天。
+        candidate_label = _LONGTERM_ROLE
     # 标题即「实际口径名 + 选股结果」，不再出现【抄底策略】优质低估低位荐股 这类自相矛盾的组合。
     if is_breakout:
         _role = _STRATEGY_ROLE_ZH["volume_breakout"]
+    elif is_longterm:
+        _role = _LONGTERM_ROLE
     elif str(recommendation_mode or "").strip().lower() == "technical":
         _role = _LOW_POSITION_ROLE
     else:

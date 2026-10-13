@@ -130,6 +130,13 @@ _QV_REASON_CODES = (
     # 2026-10-07 新增：已止跌但涨离 250 日低点超过 QV_MAX_GAIN_FROM_250D_LOW，
     # 不再符合「低位」定位。必须登记，否则漏斗日志把它算进 ERROR、无法归因。
     "FAIL_OVEREXTENDED", "FAIL_HISTORICAL_VALUATION", "FAIL_FINANCIAL_RISK", "FAIL_CYCLICAL_VALUATION",
+    # 2026-10-13 新增：长期策略（quality_longterm）的专项否决码。
+    # 同理必须登记——evaluate_quality_longterm 复用本漏斗打印归因，
+    # 未登记的码会被算进「其他」，使「今天为什么没推荐」彻底不可读。
+    "FAIL_ACCELERATING_DECLINE", "FAIL_ROE_STABILITY_INSUFFICIENT", "FAIL_ROE_UNSTABLE",
+    "FAIL_EARNINGS_INCONSISTENT", "FAIL_EARNINGS_DATA_INSUFFICIENT",
+    "FAIL_LONGTERM_CASH_INSUFFICIENT", "FAIL_LONGTERM_CASH_POOR",
+    "FAIL_LONGTERM_QUALITY_SCORE", "FAIL_RELATIVE_STRENGTH_WEAK",
 )
 
 # ===========================================================================
@@ -907,6 +914,36 @@ def _bs_login(max_retry: int = 5) -> bool:
         if attempt < max_retry - 1:
             time.sleep(1.0 * (attempt + 1))
     return False
+
+def _config_kwargs(target_cls: type, config, **overrides) -> dict:
+    """把 config 转成 target_cls 可接受的构造 kwargs（只保留目标类声明过的字段）。
+
+    为什么需要它：`StrategyConfig` 被大量 dataclass 子类继承（VolumeBreakoutConfig、
+    LongTermQualityConfig 等），而子类**必然**新增字段。于是
+    `TargetConfig(**asdict(config))` 这种「整字典透传」的写法在子类上必然抛
+    `TypeError: unexpected keyword argument`——包括基类自己内部的
+    `evaluate_quality_value`（构造 VolumeBreakoutConfig）与 technical 兜底路径
+    （构造 StrategyConfig）。
+
+    症状极具迷惑性：单测用基类配置全绿，生产用子类配置时**每只股票都崩**，
+    表现为筛选结果恒空或整轮异常，而不是任何一条清晰的报错。
+
+    语义：目标类未声明的字段一律丢弃（它们要么目标类有自己的默认值，
+    要么本就不适用于目标类）；overrides 优先级最高，且目标类不认识时直接报错
+    （那属于真实的编程错误，不该被静默吞掉）。
+    """
+    import dataclasses as _dc
+    if not _dc.is_dataclass(target_cls):
+        return dict(overrides)
+    allowed = {f.name for f in _dc.fields(target_cls)}
+    unknown = sorted(set(overrides) - allowed)
+    if unknown:
+        raise TypeError(
+            f"{target_cls.__name__} 不接受这些配置项: {unknown}；"
+            f"这是编程错误（字段名写错或该类未继承），不应被静默忽略。")
+    src = asdict(config) if _dc.is_dataclass(config) else dict(vars(config))
+    return {k: v for k, v in src.items() if k in allowed} | overrides
+
 
 def _bs_logout() -> None:
     """安全登出（仅在曾登录成功时调用）。"""
@@ -2364,8 +2401,13 @@ def describe_trade_plan(row: dict, config: Optional[StrategyConfig] = None) -> l
     rr = _num_or_none(row.get("rr_ratio"))
     atr = _num_or_none(row.get("atr14"))
     price_bits = []
-    hold_lo = int(getattr(cfg, "HOLD_DAYS_HINT_MIN", 10) or 0)
-    hold_hi = int(getattr(cfg, "HOLD_DAYS_HINT_MAX", 20) or 0)
+    # 持有期口径：Signal 自带字段优先（长期策略 30~90 天），否则回落到 config。
+    # notify 层的 describe(row) 没有 config 入口，只能靠行内字段传递——
+    # 这正是它必须落在 Signal dataclass 上（会进 to_dict）而不是临时属性的原因。
+    hold_lo = int(row.get("holding_days_hint_min")
+                  or getattr(cfg, "HOLD_DAYS_HINT_MIN", 10) or 0)
+    hold_hi = int(row.get("holding_days_hint_max")
+                  or getattr(cfg, "HOLD_DAYS_HINT_MAX", 20) or 0)
     quality_mode = _num_or_none(row.get("quality_score")) is not None or _num_or_none(row.get("position_250")) is not None
     if not quality_mode:
         # 保持 technical/突破旧展示口径，避免改动非目标策略。
@@ -2407,8 +2449,6 @@ def describe_trade_plan(row: dict, config: Optional[StrategyConfig] = None) -> l
     if atr is not None and atr > 0:
         lines.append(f"区间说明：止盈/止损带以参考价为中点，半宽为 0.5×ATR14（ATR14={atr:.2f}）；需结合估值、基本面和实际行情人工判断。")
     lines.append("建仓区间以信号日收盘为锚，仅作观察范围；跳空、基本面变化或市场环境变化时应重新评估，不机械追价/补仓。")
-    hold_lo = int(getattr(cfg, "HOLD_DAYS_HINT_MIN", 10) or 0)
-    hold_hi = int(getattr(cfg, "HOLD_DAYS_HINT_MAX", 20) or 0)
     if hold_lo > 0 and hold_hi >= hold_lo:
         lines.append(f"建议复核窗口 {hold_lo}~{hold_hi} 个交易日（仅为观察周期，不代表到期必须卖出）。")
     return lines
@@ -2674,6 +2714,12 @@ class Signal:
     technical_trend_score: Optional[float] = None
     technical_momentum_score: Optional[float] = None
     technical_volume_score: Optional[float] = None
+    # 建议持有交易日窗口。默认 None = 由 describe_trade_plan 回落到 config.HOLD_DAYS_HINT_*。
+    # 长期策略（HOLD_DAYS_HINT 30~90）需要覆盖默认的 10~20，Signal 必须有正式字段承载：
+    # 此前 evaluate_quality_longterm 写的是 signal.holding_days_hint_min 这个**不存在的属性**，
+    # 既不落库也不进卡片，等于没写 —— 卡片会一直显示生产口径的 10~20 天。
+    holding_days_hint_min: Optional[int] = None
+    holding_days_hint_max: Optional[int] = None
     # Only consumed by final QV_PENDING logs, never notification/persistence rows.
     bottom_diagnostics: Optional[dict] = None
 
@@ -4159,7 +4205,8 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
     tags.extend(hits)
     # 两个入口共享同一标签；避免第二入口去重后丢失突破提示。
     from src.volume_breakout_strategy import VolumeBreakoutConfig, evaluate_breakout
-    breakout_config = VolumeBreakoutConfig(**{**asdict(config), "RECOMMENDATION_MODE": "technical"})
+    breakout_config = VolumeBreakoutConfig(**_config_kwargs(
+        VolumeBreakoutConfig, config, RECOMMENDATION_MODE="technical"))
     breakout, _ = evaluate_breakout(
         df, code, name, breakout_config, market_env, fund_data,
         latest_trade_date=latest_trade_date)
@@ -4901,13 +4948,14 @@ def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] 
         # 0 只通过的运行在排序处崩溃）。
         if not signals:
             if config.ENABLE_DAILY_FALLBACK:
-                relaxed = StrategyConfig(**{**asdict(config),
-                    "MIN_PASS_GRADE": "C",
-                    "REQUIRE_MACD_MOMENTUM": False,
-                    "REQUIRE_KDJ_GOLDEN": False,
-                    "POSITION_IN_RANGE_MAX": max(config.POSITION_IN_RANGE_MAX, 0.60),
-                    "DAILY_RSI_ENTRY_MAX": max(config.DAILY_RSI_ENTRY_MAX, 65.0),
-                })
+                relaxed = StrategyConfig(**_config_kwargs(
+                    StrategyConfig, config,
+                    MIN_PASS_GRADE="C",
+                    REQUIRE_MACD_MOMENTUM=False,
+                    REQUIRE_KDJ_GOLDEN=False,
+                    POSITION_IN_RANGE_MAX=max(config.POSITION_IN_RANGE_MAX, 0.60),
+                    DAILY_RSI_ENTRY_MAX=max(config.DAILY_RSI_ENTRY_MAX, 65.0),
+                ))
                 fallback_candidates: list[dict] = []
                 for stock in stock_list:
                     try:

@@ -49,6 +49,7 @@ from src.bottom_fishing_strategy import (
     _bs_state,
     _AK_AVAILABLE,
     _beijing_now,
+    _config_kwargs,
     _effective_regime,
     _fund_verify_state,
     _fill_optional_fundamentals,
@@ -770,7 +771,8 @@ def evaluate_breakout(
         if base is None:
             return None, reason
         # 突破仅作为统一候选池内的标签，不另设荐股资格或排序权重。
-        technical_config = VolumeBreakoutConfig(**{**asdict(config), "RECOMMENDATION_MODE": "technical"})
+        technical_config = VolumeBreakoutConfig(**_config_kwargs(
+            VolumeBreakoutConfig, config, RECOMMENDATION_MODE="technical"))
         breakout, _ = evaluate_breakout(daily_df, code, name, technical_config, market_env,
                                         None, latest_trade_date=latest_trade_date)
         extra = {}
@@ -834,7 +836,8 @@ def evaluate_breakout(
     # 层 3.1：突破判定
     if not bool(d_last.get("breakout_any", False)):
         # 只对历史上通过完整原事件闸门的突破做确认，截断输入禁止未来行情污染。
-        event_config = VolumeBreakoutConfig(**{**asdict(config), "RECENT_BREAKOUT_DAYS": 0})
+        event_config = VolumeBreakoutConfig(**_config_kwargs(
+            VolumeBreakoutConfig, config, RECENT_BREAKOUT_DAYS=0))
         for pos in range(len(out) - 2, max(-1, len(out) - config.RECENT_BREAKOUT_DAYS - 2), -1):
             event = out.iloc[pos]
             if not bool(event.get("breakout_any", False)):
