@@ -125,6 +125,55 @@ def _supplemental_trends(usable, duplicates, latest):
     return metrics
 
 
+def describe_operating_signals(evidence):
+    """Descriptive only; never used by admission or status validation.
+
+    Priority: failed -> severe; missing -> unknown; >=2 deteriorating canonical
+    fields -> multiple; one -> single; only nonpositive prior bases with positive
+    current values -> recovering; no signals -> stable. Cumulative and quarterly
+    signals for the SAME field count once. Recovery does not override declines.
+    """
+    reasons = list(evidence.get("reasons") or [])
+    dimensions = sorted({field for field in _FIELDS.values()
+                         if any(reason.startswith(field + "_")
+                                and not reason.endswith("_nonpositive_base")
+                                for reason in reasons)})
+    bases = [reason[:-len("_nonpositive_base")] for reason in reasons
+             if reason.endswith("_nonpositive_base")]
+    if evidence.get("status") == "failed":
+        level, label, rule = "severe_deterioration", "严重恶化", "existing_hard_failure"
+    elif evidence.get("status") not in {"verified", "weak"}:
+        level, label, rule = "unknown", "证据不足", "incomplete_or_unavailable_evidence"
+    elif len(dimensions) >= 2:
+        level, label, rule = "multiple_deterioration", "多项恶化", "at_least_two_distinct_fields"
+    elif dimensions:
+        level, label, rule = "single_fluctuation", "单项波动", "one_distinct_field"
+    elif bases and all((_number(evidence.get("metrics", {}).get(field)) or 0) > 0 for field in bases):
+        level, label, rule = "recovering", "恢复中", "nonpositive_prior_base_positive_current_without_declines"
+    elif reasons:
+        level, label, rule = "unknown", "证据不足", "unclassified_signal"
+    else:
+        level, label, rule = "stable", "未见明显走弱", "no_existing_adverse_signals"
+    # This secondary label does not replace the main deterioration level. It
+    # requires *only* cumulative sales/profit declines and strictly positive,
+    # finite latest-quarter YoY for every affected field; no other weak reason
+    # (cash, margins, nonpositive base or quarterly decline) may be present.
+    cumulative_reasons = {field + "_declining": field
+                          for field in ("revenue", "net_profit", "deducted_profit")}
+    recovery_evidence = None
+    if (evidence.get("status") == "weak" and not evidence.get("missing_tags")
+            and reasons and all(reason in cumulative_reasons for reason in reasons)):
+        recovering_fields = sorted({cumulative_reasons[reason] for reason in reasons})
+        quarter_yoy = {field: _number(evidence.get("metrics", {}).get(field + "_single_quarter_yoy"))
+                       for field in recovering_fields}
+        if all(value is not None and value > 0 for value in quarter_yoy.values()):
+            recovery_evidence = dict(level="recovering_latest_quarter", label="累计承压·最新单季恢复",
+                rule="only_cumulative_declines_all_affected_quarter_yoy_positive",
+                dimensions=recovering_fields, single_quarter_yoy=quarter_yoy)
+    return dict(level=level, label=label, rule=rule, dimensions=dimensions, reason_codes=reasons,
+                recovery_evidence=recovery_evidence)
+
+
 def evaluate_operating_trend(rows, as_of, profit_yoy_min=-10.0,
                              gross_margin_drop_max=3.0, net_margin_drop_max=2.0,
                              *, yoy_decline_tolerance=3.0,
@@ -153,6 +202,7 @@ def evaluate_operating_trend(rows, as_of, profit_yoy_min=-10.0,
         raise ValueError("operating thresholds must be finite, margin limits nonnegative")
     result = {"status": "missing", "as_of": day.isoformat(), "period": None, "available_date": None,
               "metrics": {}, "missing_tags": [], "reasons": [], "source": SOURCE_URL}
+    result["signal_profile"] = describe_operating_signals(result)
     usable, duplicates, supplemental_rows = {}, set(), []
     for row in rows or []:
         if not isinstance(row, dict):
@@ -254,6 +304,7 @@ def evaluate_operating_trend(rows, as_of, profit_yoy_min=-10.0,
     result.update(metrics=metrics, missing_tags=list(dict.fromkeys(missing)),
                   reasons=list(dict.fromkeys(failed + weak)),
                   status="failed" if failed else "missing" if missing else "weak" if weak else "verified")
+    result["signal_profile"] = describe_operating_signals(result)
     return result
 
 

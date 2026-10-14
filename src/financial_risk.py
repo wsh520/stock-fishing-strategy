@@ -10,6 +10,30 @@ import re
 from .recent_operating import SOURCE_URL, _day, _number, _minimum_period, parse_summary
 
 
+def _goodwill_diagnostics(values, origin):
+    """Bounded raw-field audit; missing/ambiguous values are never imputed.
+
+    Repeated exact 商誉 fields are ambiguous even when their values agree.
+    Samples are strings (max 3 x 80 chars), so NaN and arbitrary raw values
+    cannot leak into JSON as non-finite numbers or whole statement objects.
+    """
+    count = len(values)
+    value = _number(values[0]) if count == 1 else None
+    state = ("absent" if not count else "duplicate" if count > 1
+             else "empty_or_non_numeric" if value is None
+             else "invalid_negative" if value < 0
+             else "explicit_zero" if value == 0 else "valid")
+    samples = []
+    for raw in values[:3]:
+        if raw is None or isinstance(raw, (str, int, float, bool)):
+            text = str(raw)
+            samples.append(text[:77] + "..." if len(text) > 80 else text)
+        else:
+            samples.append("<" + type(raw).__name__[:60] + ">")
+    return dict(state=state, field_count=count, parsed_value=value,
+                raw_samples=samples, origin=origin)
+
+
 def parse_balance(payload):
     reports = payload.get("result", {}).get("data", {}).get("report_list", {})
     if not isinstance(reports, dict):
@@ -23,13 +47,17 @@ def parse_balance(payload):
                    source=SOURCE_URL, report_source="fzb", data_source=report.get("data_source"),
                    statement_basis="consolidated", currency="CNY")
         seen = set()
+        goodwill_values = []
         for item in report.get("data", []):
             if not isinstance(item, dict):
                 continue
             field = fields.get(item.get("item_title"))
+            if field == "goodwill":
+                goodwill_values.append(item.get("item_value"))
             if field:
                 row[field] = None if field in seen else _number(item.get("item_value"))
                 seen.add(field)
+        row["goodwill_diagnostics"] = _goodwill_diagnostics(goodwill_values, "raw_balance")
         rows.append(row)
     return rows
 
@@ -51,6 +79,8 @@ def evaluate_financial_risk(rows, as_of, debt_max=70., goodwill_max=20.,
                   source=SOURCE_URL, metrics={}, missing_tags=[], reasons=[],
                   thresholds=dict(debt_max=limits[0], goodwill_max=limits[1],
                                   deducted_ratio_min=limits[2]))
+    result["goodwill_diagnostics"] = dict(state="no_report", field_count=None,
+                                          parsed_value=None, raw_samples=[], origin=None)
     usable = {}
     duplicates = set()
     for row in rows or []:
@@ -69,6 +99,9 @@ def evaluate_financial_risk(rows, as_of, debt_max=70., goodwill_max=20.,
     period = max(usable)
     row = usable[period]
     result.update(period=period.isoformat(), available_date=_day(row["available_date"]).isoformat())
+    result["goodwill_diagnostics"] = dict(row.get("goodwill_diagnostics") or
+        _goodwill_diagnostics([row["goodwill"]] if "goodwill" in row else [], "canonical_row"))
+    result["goodwill_diagnostics"]["report_duplicate"] = period in duplicates
     if "merge_diagnostics" in row:
         result["merge_diagnostics"] = row["merge_diagnostics"]
     if period < _minimum_period(day) or period in duplicates:

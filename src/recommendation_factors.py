@@ -73,11 +73,17 @@ def quality_value_technical(out, event_window=5):
 
 
 def assess_low_structure(out, as_of, recent_window=60, min_age=5, max_age=40, atr_multiple=5.):
-    """Recent confirmed closing-price bottom; isolated intraday wicks are diagnostic."""
+    """Recent closing-price bottom; legacy status/reason describe age only.
+
+    failure_reasons independently reports age and overextension failures, without
+    changing anchors, gains, status or the production caller's decision order.
+    Missing-data detail remains in missing_detail (not a guessed gate failure).
+    """
     result = dict(status="missing", reason="data_missing", missing_detail=None,
                   recent_window=recent_window, min_age=min_age, max_age=max_age,
                   anchor=None, anchor_date=None, age=None, gain_pct=None,
-                  allowed_gain_pct=None, annual_extreme_gain_pct=None)
+                  allowed_gain_pct=None, annual_extreme_gain_pct=None,
+                  failure_reasons=[])
     if out is None or not {"date", "close", "low", "atr"}.issubset(out.columns):
         result["missing_detail"] = "required_columns"
         return result
@@ -103,6 +109,11 @@ def assess_low_structure(out, as_of, recent_window=60, min_age=5, max_age=40, at
         result["annual_extreme_gain_pct"] = float((close / extreme.min() - 1) * 100)
     result.update(anchor=anchor, anchor_date=frame.loc[anchor_index, "_date"].strftime("%Y-%m-%d"),
                   age=age, gain_pct=(close / anchor - 1) * 100)
+    # Independent diagnostics do not alter legacy age status or caller decisions.
+    if age < min_age:
+        result["failure_reasons"].append("too_new")
+    elif age > max_age:
+        result["failure_reasons"].append("too_old")
     if not np.isfinite(atr) or atr <= 0:
         result["missing_detail"] = "invalid_atr"
         return result
@@ -111,6 +122,96 @@ def assess_low_structure(out, as_of, recent_window=60, min_age=5, max_age=40, at
     result.update(allowed_gain_pct=allowed,
                   status="verified" if min_age <= age <= max_age else "unconfirmed",
                   reason="too_new" if age < min_age else "too_old" if age > max_age else "confirmed")
+    if result["gain_pct"] > allowed:
+        result["failure_reasons"].append("overextended")
+    return result
+
+
+def assess_shadow_bottoms(out, as_of, window=120, left_bars=3, right_bars=3,
+                          min_separation=5, retest_tolerance=.03, min_rebound=.04):
+    """Pure shadow study; never selects/replaces a production anchor.
+
+    Strict local closing minima confirm after right_bars observed higher closes;
+    a later lower close invalidates them permanently. Double bottoms use the
+    first comparable retest, an intervening rebound, then a neckline breakout.
+    All candidates are chronological; gains use the FIRST bottom, not a higher
+    retest. Breaks below either bottom's support permanently invalidate a pair.
+    """
+    if (window < left_bars + right_bars + 1 or min(left_bars, right_bars, min_separation) < 1
+            or not 0 <= retest_tolerance < 1 or not 0 < min_rebound < 1):
+        raise ValueError("invalid shadow parameters")
+    result = dict(status="missing", reason="required_columns", as_of=str(as_of),
+                  shadow_only=True, local_bottoms=[], double_bottoms=[])
+    if out is None or not {"date", "close"}.issubset(out.columns):
+        return result
+    frame = out.reset_index(drop=True).copy()
+    frame["_date"] = pd.to_datetime(frame["date"], errors="coerce")
+    day = pd.Timestamp(as_of)
+    frame = frame.loc[frame["_date"].notna() & (frame["_date"] <= day)].sort_values("_date")
+    if frame.empty or frame["_date"].duplicated().any() or frame.iloc[-1]["_date"] != day:
+        result["reason"] = ("no_eligible_bars" if frame.empty else
+                            "duplicate_dates" if frame["_date"].duplicated().any() else "as_of_bar_missing")
+        return result
+    frame = frame.tail(window).reset_index(drop=True)
+    close = pd.to_numeric(frame["close"], errors="coerce").to_numpy(float)
+    if len(frame) < left_bars + right_bars + 1 or not np.isfinite(close).all() or (close <= 0).any():
+        result["reason"] = "insufficient_or_invalid_close"
+        return result
+    date = lambda i: frame.iloc[i]["_date"].strftime("%Y-%m-%d")
+    positions = []
+    for i in range(left_bars, len(close)):
+        if not (close[i] < close[i-left_bars:i]).all():
+            continue
+        following = close[i+1:min(i+right_bars+1, len(close))]
+        confirmation_failed = np.flatnonzero(following <= close[i])
+        confirmed_i = (i + right_bars if i + right_bars < len(close)
+                       and not len(confirmation_failed) else None)
+        broken = np.flatnonzero(close[i+1:] < close[i])
+        invalid_i = i + 1 + int(broken[0]) if len(broken) else None
+        if len(confirmation_failed):
+            invalid_i = i + 1 + int(confirmation_failed[0])
+        state = "invalidated" if invalid_i is not None else "confirmed" if confirmed_i is not None else "unconfirmed"
+        candidate = dict(anchor=float(close[i]), anchor_date=date(i), age=len(close)-1-i,
+                         gain_pct=float((close[-1]/close[i]-1)*100), status=state,
+                         confirmed_date=date(confirmed_i) if confirmed_i is not None else None,
+                         invalidated_date=date(invalid_i) if invalid_i is not None else None)
+        result["local_bottoms"].append(candidate)
+        positions.append((i, candidate))
+    for p, (i, first) in enumerate(positions):
+        if first["confirmed_date"] is None:
+            continue
+        for j, second in positions[p+1:]:
+            if second["confirmed_date"] is None and second["status"] == "invalidated":
+                continue
+            if j-i < max(min_separation, right_bars+1):
+                continue
+            if close[i+1:j].min() < close[i]*(1-retest_tolerance):
+                break
+            if abs(close[j]/close[i]-1) > retest_tolerance:
+                continue
+            neckline = float(close[i+1:j].max())
+            if neckline/close[i]-1 < min_rebound:
+                continue
+            support = float(min(close[i], close[j]))
+            broken = np.flatnonzero(close[j+1:] < support)
+            invalid_i = j+1+int(broken[0]) if len(broken) else None
+            confirmed_i = None
+            if second["confirmed_date"] is not None:
+                breakout = np.flatnonzero(close[j+right_bars:] > neckline)
+                if len(breakout):
+                    proposed = j+right_bars+int(breakout[0])
+                    if invalid_i is None or proposed < invalid_i:
+                        confirmed_i = proposed
+            result["double_bottoms"].append(dict(
+                status="invalidated" if invalid_i is not None else "confirmed" if confirmed_i is not None else "unconfirmed",
+                first_date=date(i), second_date=date(j), first_anchor=float(close[i]),
+                second_anchor=float(close[j]), support=support, neckline=neckline,
+                confirmed_date=date(confirmed_i) if confirmed_i is not None else None,
+                invalidated_date=date(invalid_i) if invalid_i is not None else None,
+                gain_pct=float((close[-1]/close[i]-1)*100),
+                support_gain_pct=float((close[-1]/support-1)*100)))
+            break  # First comparable retest, not a gain-optimising search.
+    result.update(status="observed", reason="shadow_only")
     return result
 
 

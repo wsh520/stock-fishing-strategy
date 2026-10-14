@@ -43,6 +43,8 @@ from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Optional
 
+from src.qv_diagnostics import GateAudit, mark_gate, log_gate_audit
+
 import numpy as np
 import pandas as pd
 
@@ -121,7 +123,7 @@ SORT_BY = ["rank_score"]
 SORT_ASC = [False]
 
 # P6b：quality_value 路径全部否决归因码（用于「完整闸门归因」日志，含 0 计数）。
-# 长期为 0 的闸门＝对区分候选无贡献，是数据驱动瘦身的审计对象。新增否决码时同步登记。
+# 零否决不证明无贡献：结合启用状态、适用范围和实际进入检查数解释。新增否决码时同步登记。
 _QV_REASON_CODES = (
     "FAIL_DATA", "FAIL_STALE", "FAIL_LIQUIDITY", "FAIL_POSITION", "FAIL_VALUATION",
     "FAIL_FUND", "FAIL_FORWARD", "FAIL_QV_SCORE", "FAIL_QUALITY_FLOOR",
@@ -2531,7 +2533,7 @@ _MISSING_TAG_ZH = {
     "fund_goodwill": "商誉缺失", "fund_deducted": "扣非缺失",
     "valuation_pe": "PE未核验", "valuation_pb": "PB未核验",
     "fund_annual": "多年财务未核验", "annual_availability_assumed": "年度财务公告日需人工核对", "market_date": "行情基准日期缺失",
-    "financial_review": "金融企业待专项核验",
+    "financial_review": "金融企业待专项核验", "repeat_cooldown": "资格已通过·重复推荐冷却",
     "valuation": "估值缺失", "pct_chg": "涨幅数据缺失", "gap": "开盘价缺失",
     "macd_mom": "MACD柱数据缺失", "kdj": "KDJ数据缺失",
     "operating_trend": "近期经营证据未核验", "operating_weak": "近期经营走弱·观察",
@@ -2793,10 +2795,12 @@ class Signal:
     holding_days_hint_max: Optional[int] = None
     # Only consumed by final QV_PENDING logs, never notification/persistence rows.
     bottom_diagnostics: Optional[dict] = None
+    technical_diagnostics: Optional[dict] = None
 
     def to_dict(self) -> dict:
         row = asdict(self)
         row.pop("bottom_diagnostics", None)
+        row.pop("technical_diagnostics", None)
         return row
 
 def _grade_from_score(score: float, config: StrategyConfig) -> str:
@@ -3365,6 +3369,9 @@ def enrich_recent_operating(code: str, fund_data: Optional[dict], config: Strate
             evidence.setdefault("as_of", str(as_of)[:10])
         if cache is not None:
             cache.set(key, evidence)
+    if isinstance(evidence, dict):
+        from src.recent_operating import describe_operating_signals
+        evidence = dict(evidence, signal_profile=describe_operating_signals(evidence))
     result["operating_trend"] = evidence
     return result
 
@@ -3374,8 +3381,8 @@ def enrich_financial_risk(code: str, fund_data: Optional[dict], config: Strategy
     result = dict(fund_data or {})
     if not config.REQUIRE_FINANCIAL_RISK or _is_financial_stock(code, "", config):
         return result
-    # v2 preserves source labels/merge diagnostics; do not reuse older evidence.
-    key = f"financial_risk_v2_{code}_{as_of}_{config.MAX_DEBT_RATIO}_{config.MAX_GOODWILL_RATIO}_{config.MIN_DEDUCTED_PROFIT_RATIO}"
+    # v3 preserves original goodwill field diagnostics; old caches cannot reconstruct raw missingness.
+    key = f"financial_risk_v3_{code}_{as_of}_{config.MAX_DEBT_RATIO}_{config.MAX_GOODWILL_RATIO}_{config.MIN_DEDUCTED_PROFIT_RATIO}"
     evidence = cache.get(key) if cache is not None else None
     path = _cache_path(config, key + ".json") if config.USE_CACHE else None
     if evidence is None and path and _cache_fresh(path, 1):
@@ -4023,6 +4030,7 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
     index_df：沪深300日线（用于计算近60日相对强度），由主流程传入复用，不额外取数。
     """
     from src.fundamental_quality import evaluate_annual_quality
+    mark_gate("FAIL_DATA")
     if daily_df is None or daily_df.empty:
         return None, "FAIL_DATA"
     df = daily_df.copy()
@@ -4039,6 +4047,7 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
     if df.empty:
         return None, "FAIL_DATA"
     day = str(df.iloc[-1]["date"])
+    mark_gate("FAIL_STALE")
     if latest_trade_date is not None and day != str(latest_trade_date)[:10]:
         return None, "FAIL_STALE"
     # 零量停牌占位不计为有效交易日；末日无成交不推荐。
@@ -4060,11 +4069,14 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
     if ((window["high"] < window[["open", "close", "low"]].max(axis=1)) |
             (window["low"] > window[["open", "close", "high"]].min(axis=1))).any():
         return None, "FAIL_DATA"
+    mark_gate("FAIL_LIQUIDITY")
     if float(df["amount"].tail(20).mean()) < config.MIN_AMOUNT:
         return None, "FAIL_LIQUIDITY"
     # ===== 规则6：停牌缺口检查（quality_value 路径接入 has_halt_gap）=====
     # 沿用 REQUIRE_NO_HALT_GAP 与 MAX_BAR_GAP_DAYS 配置；检测到过长停牌缺口时否决。
     # K 线跨停牌区间时全部滚动指标失真（MA20/RSI/ATR/250日位置），判定失去经济意义。
+    if config.REQUIRE_NO_HALT_GAP:
+        mark_gate("FAIL_HALT_GAP")
     if has_halt_gap(df, config):
         return None, "FAIL_HALT_GAP"
     last = df.iloc[-1]
@@ -4078,6 +4090,7 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
     closes_window = window["close"].to_numpy(dtype=float)
     position = float(((closes_window < close).sum() +
                       0.5 * (closes_window == close).sum()) / len(closes_window))
+    mark_gate("FAIL_POSITION")
     if position > config.LOW_POSITION_MAX:
         return None, "FAIL_POSITION"
     missing = [] if latest_trade_date is not None else ["market_date"]
@@ -4099,6 +4112,7 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
     pct_cap = float(getattr(config, "VALUATION_INDUSTRY_PERCENTILE_MAX", 0.60))
     dual_valuation_guard = bool(getattr(config, "QV_VALUATION_DUAL_GUARD", False))
     # --- PE 准入（主要估值条件）---
+    mark_gate("FAIL_VALUATION")
     if pe is None:
         missing.append("valuation_pe")
     elif pe <= 0:
@@ -4133,6 +4147,8 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
         if dual_valuation_guard and pb_high:
             return None, "FAIL_VALUATION"
     from src.recommendation_factors import historical_valuation, cyclical_earnings_risk, normalized_earnings_valuation
+    if config.REQUIRE_HISTORICAL_VALUATION:
+        mark_gate("FAIL_HISTORICAL_VALUATION")
     history = historical_valuation(df, day, config.HISTORICAL_VALUATION_LOOKBACK, config.HISTORICAL_VALUATION_MIN_SAMPLES)
     if history["status"] == "verified":
         if config.REQUIRE_HISTORICAL_VALUATION and history["percentile"] > config.HISTORICAL_VALUATION_PERCENTILE_MAX:
@@ -4152,6 +4168,7 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
     risk = fund.get("financial_risk")
     risk_status = "not_required"
     if config.REQUIRE_FINANCIAL_RISK and not _is_financial_stock(code, name, config):
+        mark_gate("FAIL_FINANCIAL_RISK")
         from src.financial_risk import validated_financial_risk_status
         risk_status = validated_financial_risk_status(risk, code, day)
         if risk_status == "failed":
@@ -4166,11 +4183,13 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
     financial = _is_financial_stock(code, name, config)
     op_status = "not_required"
     if getattr(config, "REQUIRE_RECENT_OPERATING", True) and not financial:
+        mark_gate("FAIL_RECENT_FUNDAMENTAL")
         op_status = validated_operating_status(operating, code, day)
         if op_status == "failed":
             return None, "FAIL_RECENT_FUNDAMENTAL"
         if op_status != "verified":
             missing.append("operating_weak" if op_status == "weak" else "operating_trend")
+    mark_gate("FAIL_FUND")
     debt_limit = config.FINANCE_MAX_DEBT_RATIO if financial else config.MAX_DEBT_RATIO
     if debt is None:
         missing.append("fund_debt")
@@ -4200,6 +4219,8 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
     _legacy_forward = (getattr(config, "REQUIRE_FORWARD_CONFIRMATION", False)
                        and not getattr(config, "REQUIRE_RECENT_OPERATING", True))
     forward_status, forward_yoy = validate_forward_growth(fund, day, config) if _legacy_forward else ("disabled", None)
+    if _legacy_forward and not financial:
+        mark_gate("FAIL_FORWARD")
     if forward_status == "verified" and not financial:
         ni_yoy = forward_yoy
         forward_verified = True
@@ -4220,9 +4241,11 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
     # KDJ / MACD 下限否决（默认关闭）：quality_value 模式的原有设计是「不额外启用KDJ/MACD硬否决」，此处只在显式开启 QV_ENFORCE_KDJ_MACD_VETO 时收紧，且只拦「动能连续
     # 走弱 / KDJ 高位滞涨」，不改变质量、估值、低位三大闸门的口径。
     if getattr(config, "QV_ENFORCE_KDJ_MACD_VETO", False):
+        mark_gate("FAIL_MACD_WEAK")
         if not macd_not_deeply_weak(technical, config.MACD_WEAK_DAYS,
                                     config.MACD_WEAK_HIST_PCT):
             return None, "FAIL_MACD_WEAK"
+        mark_gate("FAIL_KDJ_HIGH")
         if not kdj_not_overheated(technical, config.KDJ_K_HARD_MAX, config.KDJ_DEAD_CROSS_K):
             return None, "FAIL_KDJ_HIGH"
     quality_score = float(quality.get("quality_score", 0))
@@ -4244,6 +4267,7 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
     cycle = cyclical_earnings_risk(quality.get("annual_rows", []), cycle_operating, config.CYCLICAL_PEAK_PROFIT_MULT) if cyclical else {"status": "not_required", "peak_ratio": None}
     normalized = normalized_earnings_valuation(pe, quality.get("annual_rows", []), cycle_operating, config.QUALITY_YEARS) if cyclical else {"status": "not_required", "normalized_pe": None}
     if cyclical and config.REQUIRE_CYCLICAL_NORMALIZED_VALUATION:
+        mark_gate("FAIL_CYCLICAL_VALUATION")
         if normalized["status"] != "verified":
             missing.append("cyclical_normalized_valuation")
         elif normalized["normalized_pe"] > config.CYCLICAL_NORMALIZED_PE_MAX:
@@ -4375,8 +4399,13 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
     if _stab_mode not in ("strict", "risk_only", "disabled"):
         _stab_mode = "strict"
     low_structure = None
+    technical_diagnostics = {"gate_enabled": bool(getattr(config, "QV_STABILIZATION_GATE", True)),
+                             "mode": _stab_mode, "ma20": finite(d.get("ma20")),
+                             "close": close, "score_ma20_slope": finite(d.get("ma20_slope"))}
     stabilization_level = "confirmed"
     if getattr(config, "QV_STABILIZATION_GATE", True):
+        if _stab_mode != "disabled":
+            mark_gate("FAIL_STABILIZATION")
         _ma20_ok = False
         if timing.get("below_ma20") is False and "ma20" in technical.columns:
             _slope_days = max(1, int(getattr(config, "STABILIZATION_MA20_SLOPE_DAYS", 5)))
@@ -4408,6 +4437,10 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
             _no_new_low = bool(np.isfinite(_recent.to_numpy()).all() and np.isfinite(_prior.to_numpy()).all()
                                and (_recent > 0).all() and (_prior > 0).all()
                                and float(_recent.min()) >= float(_prior.min()))
+        technical_diagnostics.update(ma20_confirmed=bool(_ma20_ok),
+                                     below_ma20=timing.get("below_ma20"), above_ma60=bool(_above_ma60),
+                                     macd_improving=bool(_macd_improving), no_new_low=bool(_no_new_low),
+                                     ma20_slope_days=int(getattr(config, "STABILIZATION_MA20_SLOPE_DAYS", 5)))
         if _stab_mode == "risk_only":
             # 危险形态：MACD 深度弱势 AND 仍在恶化（复用 KDJ/MACD 闸门同一实现）。
             # 只有这一种形态被否决——即「下跌仍在加速」的接飞刀形态。
@@ -4461,11 +4494,13 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
         if config.QV_LOW_ANCHOR_MODE == "recent_structure" and stabilization_level not in ("disabled", "watch"):
             if low_structure["status"] != "verified":
                 missing.append("recent_bottom_unconfirmed")
-            elif low_structure["gain_pct"] > low_structure["allowed_gain_pct"]:
-                return None, "FAIL_OVEREXTENDED"
             else:
+                mark_gate("FAIL_OVEREXTENDED")
+                if low_structure["gain_pct"] > low_structure["allowed_gain_pct"]:
+                    return None, "FAIL_OVEREXTENDED"
                 tags.append(f"近期有效底部{low_structure['anchor_date']}，距底+{low_structure['gain_pct']:.1f}%")
         elif config.QV_LOW_ANCHOR_MODE == "legacy" and _max_gain is not None and float(_max_gain) > 0 and stabilization_level not in ("disabled", "watch"):
+            mark_gate("FAIL_OVEREXTENDED")
             _pct_from_low = finite(timing.get("pct_from_low"))
             if _pct_from_low is None:
                 # 距 250 日低点无法计算（低点窗口数据不足）→ 不视为已满足，保守降级。
@@ -4480,6 +4515,8 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
     timing["stabilization_level"] = stabilization_level
     # 最终层级已知后再应用质量/综合分下限；弱确认即使分数足够也只能 pending。
     _min_quality = float(getattr(config, "MIN_QUALITY_SCORE", 0.0) or 0.0)
+    if _min_quality > 0 and quality["status"] == "verified":
+        mark_gate("FAIL_QUALITY_FLOOR")
     if _min_quality > 0 and quality["status"] == "verified" and quality_score < _min_quality:
         return None, "FAIL_QUALITY_FLOOR"
     assumed_availability = any(bool(r.get("availability_assumed")) for r in quality.get("annual_rows", []))
@@ -4494,12 +4531,15 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
         effective_missing.append("technical_weak")
     formal_eligible = not effective_missing
     min_qv = float(getattr(config, "MIN_QV_SCORE", 0.0) or 0.0)
+    if min_qv > 0 and formal_eligible:
+        mark_gate("FAIL_QV_SCORE")
     if min_qv > 0 and formal_eligible and score < min_qv:
         return None, "FAIL_QV_SCORE"
     # quality_value 波动率风控：放在止跌/KDJ/MACD准入之后，只有已通过其它
     # 资格层、仅 ATR 超限的标的才进入 volatile_out 观察池。
     # 技术路径的 ATR 层保持在 evaluate() 原有实现中，两个开关互不影响。
     if bool(getattr(config, "QV_ATR_GUARD", True)):
+        mark_gate("FAIL_VOLATILE")
         atr_value = finite(d.get("atr"))
         atr_limit = finite(getattr(config, "QV_MAX_ATR_PCT", None))
         if atr_limit is None:
@@ -4568,6 +4608,7 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
         technical_momentum_score=finite(d.get("qv_momentum_score")),
         technical_volume_score=finite(d.get("qv_volume_score")),
         bottom_diagnostics=low_structure if "recent_bottom_unconfirmed" in missing else None,
+        technical_diagnostics=technical_diagnostics,
         **brief), "PASS"
 
 
@@ -4595,9 +4636,14 @@ def _apply_repeat_cooldown(formal: pd.DataFrame, frame: pd.DataFrame,
                     _c, cooldown_days)
     logger.info("重复推荐冷却：%d 只命中，转入待核验（不丢弃、不推送）", len(hit_codes))
     if pending_out is not None and frame is not None:
-        pending_out.extend(
-            frame.loc[frame["code"].astype(str).isin(hit_codes)
-                      & frame["tier"].eq("formal")].to_dict("records"))
+        for record in frame.loc[frame["code"].astype(str).isin(hit_codes)
+                                & frame["tier"].eq("formal")].to_dict("records"):
+            record.update(tier="pending", qualification_status="passed",
+                          delivery_status="cooldown", cooldown_days=cooldown_days)
+            record["missing_tags"] = ",".join(dict.fromkeys(
+                [t for t in str(record.get("missing_tags") or "").split(",") if t]
+                + ["repeat_cooldown"]))
+            pending_out.append(record)
     return formal.loc[~hit_mask].copy()
 
 
@@ -4619,6 +4665,18 @@ def _screen_quality_pool(config: StrategyConfig, cache: CacheManager, market_env
     """
     evaluator = evaluator or evaluate
     stocks = get_stock_list(config, cache)
+    # Only this strategy's built-in path changes scope; longterm/breakout custom evaluators retain theirs.
+    qv_builtin = evaluator is evaluate or evaluator is evaluate_quality_value
+    audit = GateAudit()
+    original_pool_size = len(stocks)
+    if qv_builtin:
+        financial_stocks = [s for s in stocks if _is_financial_stock(s["code"], s["name"], config)]
+        stocks = [s for s in stocks if not _is_financial_stock(s["code"], s["name"], config)]
+        logger.info("[QV_UNIVERSE] 原始股票池=%d，金融排除=%d，实际筛选=%d（按名称关键词/代码名单识别）",
+                    original_pool_size, len(financial_stocks), len(stocks))
+        if financial_stocks:
+            logger.info("[QV_FINANCIAL_EXCLUDED] %s", "，".join(
+                f"{s['name']}({s['code']})" for s in financial_stocks))
     # ===== 重复推荐冷却（2026-10-13 新增，默认开启，只减不增）=====
     # 真实推荐追踪显示「越跌越推」：云天化 3 次、盐津铺子/西藏药业/新乳业各 2 次，
     # 每次推荐后 F1 均为负。跌→更低位更便宜→再满足准入→再推 的闭环。
@@ -4660,6 +4718,10 @@ def _screen_quality_pool(config: StrategyConfig, cache: CacheManager, market_env
     pending_evidence = {}
 
     def screen(stock):
+        with audit.stock():
+            return screen_one(stock)
+
+    def screen_one(stock):
         code, name = stock["code"], stock["name"]
         daily = get_daily_data(code, config, cache)
         # 行业相对估值上下文：个股 PE/PB 在其行业内的分位（无快照/样本不足 → None → 绝对回退）
@@ -4696,7 +4758,7 @@ def _screen_quality_pool(config: StrategyConfig, cache: CacheManager, market_env
             pending_evidence[str(code)] = {
                 label: {key: evidence.get(key) for key in
                         ("status", "period", "available_date", "missing_tags", "reasons", "error_type",
-                         "data_source", "merge_diagnostics")
+                         "data_source", "merge_diagnostics", "signal_profile", "goodwill_diagnostics")
                         if evidence.get(key) is not None}
                 for label, evidence in (("近期经营", fund.get("operating_trend") or {}),
                                         ("财务风险", fund.get("financial_risk") or {}))
@@ -4707,6 +4769,8 @@ def _screen_quality_pool(config: StrategyConfig, cache: CacheManager, market_env
     if volatile_out:
         volatile_out[:] = sort_volatile(volatile_out)
         log_volatile_rejects(volatile_out, logger)
+    technical_diagnostics = {str(sig.code): getattr(sig, "technical_diagnostics", None)
+                             for sig, reason in results if sig is not None and reason == "PASS"}
     bottom_diagnostics = {str(sig.code): getattr(sig, "bottom_diagnostics", None)
                           for sig, reason in results if sig is not None and reason == "PASS"}
     rows = [sig.to_dict() for sig, reason in results if sig is not None and reason == "PASS"]
@@ -4716,30 +4780,36 @@ def _screen_quality_pool(config: StrategyConfig, cache: CacheManager, market_env
     if reasons:
         top = "，".join(f"{k} {v}" for k, v in reasons.most_common(6))
         logger.info("优质低估低位否决归因（前6）：%s", top)
-    # ===== P6b：完整闸门归因（含 0 计数），把"从不触发的死闸门"暴露在每次运行日志里 =====
-    # 目的：闸门瘦身应由数据驱动（哪些闸门长期 0 命中＝对区分候选无贡献），而非凭直觉删。
-    # 长期为 0 的闸门即审计对象——要么阈值被前置闸门架空（死权重），要么本就极少生效。
+    # 完整首因归因与执行审计分开：零否决可能源于关闭、不适用、未进入或检查后通过。
     full = "，".join(f"{c}={reasons.get(c, 0)}" for c in _QV_REASON_CODES)
     logger.info("优质低估低位闸门归因（全量）：%s", full)
-    never = [c for c in _QV_REASON_CODES if reasons.get(c, 0) == 0]
-    if never and processed:
-        logger.info("本次从未触发的闸门（瘦身审计对象，长期为 0 需复核是否被前置条件架空）：%s",
-                    "，".join(never))
+    if qv_builtin:
+        log_gate_audit(logger, config, _QV_REASON_CODES, reasons, audit)
+    else:
+        logger.info("闸门执行审计：自定义评估器未接入；零否决不代表未执行或无用")
     logger.info("优质低估低位筛选：已处理 %d/%d，候选 %d，时间预算耗尽=%s", processed, len(stocks), len(rows), timed_out)
     if not rows:
         return None
     frame = _rank_signals(pd.DataFrame(rows))
-    pending = frame[frame["tier"] != "formal"]
+    pending = frame[frame["tier"] != "formal"].copy()
+    if not pending.empty:
+        pending["qualification_status"] = "blocked"
+        pending["delivery_status"] = "pending"
+    formal = frame[frame["tier"] == "formal"].copy()
+    qualified_count = len(formal)
+    cooldown_rows = []
+    if _cooldown_on and _cooldown_set:
+        formal = _apply_repeat_cooldown(formal, frame, _cooldown_set, _cooldown_days, cooldown_rows)
     if pending_out is not None:
         pending_out.extend(pending.to_dict("records"))
-    formal = frame[frame["tier"] == "formal"].copy()
-    # ===== 重复推荐冷却：只拦「冷却期内已推过的同一只票」，不改任何闸门判定 =====
-    # 逐只打日志（见 _apply_repeat_cooldown）：若这里不输出，后续「今天为什么没推 X」
-    # 将无从排查——不可观测的风控等于没有风控。
-    if _cooldown_on and _cooldown_set:
-        formal = _apply_repeat_cooldown(formal, frame, _cooldown_set, _cooldown_days, pending_out)
-    logger.info("优质低估低位最终分层：候选 %d，正式资格通过 %d，待核验 %d（行业去重/名额截取前）",
-                len(frame), len(formal), len(pending))
+        pending_out.extend(cooldown_rows)
+    logger.info("优质低估低位最终分层：候选 %d，资格通过 %d，冷却转出 %d，普通待核验 %d，"
+                "观察合计 %d，冷却后正式 %d（行业去重/名额截取前）",
+                len(frame), qualified_count, len(cooldown_rows), len(pending),
+                len(pending) + len(cooldown_rows), len(formal))
+    for row in cooldown_rows:
+        logger.info("[QV_COOLDOWN] %s(%s) | 资格=passed | 推送=cooldown | 原因=repeat_cooldown | 冷却期=%d",
+                    row.get("name"), row.get("code"), _cooldown_days)
     if not pending.empty:
         tag_counts, sole_counts, combination_counts = Counter(), Counter(), Counter()
         dual_guard = bool(getattr(config, "QV_VALUATION_DUAL_GUARD", False))
@@ -4763,6 +4833,10 @@ def _screen_quality_pool(config: StrategyConfig, cache: CacheManager, market_env
                 row.get("stabilization_level"), row.get("quality_status"),
                 row.get("financial_risk_status"), row.get("operating_status"),
                 row.get("cyclical_risk"), row.get("operating_summary") or "无")
+            logger.info("[QV_PENDING_TECH] %s(%s) | 趋势分=%s 动量分=%s 量价分=%s | 判据=%s",
+                        row.get("name"), row.get("code"), row.get("technical_trend_score"),
+                        row.get("technical_momentum_score"), row.get("technical_volume_score"),
+                        technical_diagnostics.get(str(row.get("code"))) or "未取得")
             if "recent_bottom_unconfirmed" in blockers:
                 bottom = bottom_diagnostics.get(str(row.get("code"))) or {}
                 reason = bottom.get("reason", "data_missing")
@@ -4771,14 +4845,15 @@ def _screen_quality_pool(config: StrategyConfig, cache: CacheManager, market_env
                 logger.info(
                     "[QV_PENDING_BOTTOM] %s(%s) | 底部锚点日期=%s | 距底交易bar数=%s | "
                     "min_age=%s max_age=%s window=%s | gain_pct=%s allowed_gain_pct=%s | "
-                    "原因=%s（%s） | 缺失详情=%s",
+                    "原因=%s（%s） | 缺失详情=%s | 全部问题=%s",
                     row.get("name"), row.get("code"), _fmt_cell(bottom.get("anchor_date")),
                     _fmt_cell(bottom.get("age")),
                     bottom.get("min_age", config.QV_RECENT_LOW_MIN_AGE),
                     bottom.get("max_age", config.QV_RECENT_LOW_MAX_AGE),
                     bottom.get("recent_window", config.QV_RECENT_LOW_WINDOW),
                     _fmt_cell(bottom.get("gain_pct")), _fmt_cell(bottom.get("allowed_gain_pct")),
-                    reason, reason_zh, bottom.get("missing_detail") or "无")
+                    reason, reason_zh, bottom.get("missing_detail") or "无",
+                    ",".join(bottom.get("failure_reasons") or []) or reason)
             logger.info("[QV_PENDING_EVIDENCE] %s(%s) | 财务证据摘要=%s",
                         row.get("name"), row.get("code"),
                         pending_evidence.get(str(row.get("code"))) or "无（未取得证据摘要）")
@@ -4786,7 +4861,7 @@ def _screen_quality_pool(config: StrategyConfig, cache: CacheManager, market_env
                     "，".join(f"{tag}（{_missing_tags_zh(tag)}）={count}" for tag, count in tag_counts.most_common()))
         logger.info("[QV_PENDING_SUMMARY] 唯一阻断原因（仅被这一项阻断）：%s",
                     "，".join(f"{tag}={count}" for tag, count in sole_counts.most_common()) or "无")
-        logger.info("[QV_PENDING_SUMMARY] 阻断组合（互斥，数量合计等于待核验数）：%s",
+        logger.info("[QV_PENDING_SUMMARY] 阻断组合（互斥，数量合计等于普通待核验数，不含冷却转出）：%s",
                     "；".join(f"[{tags}]={count}" for tags, count in combination_counts.most_common()))
     if config.USE_INDUSTRY_DEDUP and not formal.empty:
         formal = _dedup_by_industry(formal, config, cache)
@@ -4795,7 +4870,10 @@ def _screen_quality_pool(config: StrategyConfig, cache: CacheManager, market_env
         formal = _tag_valuation_mode(formal, snapshot, industry_map, config)
     if len(formal) > cap:
         logger.info("通过 formal %d 只，按综合分截取前 %d 只（市场环境上限）", len(formal), cap)
-    return formal.head(cap).reset_index(drop=True)
+    selected = formal.head(cap).reset_index(drop=True)
+    logger.info("[QV_DELIVERY_SUMMARY] 最终可推送=%d，资格通过=%d，冷却转出=%d，普通待核验=%d，观察合计=%d",
+                len(selected), qualified_count, len(cooldown_rows), len(pending), len(pending) + len(cooldown_rows))
+    return selected
 
 
 def get_market_environment(config: StrategyConfig, cache: CacheManager) -> dict:
