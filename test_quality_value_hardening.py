@@ -25,7 +25,7 @@ from unittest.mock import patch
 import numpy as np
 import pandas as pd
 
-from src import bottom_fishing_strategy as m
+from src import screening_engine as m
 from src import volume_breakout_strategy as vb
 
 DAY = "2025-06-30"

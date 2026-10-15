@@ -1,7 +1,7 @@
 """
 放量突破选股策略（Volume Breakout）
 
-与 bottom_fishing_strategy.py 并列的第二支日线选股信号，捕捉「横盘整理末端 →
+与 screening_engine.py 并列的第二支日线选股信号，捕捉「横盘整理末端 →
 放量突破关键阻力位」的趋势启动点。整体骨架、数据层、基本面防雷、市场环境、
 决赛圈周线确认、漏斗日志、时间预算、看门狗全部沿用抄底策略的实现，
 只替换「日线信号 + 评估」层。
@@ -40,7 +40,7 @@ import pandas as pd
 from numpy.lib.stride_tricks import sliding_window_view
 
 # 复用抄底策略的数据层、市场环境、基本面、周线确认、Baostock 生命周期、并发筛选骨架
-from src.bottom_fishing_strategy import (
+from src.screening_engine import (
     StrategyConfig,
     CacheManager,
     Signal,
@@ -1072,7 +1072,7 @@ def describe_breakout(row: dict) -> str:
     而非「候选」——能进卡片的必然已是 tier=formal（feishu 渲染前已过滤）。
     """
     if row.get("weekly_status") == "not_required":
-        from src.bottom_fishing_strategy import describe
+        from src.screening_engine import describe
         return describe(row)
     lvl = {3: "L1·60日新高", 2: "L2·20日新高", 1: "L3·MA60"}.get(
         int(row.get("breakout_level") or 0), "-")
@@ -1175,7 +1175,7 @@ def main_breakout(
     volatile_out: Optional[list] = None,
     pending_out: Optional[list] = None,
 ) -> Optional[pd.DataFrame]:
-    """放量突破选股主流程。骨架与 bottom_fishing_strategy.main 对齐：
+    """放量突破选股主流程。骨架与 screening_engine.main 对齐：
     初始化数据源 → 市场环境 → 股票池 → 并发筛选（漏斗日志） → 决赛圈周线确认 → 排序截取。
 
     volatile_out：可选 list，传出「波动率风控否决」明细（突破/量能/形态/趋势各层已过、
@@ -1402,7 +1402,7 @@ def main_breakout(
             fund = _fill_optional_fundamentals(code, dict(fund or {}), config)
             fund = enrich_recent_operating(code, fund, config, cache, as_of=str(row.get("date") or latest))
             from src.recent_operating import validated_operating_status, summarize_operating
-            from src.bottom_fishing_strategy import _is_financial_stock
+            from src.screening_engine import _is_financial_stock
             financial = _is_financial_stock(code, str(row["name"]), config)
             risk_status = "not_required"
             if config.REQUIRE_FINANCIAL_RISK:

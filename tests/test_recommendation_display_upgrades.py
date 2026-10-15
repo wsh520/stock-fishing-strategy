@@ -152,7 +152,7 @@ class RecommendationDisplayTests(unittest.TestCase):
         self.assertNotIn("999999", json.dumps(payloads, ensure_ascii=False))
         self.assertNotIn("不应展示的待核验票", json.dumps(payloads, ensure_ascii=False))
     def test_manual_reference_bands_use_half_atr_and_are_not_execution_orders(self):
-        from src.bottom_fishing_strategy import describe_trade_plan
+        from src.screening_engine import describe_trade_plan
         lines = describe_trade_plan(dict(close=10., stop_loss=8.5, take_profit=13.,
                                          rr_ratio=2., atr14=1., quality_score=70.))
         text = "\n".join(lines)
@@ -163,7 +163,7 @@ class RecommendationDisplayTests(unittest.TestCase):
         self.assertIn("不代表到期必须卖出", text)
 
     def test_missing_atr_keeps_single_reference_levels_and_manual_note(self):
-        from src.bottom_fishing_strategy import describe_trade_plan
+        from src.screening_engine import describe_trade_plan
         text = "\n".join(describe_trade_plan(dict(close=10., stop_loss=8.5, take_profit=13.,
                                                   quality_score=70.)))
         self.assertIn("止损参考价 8.50", text)

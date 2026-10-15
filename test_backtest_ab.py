@@ -13,7 +13,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import backtest as bt
-from src.bottom_fishing_strategy import StrategyConfig
+from src.screening_engine import StrategyConfig
 
 _RESULTS: list[tuple[str, bool]] = []
 

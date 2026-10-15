@@ -13,7 +13,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from src.bottom_fishing_strategy import StrategyConfig, compute_daily_signals, assess_entry_timing
+from src.screening_engine import StrategyConfig, compute_daily_signals, assess_entry_timing
 from src.recommendation_factors import assess_low_structure, assess_shadow_bottoms
 
 

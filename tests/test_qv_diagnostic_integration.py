@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 import pandas as pd
 
-from src import bottom_fishing_strategy as m
+from src import screening_engine as m
 from src.qv_diagnostics import GateAudit, gate_mode, log_gate_audit, mark_gate
 from test_quality_recommendations import DAY, fundamentals, prices
 

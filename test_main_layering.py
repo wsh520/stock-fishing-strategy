@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src
 import numpy as np
 import pandas as pd
 
-import bottom_fishing_strategy as m
+import screening_engine as m
 
 LATEST = "2025-06-27"  # 基准交易日（周五）
 

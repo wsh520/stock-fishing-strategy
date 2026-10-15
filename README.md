@@ -79,10 +79,12 @@
 
 以下“历史技术对照”四层技术过滤是**历史technical对照说明**，不是当前quality_value默认，也不是突破当前默认；其中旧阈值与实验结论只适用于其历史配置。当前突破规则见“策略二”和[突破设计](docs/volume_breakout_strategy.md)。交易/回测/追踪章节描述既有行为，本次荐股证据调整没有自动补齐历史核验或证明业绩改善。
 
-## 历史技术对照：低位企稳（bottom_fishing_strategy.py）
+## 历史技术对照：低位企稳（screening_engine.py）
 
-> **模块名与口径的关系**：`bottom_fishing_strategy.py` 承载两种资格判定，对外称谓按**实际生效口径**给出——
+> **模块名与口径的关系**：`screening_engine.py` 承载两种资格判定，对外称谓按**实际生效口径**给出——
 > `quality_value`（run.py默认）= **优质低估低位**；以下内容记录旧technical低位企稳配置（底背离、RSI超卖、回撤深度）。历史阈值不能直接当作当前运行值；突破technical是独立规则。
+
+> **模块名 ≠ 落库 strategy 值（重要）**：模块已于 2026-10-15 由 `bottom_fishing_strategy.py` 更名为 `screening_engine.py`（现名更贴合其实际职责：选股引擎而非单一「底背离」策略）。但**数据库 `stock_recommendation.strategy` 列的值仍是 `bottom_fishing`，且不可改**——该值参与唯一键 `uk_rec_date_code_strategy (rec_date, code, strategy)`，改名会造成历史推荐行与新行分裂成两个 strategy sleeve，周度追踪与信号归因按 strategy 分列时胜率被拆开重算。2026-10-13 已发生过一次「传入值不在 `KNOWN_STRATEGIES` 里被静默改写、导致长期 sleeve 推荐与生产 sleeve 撞唯一键而丢失」的事故。因此：`src/screening_engine.py` 是**代码模块名**，`bottom_fishing` 是**持久化枚举值**，两者刻意保持不同。
 
 4 层量化过滤体系：
 
@@ -290,8 +292,8 @@ SOURCE schema.sql;
 │   ├── weekly_tracking.yml           # 周度追踪（周五 21:20）
 │   └── monthly_attribution.yml       # 信号归因月报（每月 1 日 09:00）
 ├── src/
-│   ├── bottom_fishing_strategy.py          # 策略一：优质低估低位+低位企稳（quality_value / technical 双口径 · 数据层 · 评分 · 共享筛选骨架）
-│   ├── volume_breakout_strategy.py         # 策略二：放量突破（7层漏斗，继承策略一数据层/骨架）
+│   ├── screening_engine.py                # 选股引擎（quality_value 默认口径 + technical 口径 + 数据层 + 评分 + 共享筛选骨架）
+│   ├── volume_breakout_strategy.py        # 策略二：放量突破（7层漏斗，继承引擎数据层/骨架）
 │   ├── quality_longterm_strategy.py        # 策略三：长期优质低估低位（LongTermQualityConfig + evaluate_quality_longterm，经 evaluator 参数注入 _screen_quality_pool）
 │   ├── fundamental_quality.py              # 年度质量核验（新浪原始接口优先，AkShare摘要fallback）
 │   ├── financial_risk.py                   # 财务risk 独立证据（新浪原始资产负债表：负债率/商誉/扣非，同报告期同口径）
@@ -299,8 +301,8 @@ SOURCE schema.sql;
 │   ├── recommendation_factors.py           # 纯点时证据：周期行业分类 / 自身历史PE分位 / 近期底部结构 / 盈利正常化估值 / 技术状态分（零取数）
 │   ├── market_data_integrity.py            # 已完成交易日与行情缓存元数据核验（与数据源无关，独立日历覆盖当日）
 │   ├── volume_breakout_backtest.py         # 突破策略离线回测（本地 CSV，不联网；含闸门 A/B 与漏斗归因）
-│   ├── bottom_fishing_strategy_akshare.py  # 旧版策略备份（AkShare 数据源，未被引用）
-│   └── bottom_fishing_strategy_old.py      # 更早期版本备份（未被引用）
+│   ├── screening_engine_akshare.py       # 旧版备份（AkShare 数据源，未被引用）
+│   └── screening_engine_old.py            # 更早期版本备份（未被引用）
 ├── store/
 │   └── mysql_store.py                # MySQL 持久化：推荐落库 / 固定期限追踪 / 归因查询（含幂等迁移）
 ├── notify/
@@ -469,7 +471,7 @@ python backtest.py ab --mode technical --variants baseline,no_kdj \
 
 > **`p3_tech10` 的坑**：单纯下调技术权重会使综合分整体下移，`MIN_QV_SCORE` 变成更严的门槛——测到的其实是「降分」而非「换权重」。必须把差额同时还给质量/估值，保持三者和为 1。P4 套件同理（`_validate_score_weights` 会硬校验权重和）。
 
-> **⚠️ 覆盖范围边界**：`backtest.py ab` 的两个模式都走 **bottom_fishing_strategy** 的 `evaluate()`（见 `_screen_day`），因此它**无法**验证放量突破策略层 3.8 的两个闸门。突破策略的闸门 A/B 与漏斗归因请用 `src/volume_breakout_backtest.py`（下节）。
+> **⚠️ 覆盖范围边界**：`backtest.py ab` 的两个模式都走 **screening_engine** 的 `evaluate()`（见 `_screen_day`），因此它**无法**验证放量突破策略层 3.8 的两个闸门。突破策略的闸门 A/B 与漏斗归因请用 `src/volume_breakout_backtest.py`（下节）。
 
 ### 突破策略闸门 A/B 与漏斗归因
 
@@ -495,7 +497,7 @@ python -m src.volume_breakout_backtest --input backtest_cache/daily --ab-gates \
 
 ```bash
 # 优质低估低位策略：仅选股，打印明细
-python src/bottom_fishing_strategy.py screen
+python src/screening_engine.py screen
 
 # 突破策略：仅选股，打印明细
 python src/volume_breakout_strategy.py screen

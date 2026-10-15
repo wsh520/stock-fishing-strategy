@@ -12,7 +12,7 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from src.bottom_fishing_strategy import (  # noqa: E402
+from src.screening_engine import (  # noqa: E402
     StrategyConfig, compute_daily_signals, compute_market_environment,
     _recompute_pct_chg, _valuation_pe_score, qv_floor_equivalence, describe_qv_floor,
 )

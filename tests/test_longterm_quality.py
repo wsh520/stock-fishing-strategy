@@ -369,7 +369,7 @@ class TestLongTermConfig(unittest.TestCase):
     
     def test_config_inheritance(self):
         """配置继承"""
-        from src.bottom_fishing_strategy import StrategyConfig
+        from src.screening_engine import StrategyConfig
         
         config = LongTermQualityConfig()
         

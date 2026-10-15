@@ -132,7 +132,7 @@ _VALUATION_MODE_NOTE = {
 # tier 复核），因此卡片上出现的每一只都是**正式推荐**——已落库、并被周度追踪统计战绩。
 # 原先写成「XX候选」会被读成「备选/仅供参考」，与 formal 的真实含义相反。
 # 现统一为「正式推荐 · XX口径」，并在每只票下渲染「操作计划」块（建仓区间 /
-# 止损 / 止盈 / 建议持有周期，见 bottom_fishing_strategy.describe_trade_plan）。
+# 止损 / 止盈 / 建议持有周期，见 screening_engine.describe_trade_plan）。
 _RECOMMENDATION_NOTE = (
     "\n**名单口径:** 下列均为**正式推荐**（已通过全部筛选闸门、已落库并纳入周度追踪）；"
     "\n每只票下方的**操作计划**为计划价位，按**次日开盘**执行，仓位与资金管理请自行判断。"
@@ -348,7 +348,7 @@ def notify_screening_result(
 
     # 尝试导入 describe 函数（按策略来源选择卡片格式）
     try:
-        from src.bottom_fishing_strategy import describe
+        from src.screening_engine import describe
     except ImportError:
         describe = None
     try:

@@ -112,7 +112,7 @@ def main(argv: list[str] | None = None):
     _setup_logging()
     args = _parse_args(argv)
 
-    from src.bottom_fishing_strategy import is_data_degraded
+    from src.screening_engine import is_data_degraded
     from src.quality_longterm_strategy import (
         LongTermQualityConfig,
         evaluate_quality_longterm,
@@ -120,7 +120,7 @@ def main(argv: list[str] | None = None):
     # 复用基类的编排与并发骨架，只替换「配置类」与「评估器」两个口径入口。
     # 这样市场熔断、regime 数量收缩、闸门归因日志、pending/volatile 分层、
     # 行业去重、估值口径标注全部与生产共用同一份实现，不会二次漂移。
-    from src import bottom_fishing_strategy as bfs
+    from src import screening_engine as bfs
 
     t_start = time.time()
     logger.info("=" * 60)
@@ -280,7 +280,7 @@ def _run_comparison(cache) -> None:
     只做口径对照，不落库、不通知——它的用途是人工判断「长期口径到底多筛掉了什么」，
     不应污染实盘数据。
     """
-    from src.bottom_fishing_strategy import (
+    from src.screening_engine import (
         StrategyConfig,
         _screen_quality_pool,
         evaluate_quality_value,

@@ -12,7 +12,7 @@
     python run_breakout.py --no-cache # 跳过磁盘缓存，强制从数据源拉最新数据
 
 与 run.py 的差异：
-- 导入 volume_breakout_strategy 而非 bottom_fishing_strategy
+- 导入 volume_breakout_strategy 而非 screening_engine
 - 熊市直接跳过（main_breakout 内部已处理，本脚本仅记录日志）
 - 落库复用 save_recommendations；同日同股重复推荐由现有唯一键忽略
 - 通知标题为「放量突破选股结果」，与优质低估低位策略通知区分
@@ -190,7 +190,7 @@ def run(argv: list[str] | None = None):
             logger.info("Step 4/4 发送飞书通知...")
             # P6：数据源降级可观测（与 run.py 同口径），避免"降级导致的零推荐"被误读为"没有好票"。
             try:
-                from src.bottom_fishing_strategy import is_data_degraded
+                from src.screening_engine import is_data_degraded
                 degraded = is_data_degraded()
             except Exception:
                 degraded = False

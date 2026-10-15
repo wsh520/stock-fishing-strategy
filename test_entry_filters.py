@@ -30,7 +30,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
 import numpy as np
 import pandas as pd
 
-import bottom_fishing_strategy as m
+import screening_engine as m
 
 
 def make_df(closes, last_vol_mult=3.0, last_open=None, vol_base=10_000_000,

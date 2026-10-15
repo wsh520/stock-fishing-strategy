@@ -213,7 +213,7 @@ def run_backtest(data: Dict[str, pd.DataFrame], cfg: Optional[BacktestConfig] = 
 # KDJ / MACD 闸门 A/B 与漏斗诊断
 #
 # 动机：`backtest.py ab` 的重放走的是抄底策略 evaluate()（quality_value / technical
-# 两个分支都指向 bottom_fishing_strategy），因此**无法**验证本策略层 3.8 的
+# 两个分支都指向 screening_engine），因此**无法**验证本策略层 3.8 的
 # REQUIRE_BR_KDJ_NOT_HIGH / REQUIRE_BR_MACD_NOT_WEAK 两个闸门。本模块是突破策略
 # 唯一的本地回测入口，故把闸门 A/B 与漏斗归因放在此处。
 #

@@ -28,9 +28,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src
 import numpy as np
 import pandas as pd
 
-from src import bottom_fishing_strategy as m
+from src import screening_engine as m
 from src import volume_breakout_strategy as vb
-from src.bottom_fishing_strategy import kdj_not_overheated, macd_not_deeply_weak
+from src.screening_engine import kdj_not_overheated, macd_not_deeply_weak
 
 _RESULTS: list[tuple[str, bool]] = []
 

@@ -7,7 +7,7 @@ import pandas as pd
 
 from src.recommendation_factors import assess_low_structure, assess_shadow_bottoms
 from diag_technical_bottom_ablation import evaluate_frame, summarize, strict_stabilization, main
-from src.bottom_fishing_strategy import StrategyConfig, compute_daily_signals
+from src.screening_engine import StrategyConfig, compute_daily_signals
 
 
 def bars(values):

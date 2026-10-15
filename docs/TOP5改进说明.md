@@ -1,17 +1,17 @@
 # TOP5 荐股质量改进 · 落地说明
 
-> 依据对 `src/bottom_fishing_strategy.py` 荐股质量的评价（`粘贴文本.txt`），本轮实现评价建议中最值得先做的五项改进。
+> 依据对 `src/screening_engine.py` 荐股质量的评价（`粘贴文本.txt`），本轮实现评价建议中最值得先做的五项改进。
 > 目标：**宁可少荐，也不让数据缺失提升入选机会**；让推荐理由「说得准」，而不是「过得了条件」。
 
 ## 一、总览：五项改进与实现位置
 
 | # | 改进项 | 核心变化 | 主要文件 |
 |---|--------|----------|----------|
-| 1 | **数据缺失分层** | 财务/周线数据缺失不再「放行即通过」，改判为**待核验候选**；主源财务按字段用 AkShare 补齐后复核 | `src/bottom_fishing_strategy.py`、`run.py`、`notify/feishu.py`、`store/mysql_store.py` |
-| 2 | **修正底背离** | 指标比较锚定在「前一个价格低点」当根，而非指标自身窗口最小值；至少间隔 5 根保证是两个独立低点 | `src/bottom_fishing_strategy.py` |
-| 3 | **统一评级含义** | 等级=原始技术分定级（删除底背离升档、删除熊市扣分定级改为抬门槛）；结果拆三维展示；排序加股票代码末级键 | `src/bottom_fishing_strategy.py`、`notify/feishu.py` |
-| 4 | **细化量价质量** | 二元「量价配合 25 分」→ 三档质量分（放量企稳 25 / 放量上涨 18 / 放量冲高回落 10） | `src/bottom_fishing_strategy.py` |
-| 5 | **数据时效与可复现** | 个股最新K线须与沪深300最新交易日一致（停牌→暂不推荐）；周线须覆盖最新交易周；排序确定性；市场环境「未知」明示 | `src/bottom_fishing_strategy.py` |
+| 1 | **数据缺失分层** | 财务/周线数据缺失不再「放行即通过」，改判为**待核验候选**；主源财务按字段用 AkShare 补齐后复核 | `src/screening_engine.py`、`run.py`、`notify/feishu.py`、`store/mysql_store.py` |
+| 2 | **修正底背离** | 指标比较锚定在「前一个价格低点」当根，而非指标自身窗口最小值；至少间隔 5 根保证是两个独立低点 | `src/screening_engine.py` |
+| 3 | **统一评级含义** | 等级=原始技术分定级（删除底背离升档、删除熊市扣分定级改为抬门槛）；结果拆三维展示；排序加股票代码末级键 | `src/screening_engine.py`、`notify/feishu.py` |
+| 4 | **细化量价质量** | 二元「量价配合 25 分」→ 三档质量分（放量企稳 25 / 放量上涨 18 / 放量冲高回落 10） | `src/screening_engine.py` |
+| 5 | **数据时效与可复现** | 个股最新K线须与沪深300最新交易日一致（停牌→暂不推荐）；周线须覆盖最新交易周；排序确定性；市场环境「未知」明示 | `src/screening_engine.py` |
 
 ## 二、逐项说明
 
@@ -75,7 +75,7 @@
 - **主流程端到端冒烟**（打桩数据源，不访问网络）：
   - 周线路径：财务完整 → formal（weekly_status=confirmed）；财务缺失 → pending；周线缺失 → pending；可选项缺失只记 `missing_tags`。
   - 周线禁用路径：weekly_status=disabled，财务缺失者仍不进正式名单。
-- **编译校验**：`src/bottom_fishing_strategy.py`、`store/mysql_store.py`、`notify/feishu.py`、`run.py`、`test_entry_filters.py`、两个入口脚本全部通过。
+- **编译校验**：`src/screening_engine.py`、`store/mysql_store.py`、`notify/feishu.py`、`run.py`、`test_entry_filters.py`、两个入口脚本全部通过。
 
 ## 四、兼容性与迁移
 

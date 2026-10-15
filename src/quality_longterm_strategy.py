@@ -14,7 +14,7 @@
 """
 
 from dataclasses import dataclass
-from src.bottom_fishing_strategy import StrategyConfig
+from src.screening_engine import StrategyConfig
 import logging
 import numpy as np
 import pandas as pd
@@ -539,7 +539,7 @@ def evaluate_quality_longterm(daily_df: Optional[pd.DataFrame], code: str, name:
     仅执行不依赖财务数据的技术面否决（加速下跌）。这也符合上游预筛的设计意图
     ——「先廉价行情筛选，后年度财务核验」。
     """
-    from src.bottom_fishing_strategy import evaluate_quality_value
+    from src.screening_engine import evaluate_quality_value
 
     # 先调用原有评估逻辑（quality_value 全部闸门：流动性/低位/估值/止跌/ATR…）
     signal, reason = evaluate_quality_value(
@@ -558,7 +558,7 @@ def evaluate_quality_longterm(daily_df: Optional[pd.DataFrame], code: str, name:
     if getattr(config, "DETECT_ACCELERATING_DECLINE", False):
         technical = None
         try:
-            from src.bottom_fishing_strategy import compute_daily_signals
+            from src.screening_engine import compute_daily_signals
             if daily_df is not None and not daily_df.empty:
                 technical = compute_daily_signals(daily_df.copy(), config)
         except Exception as exc:  # noqa: BLE001 形态指标失败不得误杀
@@ -645,7 +645,7 @@ def evaluate_quality_longterm(daily_df: Optional[pd.DataFrame], code: str, name:
     # 7. 缩量见底展示标签（不参与准入/排序）
     if getattr(config, "DETECT_VOLUME_EXHAUSTION", False):
         try:
-            from src.bottom_fishing_strategy import compute_daily_signals
+            from src.screening_engine import compute_daily_signals
             if daily_df is not None and not daily_df.empty:
                 tech_for_vol = compute_daily_signals(daily_df.copy(), config)
                 vol = _detect_volume_exhaustion(tech_for_vol, config)

@@ -117,7 +117,7 @@ class FinancialSourceCompatibilityTests(unittest.TestCase):
         self.assertEqual((balance, summary), original)
 
     def test_repaired_evidence_unlocks_only_the_financial_blocker(self):
-        from src import bottom_fishing_strategy as m
+        from src import screening_engine as m
         from test_quality_recommendations import prices, fundamentals, DAY
         cfg = m.StrategyConfig(USE_CACHE=False, REQUIRE_RECENT_OPERATING=False,
                                MIN_TECHNICAL_SCORE_FORMAL=0, QV_LOW_ANCHOR_MODE="legacy")
@@ -140,7 +140,7 @@ class FinancialSourceCompatibilityTests(unittest.TestCase):
         self.assertEqual((reason, blocked.tier, blocked.missing_tags), ("PASS", "pending", "technical_weak"))
 
     def test_risk_cache_version_bypasses_old_evidence(self):
-        from src import bottom_fishing_strategy as m
+        from src import screening_engine as m
         cfg = m.StrategyConfig(USE_CACHE=False)
         cache = m.CacheManager()
         suffix = f"603345_2026-10-08_{cfg.MAX_DEBT_RATIO}_{cfg.MAX_GOODWILL_RATIO}_{cfg.MIN_DEDUCTED_PROFIT_RATIO}"

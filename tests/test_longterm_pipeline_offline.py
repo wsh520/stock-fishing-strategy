@@ -109,7 +109,7 @@ def _fundamentals():
 class LongTermOfflineTest(unittest.TestCase):
 
     def setUp(self):
-        import src.bottom_fishing_strategy as bfs
+        import src.screening_engine as bfs
         self.bfs = bfs
         self.daily = _bars()
         self.index = _bars(n=320, start=4000.0, seed=11)[["date", "close"]].copy()
@@ -142,7 +142,7 @@ class LongTermOfflineTest(unittest.TestCase):
         导致 evaluate_quality_value 对**每只**股票崩溃。
         """
         import dataclasses as dc
-        from src.bottom_fishing_strategy import _config_kwargs
+        from src.screening_engine import _config_kwargs
         from src.quality_longterm_strategy import LongTermQualityConfig
         from src.volume_breakout_strategy import VolumeBreakoutConfig
         cfg = LongTermQualityConfig()
@@ -212,7 +212,7 @@ class LongTermOfflineTest(unittest.TestCase):
     # ---------- 3) 口径收紧（宁缺毋滥）----------
     def test_longterm_is_stricter_than_production(self):
         """长期口径必须在关键维度上不宽于生产口径。"""
-        from src.bottom_fishing_strategy import StrategyConfig
+        from src.screening_engine import StrategyConfig
         from src.quality_longterm_strategy import LongTermQualityConfig
         lt, prod = LongTermQualityConfig(), StrategyConfig()
         self.assertGreaterEqual(lt.QUALITY_YEARS, prod.QUALITY_YEARS)
@@ -231,7 +231,7 @@ class LongTermOfflineTest(unittest.TestCase):
 
     def test_reason_codes_registered(self):
         """新增否决码必须登记进漏斗归因表，否则日志算成 ERROR。"""
-        from src.bottom_fishing_strategy import _QV_REASON_CODES
+        from src.screening_engine import _QV_REASON_CODES
         for code in ("FAIL_ACCELERATING_DECLINE", "FAIL_ROE_UNSTABLE",
                      "FAIL_EARNINGS_INCONSISTENT", "FAIL_LONGTERM_CASH_POOR",
                      "FAIL_LONGTERM_QUALITY_SCORE", "FAIL_RELATIVE_STRENGTH_WEAK"):
@@ -261,7 +261,7 @@ class LongTermOfflineTest(unittest.TestCase):
     def test_holding_days_carried_in_signal(self):
         """持有期必须落在 Signal 正式字段上（会进 to_dict → 卡片），不是临时属性。"""
         import dataclasses as dc
-        from src.bottom_fishing_strategy import Signal
+        from src.screening_engine import Signal
         names = {f.name for f in dc.fields(Signal)}
         self.assertIn("holding_days_hint_min", names)
         self.assertIn("holding_days_hint_max", names)
@@ -274,7 +274,7 @@ class LongTermOfflineTest(unittest.TestCase):
 
     def test_trade_plan_uses_row_holding_days(self):
         """卡片渲染必须用行内的 30~90 天，而不是回落成生产的 40~60 天。"""
-        from src.bottom_fishing_strategy import describe_trade_plan
+        from src.screening_engine import describe_trade_plan
         row = {"code": "600000", "close": 10.0, "stop_loss": 8.0, "take_profit": 15.0,
                "rr_ratio": 1.875, "quality_score": 70.0, "position_250": 0.2,
                "holding_days_hint_min": 30, "holding_days_hint_max": 90}

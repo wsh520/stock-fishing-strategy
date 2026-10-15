@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import pandas as pd
 
-import src.bottom_fishing_strategy as bfs
+import src.screening_engine as bfs
 from src.quality_longterm_strategy import LongTermQualityConfig, evaluate_quality_longterm
 from tests.test_longterm_pipeline_offline import (
     _bars, _fundamentals, _qualified_bars, _qualified_index)

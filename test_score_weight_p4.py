@@ -27,7 +27,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
 
-from src import bottom_fishing_strategy as m
+from src import screening_engine as m
 from src.volume_breakout_strategy import VolumeBreakoutConfig
 
 # backtest.py 在模块顶层 import baostock；这里只取 AB_VARIANTS 这份纯数据，

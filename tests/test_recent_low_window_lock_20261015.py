@@ -19,7 +19,7 @@
 """
 import unittest
 
-from src.bottom_fishing_strategy import StrategyConfig
+from src.screening_engine import StrategyConfig
 
 
 class RecentLowWindowLockedTests(unittest.TestCase):

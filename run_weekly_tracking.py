@@ -117,7 +117,7 @@ def run(argv: list[str] | None = None):
     logger.info("周度追踪任务启动")
 
     # 延迟导入策略模块（确保路径已设置）
-    from src.bottom_fishing_strategy import (
+    from src.screening_engine import (
         StrategyConfig,
         CacheManager,
         get_daily_data,

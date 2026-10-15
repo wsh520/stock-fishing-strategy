@@ -20,7 +20,7 @@ import tempfile
 import unittest
 from unittest.mock import Mock
 
-from src.bottom_fishing_strategy import StrategyConfig, enrich_financial_risk
+from src.screening_engine import StrategyConfig, enrich_financial_risk
 from src.financial_risk import (_goodwill_diagnostics, combine_financial_rows,
                                 evaluate_financial_risk, parse_balance,
                                 validated_financial_risk_status)

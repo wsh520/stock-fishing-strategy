@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 import numpy as np
 import pandas as pd
-from src import bottom_fishing_strategy as m
+from src import screening_engine as m
 from src.market_data_integrity import BEIJING, latest_completed_day, quote_cache_valid, quote_metadata
 from src.recommendation_factors import historical_valuation, quality_value_technical, assess_low_structure, normalized_earnings_valuation
 from test_quality_recommendations import prices, fundamentals, DAY

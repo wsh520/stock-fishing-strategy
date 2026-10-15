@@ -16,7 +16,7 @@ import sys
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from src import bottom_fishing_strategy as m  # noqa: E402
+from src import screening_engine as m  # noqa: E402
 from diag_real_recs import RECS  # noqa: E402
 
 BASE = os.path.dirname(os.path.abspath(__file__))

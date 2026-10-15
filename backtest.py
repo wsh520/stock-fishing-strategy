@@ -1,6 +1,6 @@
 """历史回测：逐日重放选股策略并统计月度收益。
 
-与「实时选股」共用同一套策略纯函数（src/bottom_fishing_strategy.py 的 evaluate /
+与「实时选股」共用同一套策略纯函数（src/screening_engine.py 的 evaluate /
 compute_daily_signals / 周线确认 / 风控 / 排序 / 行业分散），保证回测口径与实盘一致。
 
 核心设计——避免未来函数（point-in-time）：
@@ -60,7 +60,7 @@ if not hasattr(pd.DataFrame, "append"):
         [self, other], ignore_index=ignore_index, **kw
     )
 
-from src.bottom_fishing_strategy import (  # noqa: E402
+from src.screening_engine import (  # noqa: E402
     StrategyConfig,
     _format_bs_code,
     _normalize_bs_hist,
@@ -1357,7 +1357,7 @@ def _render_report(bc: BacktestConfig, stats: dict, picks_df: pd.DataFrame, trad
     bench = stats.get("benchmark_csi300_pct")
     L = []
     L.append(f"# 选股策略回测报告（{stats['period']}）\n")
-    L.append("> 本报告由 `backtest.py` 生成，逐日重放实盘同款选股逻辑（`src/bottom_fishing_strategy.py`），"
+    L.append("> 本报告由 `backtest.py` 生成，逐日重放实盘同款选股逻辑（`src/screening_engine.py`），"
              "严格截断到每个交易日、无未来函数。\n")
     L.append("## 一、回测设置\n")
     L.append(f"- 选股区间：{bc.BT_START} ~ {bc.BT_END}（区间内每个交易日各跑一次选股）")

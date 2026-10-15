@@ -68,7 +68,7 @@ class RunnerTests(unittest.TestCase):
         frame = pd.DataFrame(dict(date=dates, close=range(10, 36), volume=100))
         rec = dict(id=1, code='600000', name='test', rec_date=dates[0], rec_close=10,
                    strategy='bottom_fishing', tracked_weeks=4)
-        provider = types.ModuleType('src.bottom_fishing_strategy')
+        provider = types.ModuleType('src.screening_engine')
         provider.StrategyConfig = lambda: types.SimpleNamespace(CACHE_EXPIRE_HOURS=1, MAX_WORKERS=1)
         provider.CacheManager = MagicMock()
         provider.get_daily_data = MagicMock(return_value=frame)
@@ -79,7 +79,7 @@ class RunnerTests(unittest.TestCase):
         provider._AK_AVAILABLE = False
         notifier = types.ModuleType('notify.feishu')
         notifier.notify_tracking_result = MagicMock()
-        with patch.dict(sys.modules, {'src.bottom_fishing_strategy': provider, 'notify.feishu': notifier}), \
+        with patch.dict(sys.modules, {'src.screening_engine': provider, 'notify.feishu': notifier}), \
              patch.object(store, 'is_configured', return_value=True), \
              patch.object(store, 'get_active_recommendations', return_value=[rec]), \
              patch.object(store, 'save_tracking', return_value=True) as save, \
@@ -100,7 +100,7 @@ class RunnerTests(unittest.TestCase):
         frame = pd.DataFrame(dict(date=dates, close=[5.0] * 26, volume=100))
         rec = dict(id=1, code='600000', name='test', rec_date=dates[0], rec_close=10.0,
                    strategy='bottom_fishing', tracked_weeks=4)
-        provider = types.ModuleType('src.bottom_fishing_strategy')
+        provider = types.ModuleType('src.screening_engine')
         provider.StrategyConfig = lambda: types.SimpleNamespace(CACHE_EXPIRE_HOURS=1, MAX_WORKERS=1)
         provider.CacheManager = MagicMock()
         provider.get_daily_data = MagicMock(return_value=frame)
@@ -111,7 +111,7 @@ class RunnerTests(unittest.TestCase):
         provider._AK_AVAILABLE = False
         notifier = types.ModuleType('notify.feishu')
         notifier.notify_tracking_result = MagicMock()
-        with patch.dict(sys.modules, {'src.bottom_fishing_strategy': provider, 'notify.feishu': notifier}), \
+        with patch.dict(sys.modules, {'src.screening_engine': provider, 'notify.feishu': notifier}), \
              patch.object(store, 'is_configured', return_value=True), \
              patch.object(store, 'get_active_recommendations', return_value=[rec]), \
              patch.object(store, 'save_tracking', return_value=True) as save, \

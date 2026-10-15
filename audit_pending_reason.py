@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from src.bottom_fishing_strategy import StrategyConfig, has_halt_gap, evaluate_quality_value
+from src.screening_engine import StrategyConfig, has_halt_gap, evaluate_quality_value
 from src.fundamental_quality import evaluate_annual_quality
 
 DAY = "2026-09-21"

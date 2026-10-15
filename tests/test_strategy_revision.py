@@ -3,7 +3,7 @@ import unittest
 from unittest.mock import patch
 import numpy as np
 import pandas as pd
-from src import bottom_fishing_strategy as m
+from src import screening_engine as m
 from src.recent_operating import evaluate_operating_trend
 from test_quality_recommendations import prices, fundamentals, DAY
 from test_quality_value_hardening import mk_df, BELOW_MA20_MACD_UP
