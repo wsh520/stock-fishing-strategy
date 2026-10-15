@@ -4,32 +4,51 @@ Balance fields use exact 新浪资产负债表 item_title: 资产总计/负债�
 Summary uses consolidated NETPROFIT (including minority interests) and NPCUT;
 debt_ratio=liabilities/assets*100; goodwill_ratio=goodwill/(assets-liabilities)*100;
 goodwill_to_assets=goodwill/assets*100. These are percentage points;
-deducted_profit_ratio is a fraction. Absence of 商誉 is unknown, never zero.
+deducted_profit_ratio is a fraction.
+
+商誉 semantics distinguish three cases, because the provider emits all three:
+  * the 商誉 item is absent from the report  -> unknown, never imputed
+  * the item is present and its value is JSON null -> the line item is zero
+    (goodwill_ratio=0, which passes MAX_GOODWILL_RATIO on merit, not by waiver)
+  * the item is present with an unparseable string ("", "None") -> unknown
+Verified on 2026-10-15: null and numeric-string values split 50/50 across 150
+sampled codes with zero raw numerics, and null codes parse 资产总计/负债合计 in
+the same period (52/52), so null is a reported zero rather than a fetch failure.
+A code with historical goodwill (公牛集团 20230930) reports null afterwards, which
+only a real zero can produce.
 """
 import re
 from .recent_operating import SOURCE_URL, _day, _number, _minimum_period, parse_summary
 
 
 def _goodwill_diagnostics(values, origin):
-    """Bounded raw-field audit; missing/ambiguous values are never imputed.
+    """Bounded raw-field audit; only a missing item stays unknown.
 
     Repeated exact 商誉 fields are ambiguous even when their values agree.
     Samples are strings (max 3 x 80 chars), so NaN and arbitrary raw values
     cannot leak into JSON as non-finite numbers or whole statement objects.
+
+    A single JSON null means the provider reported the line item as empty, so
+    the balance is zero and the goodwill ratio is 0. Only an absent item, an
+    unparseable value or an ambiguous repeat remains unknown.
     """
     count = len(values)
-    value = _number(values[0]) if count == 1 else None
-    state = ("absent" if not count else "duplicate" if count > 1
-             else "empty_or_non_numeric" if value is None
-             else "invalid_negative" if value < 0
-             else "explicit_zero" if value == 0 else "valid")
+    raw = values[0] if count == 1 else None
+    value = _number(raw) if count == 1 else None
+    if count == 1 and raw is None:
+        state, value = "explicit_null", 0.0
+    else:
+        state = ("absent" if not count else "duplicate" if count > 1
+                 else "empty_or_non_numeric" if value is None
+                 else "invalid_negative" if value < 0
+                 else "explicit_zero" if value == 0 else "valid")
     samples = []
-    for raw in values[:3]:
-        if raw is None or isinstance(raw, (str, int, float, bool)):
-            text = str(raw)
+    for item in values[:3]:
+        if item is None or isinstance(item, (str, int, float, bool)):
+            text = str(item)
             samples.append(text[:77] + "..." if len(text) > 80 else text)
         else:
-            samples.append("<" + type(raw).__name__[:60] + ">")
+            samples.append("<" + type(item).__name__[:60] + ">")
     return dict(state=state, field_count=count, parsed_value=value,
                 raw_samples=samples, origin=origin)
 
@@ -57,7 +76,12 @@ def parse_balance(payload):
             if field:
                 row[field] = None if field in seen else _number(item.get("item_value"))
                 seen.add(field)
-        row["goodwill_diagnostics"] = _goodwill_diagnostics(goodwill_values, "raw_balance")
+        diagnostics = _goodwill_diagnostics(goodwill_values, "raw_balance")
+        # A reported-null 商誉 is a zero balance, so the canonical row carries 0
+        # instead of None; absent/ambiguous items keep None and stay unknown.
+        if diagnostics["state"] == "explicit_null":
+            row["goodwill"] = 0.0
+        row["goodwill_diagnostics"] = diagnostics
         rows.append(row)
     return rows
 

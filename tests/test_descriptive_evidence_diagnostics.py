@@ -133,7 +133,9 @@ class DescriptiveOperatingTests(unittest.TestCase):
 
 class GoodwillDiagnosticsTests(unittest.TestCase):
     def test_raw_missing_zero_valid_and_duplicate_paths(self):
-        cases = [([], "absent", "missing"), ([None], "empty_or_non_numeric", "missing"),
+        # [None] is a reported-null 商誉, i.e. a zero balance (2026-10-15 fix);
+        # only absent/garbage values stay unknown.
+        cases = [([], "absent", "missing"), ([None], "explicit_null", "verified"),
                  ([""], "empty_or_non_numeric", "missing"), (["--"], "empty_or_non_numeric", "missing"),
                  ([True], "empty_or_non_numeric", "missing"), ([float("nan")], "empty_or_non_numeric", "missing"),
                  ([float("inf")], "empty_or_non_numeric", "missing"),
@@ -150,13 +152,15 @@ class GoodwillDiagnosticsTests(unittest.TestCase):
                 if status == "missing":
                     self.assertIsNone(result["metrics"]["goodwill"])
                     self.assertIsNone(result["metrics"]["goodwill_ratio"])
-                elif state == "explicit_zero":
+                elif state in ("explicit_zero", "explicit_null"):
                     self.assertEqual(result["metrics"]["goodwill_ratio"], 0)
                     self.assertEqual(result["missing_tags"], [])
                 json.dumps(result, allow_nan=False)
 
     def test_canonical_fallback_and_descriptions_do_not_affect_validation(self):
-        for values, expected in [([], "absent"), ([None], "empty_or_non_numeric"), ([0], "explicit_zero"), ([10], "valid")]:
+        # A canonical row carries the resolved balance, so a reported-null 商誉
+        # arrives here as 0 and is described as an explicit zero.
+        for values, expected in [([], "absent"), ([None], "explicit_zero"), ([0], "explicit_zero"), ([10], "valid")]:
             row = risk_rows(values)[0]
             row.pop("goodwill_diagnostics")
             result = evaluate_financial_risk([row], DAY)

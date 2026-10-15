@@ -3381,8 +3381,10 @@ def enrich_financial_risk(code: str, fund_data: Optional[dict], config: Strategy
     result = dict(fund_data or {})
     if not config.REQUIRE_FINANCIAL_RISK or _is_financial_stock(code, "", config):
         return result
-    # v3 preserves original goodwill field diagnostics; old caches cannot reconstruct raw missingness.
-    key = f"financial_risk_v3_{code}_{as_of}_{config.MAX_DEBT_RATIO}_{config.MAX_GOODWILL_RATIO}_{config.MIN_DEDUCTED_PROFIT_RATIO}"
+    # v4 (2026-10-15): a reported-null 商誉 is a zero balance, not missing evidence, so v3
+    # cached rows that marked those codes missing/empty_or_non_numeric are no longer
+    # trustworthy. The version tag invalidates them instead of silently reusing them.
+    key = f"financial_risk_v4_{code}_{as_of}_{config.MAX_DEBT_RATIO}_{config.MAX_GOODWILL_RATIO}_{config.MIN_DEDUCTED_PROFIT_RATIO}"
     evidence = cache.get(key) if cache is not None else None
     path = _cache_path(config, key + ".json") if config.USE_CACHE else None
     if evidence is None and path and _cache_fresh(path, 1):

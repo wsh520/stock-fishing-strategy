@@ -79,8 +79,23 @@ class FinancialSourceCompatibilityTests(unittest.TestCase):
         self.assertNotIn("net_profit", rows[0])
 
     def test_missing_goodwill_and_known_violations_still_block(self):
-        for values, expected, tag in (({"商誉": None}, "missing", "financial_risk_goodwill"),
-                                      ({"负债合计": 800}, "failed", "debt_ratio_outside_limit")):
+        # 商誉 present-but-null is a reported zero (2026-10-15 fix): the ratio is 0
+        # and passes MAX_GOODWILL_RATIO on merit. Only an absent item stays unknown.
+        b, s = self.reports(balance_values={"商誉": None})
+        result = fetch_financial_risk("603345", "2026-10-08",
+                                     request_get=Mock(side_effect=[response(b), response(s)]))
+        self.assertEqual(result["status"], "verified")
+        self.assertEqual(result["metrics"]["goodwill_ratio"], 0.0)
+        self.assertEqual(result["metrics"]["net_profit"], 100)
+        absent_b = copy.deepcopy(b)
+        items = absent_b["result"]["data"]["report_list"]["20260630"]["data"]
+        items[:] = [item for item in items if item["item_title"] != "商誉"]
+        result = fetch_financial_risk("603345", "2026-10-08",
+                                     request_get=Mock(side_effect=[response(absent_b), response(s)]))
+        self.assertEqual(result["status"], "missing")
+        self.assertIn("financial_risk_goodwill", result["missing_tags"])
+        # Known violations dominate missing evidence and still block.
+        for values, expected, tag in (({"负债合计": 800}, "failed", "debt_ratio_outside_limit"),):
             b, s = self.reports(balance_values=values)
             result = fetch_financial_risk("603345", "2026-10-08",
                                          request_get=Mock(side_effect=[response(b), response(s)]))
