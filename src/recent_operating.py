@@ -287,22 +287,38 @@ def evaluate_operating_trend(rows, as_of, profit_yoy_min=-10.0,
             or metrics["cash_conversion"] is None or metrics["cash_conversion"] < limits[5]):
         weak.append("operating_cashflow_declining")
     metrics.update(_supplemental_trends(usable, duplicates, latest))
-    # 最新单季度同比用于揭示累计同比可能掩盖的边际恶化；目前仅形成独立弱信号，
-    # 不作为硬否决，避免季节性/低基数和财报修订导致过度误杀。
+    # 最新单季度同比用于揭示累计同比可能掩盖的边际恶化。
+    #
+    # 口径修正（2026-10-16）：单季信号**只记录进 reasons，不再参与 status 判定**。
+    # 原实现把它追加进 weak，而 status = "weak" if weak else "verified"（任一命中即降级），
+    # 于是单季信号事实上成了硬否决 —— 与下方注释承诺的「不作为硬否决」自相矛盾。
+    # 实证代价（Actions run #108，2963 只 → 候选 11 → 正式 0）：11 只候选的
+    # operating_weak 覆盖率 100%，其中 operating_cashflow 字段命中率同样 100%。
+    # 典型误杀：国电南瑞累计经营现金流同比 +14.7%、青岛啤酒 +14.7%、兔宝宝 +98.3%、
+    # 吉比特 +18.2%（净利 +55.6%），均为累计改善，却因单季 −32.0% / −16.7% /
+    # −17.9% / −19.8% 被判weak；中国汽研更仅凭单季 −3.1%（刚过阈值）被判 weak。
+    #
+    # 为什么单季口径不适合做判定：单季由 YTD 差分而来（Qn = YTDn − YTD(n−1)），
+    # 而现金流本身强季节性（Q1 集中收款、Q4 集中结算），单季负增长在大盘下跌期
+    # 是全市场共性，不含个股信息；反之低基数/财报修订也会放大单季波动。
+    # 累计口径已有cash_conversion豁免（第 285-288 行），单季信号保留在 reasons 中
+    # 供 describe/summarize 与人工复核查看，但不再单独把候选打成 pending。
+    latest_quarter_flags: list[str] = []
     for field in ("revenue", "net_profit", "deducted_profit"):
         q_yoy = metrics.get(field + "_single_quarter_yoy")
         if q_yoy is not None and q_yoy < -limits[3] - 1e-10:
-            weak.append(field + "_latest_quarter_declining")
+            latest_quarter_flags.append(field + "_latest_quarter_declining")
     cash_q_yoy = metrics.get("operating_cashflow_single_quarter_yoy")
     if cash_q_yoy is not None and cash_q_yoy < -limits[4] - 1e-10:
-        weak.append("operating_cashflow_latest_quarter_declining")
+        latest_quarter_flags.append("operating_cashflow_latest_quarter_declining")
     # Simultaneous deterioration in sales, earnings and operating cash is stronger evidence.
     if (metrics["revenue_yoy"] is not None and metrics["revenue_yoy"] < -1e-10
             and metrics["net_profit_yoy"] is not None and metrics["net_profit_yoy"] < -1e-10
             and cash_change is not None and cash_change < 0):
         failed.append("sales_profit_cash_deteriorating")
     result.update(metrics=metrics, missing_tags=list(dict.fromkeys(missing)),
-                  reasons=list(dict.fromkeys(failed + weak)),
+                  reasons=list(dict.fromkeys(failed + weak + latest_quarter_flags)),
+                  latest_quarter_signals=list(latest_quarter_flags),
                   status="failed" if failed else "missing" if missing else "weak" if weak else "verified")
     result["signal_profile"] = describe_operating_signals(result)
     return result

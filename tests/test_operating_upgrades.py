@@ -54,6 +54,94 @@ class OperatingUpgradesTests(unittest.TestCase):
         self.assertEqual(result["status"], "failed")
         self.assertIn("net_profit_latest_quarter_declining", result["reasons"])
 
+    # ===== 单季信号不再参与 status 判定（2026-10-16口径修正）=====
+    #
+    # 背景（Actions run #108 实测）：2963 只 → 候选 11 → 正式 0。11 只候选的
+    # operating_weak 覆盖率 100%，operating_cashflow 字段命中率同样 100%。
+    # 典型误杀：国电南瑞累计经营现金流 +14.7%、青岛啤酒 +14.7%、兔宝宝 +98.3%、
+    # 吉比特 +18.2%（净利 +55.6%）—— 累计全部改善，却因单季为负被判 weak；
+    # 中国汽研更仅凭单季 −3.1%（刚过阈值）被判 weak。
+    #
+    # 根因：单季信号被 append 进 weak，而 status = "weak" if weak else "verified"
+    # （任一命中即降级），于是它事实上成了硬否决 —— 与原注释承诺的
+    # 「仅形成独立弱信号，不作为硬否决」自相矛盾。
+    #
+    # 修法：单季信号只记入 reasons / latest_quarter_signals，不再参与 status。
+    # 注意单季由 YTD 差分而来（Qn = YTDn − YTD(n−1)），现金流本身强季节性，
+    # 单季负增长在大盘下跌期是全市场共性、不含个股信息。
+
+    def _quarterly_rows(self, cashflow=None, net_profit=None):
+        """构造两期Q1+Q2 数据，使单季与累计方向相反。
+
+        默认：累计现金流 +15.0% 而单季 −13.8%（复现 run #108 国电南瑞的结构）。
+        """
+        base_cf = dict(revenue=1000., net_profit=100., deducted_profit=90., operating_cashflow=100.)
+        base_np = dict(revenue=1000., net_profit=110., deducted_profit=90., operating_cashflow=110.)
+        rows = [row("2025-03-31", **(base_cf if cashflow else base_np)),
+                row("2025-06-30", operating_cashflow=187., net_profit=260.),
+                row("2025-12-31", operating_cashflow=400., net_profit=520.),
+                row("2026-03-31", operating_cashflow=140., net_profit=130.),
+                row("2026-06-30", operating_cashflow=215., net_profit=266.)]
+        if cashflow:
+            rows[0].update(operating_cashflow=100.)
+        if net_profit:
+            rows[0].update(net_profit=110.)
+        return rows
+
+    def test_single_quarter_cashflow_does_not_veto_when_cumulative_improves(self):
+        result = evaluate_operating_trend(self._quarterly_rows(cashflow=True), "2026-09-01")
+        metrics = result["metrics"]
+        self.assertGreater(metrics["operating_cashflow_yoy"], 0.0)          # 累计为正
+        self.assertLess(metrics["operating_cashflow_single_quarter_yoy"], 0.0)  # 单季为负
+        # 核心断言：累计改善时，单季信号不得把 status 打成 weak。
+        self.assertEqual(result["status"], "verified")
+        # 但信号必须仍被记录，供describe / summarize / 人工复核使用。
+        self.assertIn("operating_cashflow_latest_quarter_declining",
+                      result["latest_quarter_signals"])
+        self.assertIn("operating_cashflow_latest_quarter_declining", result["reasons"])
+
+    def test_single_quarter_profit_does_not_veto_when_cumulative_improves(self):
+        result = evaluate_operating_trend(self._quarterly_rows(net_profit=True), "2026-09-01")
+        self.assertGreater(result["metrics"]["net_profit_yoy"], 0.0)
+        self.assertLess(result["metrics"]["net_profit_single_quarter_yoy"], 0.0)
+        self.assertEqual(result["status"], "verified")
+        self.assertIn("net_profit_latest_quarter_declining", result["latest_quarter_signals"])
+
+    def test_cumulative_cashflow_decline_still_vetoes(self):
+        """防削弱：累计口径真的转负时，闸门必须照常生效。"""
+        rows = [row("2025-03-31", operating_cashflow=100.),
+                row("2025-06-30", operating_cashflow=187., net_profit=260.),
+                row("2025-12-31", operating_cashflow=400., net_profit=520.),
+                row("2026-03-31", operating_cashflow=70., net_profit=130.),
+                row("2026-06-30", operating_cashflow=134., net_profit=266.)]
+        result = evaluate_operating_trend(rows, "2026-09-01")
+        self.assertLess(result["metrics"]["operating_cashflow_yoy"], -3.0)
+        self.assertEqual(result["status"], "weak")
+        self.assertIn("operating_cashflow_declining", result["reasons"])
+
+    def test_single_quarter_signal_alone_cannot_make_status_weak(self):
+        """单季信号必须完全无力：即使四个单季字段同时恶化，status 仍由累计口径决定。
+
+        这是本次修复的语义边界 —— 若将来有人把单季信号重新接回 status，
+        本条会立刻失败。
+        """
+        rows = [row("2025-03-31", operating_cashflow=100., net_profit=100.),
+                row("2025-06-30", revenue=1000., net_profit=260., deducted_profit=240.,
+                    operating_cashflow=187., gross_margin=30., net_margin=15.),
+                row("2025-12-31", revenue=2000., net_profit=520., deducted_profit=480.,
+                    operating_cashflow=400., gross_margin=30., net_margin=15.),
+                row("2026-03-31", revenue=1000., net_profit=130., deducted_profit=120.,
+                    operating_cashflow=140., gross_margin=30., net_margin=15.),
+                row("2026-06-30", revenue=2050., net_profit=266., deducted_profit=248.,
+                    operating_cashflow=215., gross_margin=30., net_margin=15.)]
+        result = evaluate_operating_trend(rows, "2026-09-01")
+        # 累计口径全部健康（现金流 +15.0%、净利 +2.3%），但单季现金流同比为负。
+        self.assertGreater(result["metrics"]["operating_cashflow_yoy"], 0.0)
+        self.assertLess(result["metrics"]["operating_cashflow_single_quarter_yoy"], 0.0)
+        self.assertEqual(result["status"], "verified")
+        self.assertIn("operating_cashflow_latest_quarter_declining",
+                      result["latest_quarter_signals"])
+
     def test_cumulative_quarter_and_ttm_exact_arithmetic(self):
         rows = [row("2024-06-30", net_profit=50), row("2024-12-31", net_profit=120),
                 row("2025-03-31", net_profit=40), row("2025-06-30", net_profit=70),
