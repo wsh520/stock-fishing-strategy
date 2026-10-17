@@ -354,7 +354,16 @@ def summarize_operating(evidence, status=None):
 
 
 def validated_operating_status(evidence, code, as_of):
-    """Validate evidence identity, decision date, disclosure and verified metrics."""
+    """Validate evidence identity, decision date, disclosure and verified metrics.
+
+    2026-10-17 补充口径（run #109 实证）：status=="verified" 的证据若 reasons 里
+    **只剩单季信号**，必须放行。f1f6184 已把单季信号移出 status 判定（只进
+    reasons / latest_quarter_signals），若本校验仍以「verified 须 reasons 为空」
+    把它打回 missing，修复就永远吃不到 —— run #109 的中国汽研正是如此：
+    evidence verified、reasons 仅剩 operating_cashflow_latest_quarter_declining，
+    却被降级 missing → operating_trend 标签 → 继续 pending。
+    旧证据（无 latest_quarter_signals 字段）按空集合处理，行为与本修正前一致。
+    """
     day = _day(as_of)
     if day is None or not isinstance(evidence, dict):
         return "missing"
@@ -373,7 +382,10 @@ def validated_operating_status(evidence, code, as_of):
         required = tuple(_FIELDS.values()) + (
             "revenue_yoy", "net_profit_yoy", "deducted_profit_yoy",
             "gross_margin_change_pp", "net_margin_change_pp", "operating_cashflow_change")
-        if (not isinstance(metrics, dict) or evidence.get("missing_tags") or evidence.get("reasons")
+        # 单季信号不参与判定（f1f6184），不得再经本校验把 verified 打回 missing。
+        ignorable = set(evidence.get("latest_quarter_signals") or [])
+        residual = set(evidence.get("reasons") or []) - ignorable
+        if (not isinstance(metrics, dict) or evidence.get("missing_tags") or residual
                 or any(_number(metrics.get(field)) is None for field in required)):
             return "missing"
     return status

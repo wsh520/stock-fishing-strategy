@@ -2,7 +2,8 @@
 import copy
 import unittest
 from unittest.mock import Mock
-from src.recent_operating import evaluate_operating_trend, fetch_operating_trend
+from src.recent_operating import (evaluate_operating_trend, fetch_operating_trend,
+                                  validated_operating_status)
 
 
 def row(period, **kwargs):
@@ -171,6 +172,48 @@ class OperatingUpgradesTests(unittest.TestCase):
                                       yoy_decline_tolerance=0, cashflow_decline_tolerance=0)
         self.assertEqual(result["status"], "missing")
         self.assertEqual(getter.call_args.kwargs["timeout"], 15)
+
+
+    # ===== validated_operating_status 不得吃掉单季修复（2026-10-17，run #109 实证）=====
+    #
+    # run #109（f1f6184 上线后首个定时任务）：8 只候选仍全部 pending。其中唯一的
+    # 单季-only 候选中国汽研，evidence 已是 status=verified、reasons 仅剩
+    # operating_cashflow_latest_quarter_declining，却被 validated_operating_status
+    # 以「verified 证据 reasons 必须为空」降级 missing → operating_trend 标签
+    # → 修复被验证层吃掉，实际效果为零。
+    #
+    # 修法：该校验扣除 latest_quarter_signals 后再判空。
+
+    def _single_quarter_only_evidence(self):
+        """复刻中国汽研结构：累计健康、reasons 仅剩已声明的单季信号 → verified。"""
+        result = evaluate_operating_trend(self._quarterly_rows(cashflow=True), "2026-09-01")
+        self.assertEqual(result["status"], "verified")
+        # reasons 必须全部是已声明的单季信号（无任何累计口径理由混入）。
+        self.assertTrue(set(result["reasons"]) <= set(result["latest_quarter_signals"]))
+        self.assertIn("operating_cashflow_latest_quarter_declining", result["reasons"])
+        return dict(result, code="600004")
+
+    def test_validator_passes_verified_with_only_single_quarter_reasons(self):
+        evidence = self._single_quarter_only_evidence()
+        self.assertEqual(validated_operating_status(evidence, "600004", "2026-09-01"), "verified")
+
+    def test_validator_still_rejects_verified_with_cumulative_reason(self):
+        """防削弱：verified 证据若还有累计口径理由，必须依旧打回 missing。"""
+        evidence = self._single_quarter_only_evidence()
+        poisoned = dict(evidence, reasons=evidence["reasons"] + ["operating_cashflow_declining"])
+        self.assertEqual(validated_operating_status(poisoned, "600004", "2026-09-01"), "missing")
+
+    def test_validator_legacy_evidence_without_new_field_behaves_as_before(self):
+        """旧证据（无 latest_quarter_signals 字段）按空集合处理，行为与修正前一致。"""
+        evidence = self._single_quarter_only_evidence()
+        legacy = {k: v for k, v in evidence.items() if k != "latest_quarter_signals"}
+        self.assertEqual(validated_operating_status(legacy, "600004", "2026-09-01"), "missing")
+
+    def test_validator_ignores_only_declared_single_quarter_signals(self):
+        """latest_quarter_signals 未声明的单季理由（防御性编码错误）不得被静默豁免。"""
+        evidence = self._single_quarter_only_evidence()
+        misdeclared = dict(evidence, latest_quarter_signals=["net_profit_latest_quarter_declining"])
+        self.assertEqual(validated_operating_status(misdeclared, "600004", "2026-09-01"), "missing")
 
 
 if __name__ == "__main__":

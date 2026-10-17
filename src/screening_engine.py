@@ -33,6 +33,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import random
 import re
 import socket
 import sys
@@ -796,6 +797,12 @@ class StrategyConfig:
     FETCH_DELAY: float = 0.05
     # 并发筛选时间预算（分钟）：超时取消未完成任务，按已完成结果出报告
     SCREEN_TIME_BUDGET_MIN: float = 240.0
+    # 行业估值快照时间预算（分钟）：超时放弃本次快照（返回空 → 全市场回退 PE 绝对阈值），
+    # 把时间留给后续并发筛选。run #109 实测：快照 225.6 分钟占 job 360 分钟硬上限的
+    # 63%，而筛选本身仅 1.8 分钟；快照初期预估「剩余 244.9 分钟」，Baostock 再慢约
+    # 60% 就会整 job 超时、两套策略全部丢失。已拉取的日线仍在 cache/ 内，筛选阶段
+    # 直接复用，次日缓存放映后快照本身也更快。<=0 表示不设预算（不推荐）。
+    SNAPSHOT_TIME_BUDGET_MIN: float = 60.0
     # 筛选进度日志间隔（每处理 N 只打印一次进度与 ETA）
     PROGRESS_LOG_EVERY: int = 500
 
@@ -810,6 +817,13 @@ class StrategyConfig:
     FUND_START_YEAR: str = "2023"
     MAX_RETRY: int = 2
     LIST_MAX_RETRY: int = 4
+    # 取数重试退避（指数 + 抖动）：第 n 次重试前休眠 base*2^(n-1) 秒（夹在 max 内），
+    # 再乘 [1-jitter, 1+jitter] 均匀随机因子。run #109 实测 Baostock 每约 10-15 分钟
+    # 一轮 timed out / 脏数据（utf-8 解码失败），4 个线程的重试节拍同步且无抖动，
+    # 失败后还会在 bs_lock 上串行重登 4 次（每次约 4 秒），放大服务端压力。
+    FETCH_RETRY_BACKOFF_BASE_SEC: float = 0.5
+    FETCH_RETRY_BACKOFF_MAX_SEC: float = 8.0
+    FETCH_RETRY_JITTER: float = 0.3
 
     FILTER_ST: bool = True
     EXCLUDE_DELISTING: bool = True
@@ -873,6 +887,17 @@ class StrategyConfig:
             raise ValueError("historical valuation sample minimum cannot exceed lookback")
         if not self.QV_RECENT_LOW_MIN_AGE <= self.QV_RECENT_LOW_MAX_AGE < self.QV_RECENT_LOW_WINDOW:
             raise ValueError("recent low ages must satisfy minimum <= maximum < window")
+        for name in ("SCREEN_TIME_BUDGET_MIN", "SNAPSHOT_TIME_BUDGET_MIN"):
+            value = float(getattr(self, name))
+            if not np.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be finite and nonnegative (0 disables the budget)")
+        for name in ("FETCH_RETRY_BACKOFF_BASE_SEC", "FETCH_RETRY_BACKOFF_MAX_SEC"):
+            value = float(getattr(self, name))
+            if not np.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be finite and positive")
+        jitter = float(getattr(self, "FETCH_RETRY_JITTER"))
+        if not np.isfinite(jitter) or not 0 <= jitter <= 1:
+            raise ValueError("FETCH_RETRY_JITTER must be finite and between 0 and 1")
         for name in ("HISTORICAL_VALUATION_PERCENTILE_MAX", "HISTORICAL_VALUATION_WEIGHT"):
             value = float(getattr(self, name))
             if not np.isfinite(value) or not 0 <= value <= 1:
@@ -962,6 +987,10 @@ _bs_state = {
     "circuit_open": False,
 }
 _BS_CIRCUIT_THRESHOLD = 8  # 连续失败达到该次数后熔断（单次取数最多计 MAX_RETRY+1 次）
+# 登录单飞锁：一次查询失败会把连接置断，N 个工作线程会同时进入 _bs_login；
+# bs_lock 虽把 bs.login() 串行化，但每次登录约 4 秒，run #109 每轮异常都要白付
+# 4×4 秒。让一个线程登，其余线程在门外等结果，登完直接复用。
+_bs_login_gate = threading.Lock()
 
 def _bs_login(max_retry: int = 5) -> bool:
     """Baostock 登录。bs.login 失败时也返回对象，必须检查 error_code 才算真正重试。"""
@@ -969,21 +998,24 @@ def _bs_login(max_retry: int = 5) -> bool:
         return False
     if _bs_state["logged_in"]:
         return True  # 幂等：已登录直接返回，避免 run.py 预取市场环境后 main() 重复登录
-    for attempt in range(max_retry):
-        try:
-            with bs_lock:
-                lg = bs.login()
-            if getattr(lg, "error_code", None) == "0":
-                _bs_state["logged_in"] = True
-                _bs_state["consecutive_failures"] = 0
-                _bs_state["circuit_open"] = False
-                return True
-            logging.warning("Baostock 登录失败(%d/%d): %s", attempt + 1, max_retry, getattr(lg, "error_msg", "未知错误"))
-        except Exception as e:
-            logging.warning("Baostock 登录异常(%d/%d): %s", attempt + 1, max_retry, e)
-        _bs_state["logged_in"] = False
-        if attempt < max_retry - 1:
-            time.sleep(1.0 * (attempt + 1))
+    with _bs_login_gate:
+        if _bs_state["logged_in"]:
+            return True  # 等其他线程登好了，直接复用
+        for attempt in range(max_retry):
+            try:
+                with bs_lock:
+                    lg = bs.login()
+                if getattr(lg, "error_code", None) == "0":
+                    _bs_state["logged_in"] = True
+                    _bs_state["consecutive_failures"] = 0
+                    _bs_state["circuit_open"] = False
+                    return True
+                logging.warning("Baostock 登录失败(%d/%d): %s", attempt + 1, max_retry, getattr(lg, "error_msg", "未知错误"))
+            except Exception as e:
+                logging.warning("Baostock 登录异常(%d/%d): %s", attempt + 1, max_retry, e)
+            _bs_state["logged_in"] = False
+            if attempt < max_retry - 1:
+                time.sleep(1.0 * (attempt + 1))
     return False
 
 def _config_kwargs(target_cls: type, config, **overrides) -> dict:
@@ -1081,7 +1113,24 @@ def _bs_adjust_flag(adjust: str) -> str:
 _DATE_FMT = "%Y-%m-%d"
 _NUMERIC_COLS = ("open", "close", "high", "low", "volume", "amount", "pct_chg", "turnover", "peTTM", "pbMRQ")
 
-def _fetch_with_retry(fetcher: Callable[[], Any], max_retry: int, label: str, retry_on_empty: bool = False) -> Any:
+def _retry_backoff_seconds(attempt: int, config: Optional[StrategyConfig] = None) -> float:
+    """第 attempt 次重试前的休眠秒数：指数退避（base*2^attempt，夹在 max 内）+ 均匀抖动。
+
+    参数同源 StrategyConfig.FETCH_RETRY_*（config 缺省时读类默认，不复制字面量）。
+    为什么必须指数+抖动：run #109 实测 Baostock 每约 10-15 分钟一轮 timed out /
+    脏数据，4 个线程的重试节拍同步且退避是线性 0.5/1.0/1.5s，失败后还在 bs_lock 上
+    串行重登 4 次——同步重试叠加服务端已过载，把「一次抖动」放大成「一轮抖动」。
+    """
+    source = config if config is not None else StrategyConfig
+    base = float(getattr(source, "FETCH_RETRY_BACKOFF_BASE_SEC"))
+    cap = float(getattr(source, "FETCH_RETRY_BACKOFF_MAX_SEC"))
+    jitter = float(getattr(source, "FETCH_RETRY_JITTER"))
+    delay = min(cap, base * (2 ** attempt))
+    return delay * random.uniform(1.0 - jitter, 1.0 + jitter)
+
+def _fetch_with_retry(fetcher: Callable[[], Any], max_retry: int, label: str,
+                      retry_on_empty: bool = False,
+                      config: Optional[StrategyConfig] = None) -> Any:
     last_err = None
     for attempt in range(max_retry + 1):
         try:
@@ -1100,7 +1149,7 @@ def _fetch_with_retry(fetcher: Callable[[], Any], max_retry: int, label: str, re
         except Exception as e:
             last_err = e
         if attempt < max_retry:
-            time.sleep(0.5 * (attempt + 1))
+            time.sleep(_retry_backoff_seconds(attempt, config))
     logging.debug("%s 获取失败（已重试 %d 次）: %s", label, max_retry, last_err)
     return None
 
@@ -1268,7 +1317,7 @@ def _fetch_hist_bs(code: str, period: str, start: str, end: str, config: Strateg
         _bs_mark_failure()
         raise RuntimeError(f"bs_hist({bs_code}) 查询失败: {rs.error_msg}")
 
-    raw_df = _fetch_with_retry(fetch_data, config.MAX_RETRY, f"bs_hist({bs_code},{period})")
+    raw_df = _fetch_with_retry(fetch_data, config.MAX_RETRY, f"bs_hist({bs_code},{period})", config=config)
     df = _normalize_bs_hist(raw_df)
     if df is not None and path: _write_cache_csv(df, path)
     return df
@@ -1312,7 +1361,7 @@ def _fetch_index_daily_bs(symbol: str, config: StrategyConfig) -> Optional[pd.Da
         _bs_mark_failure()
         raise RuntimeError(f"bs_index({bs_code}) 查询失败: {rs.error_msg}")
 
-    raw_df = _fetch_with_retry(fetch_index, config.MAX_RETRY, f"bs_index({bs_code})")
+    raw_df = _fetch_with_retry(fetch_index, config.MAX_RETRY, f"bs_index({bs_code})", config=config)
     df = _normalize_bs_hist(raw_df)
     if df is not None and path: _write_cache_csv(df, path)
     return df
@@ -1432,7 +1481,7 @@ def _fetch_fundamentals_bs(code: str, config: Optional[StrategyConfig] = None) -
             _bs_mark_failure()
             raise RuntimeError(f"bs_fund({bs_code}) 查询失败: {getattr(p_rs, 'error_msg', '')} / {getattr(b_rs, 'error_msg', '')}")
 
-        rs = _fetch_with_retry(fetch_fund, config.MAX_RETRY, f"bs_fund({bs_code},{year}Q{quarter})")
+        rs = _fetch_with_retry(fetch_fund, config.MAX_RETRY, f"bs_fund({bs_code},{year}Q{quarter})", config=config)
         if not rs:
             if _bs_state["circuit_open"]:
                 break  # 已熔断，继续回溯只是无效重试，直接放弃让上层降级 AkShare
@@ -1499,7 +1548,7 @@ def _fetch_growth_bs(code: str, config: Optional[StrategyConfig] = None) -> Opti
             _bs_mark_failure()
             raise RuntimeError(f"bs_growth({bs_code}) 查询失败: {getattr(rs, 'error_msg', '')}")
 
-        rs = _fetch_with_retry(fetch_growth, config.MAX_RETRY, f"bs_growth({bs_code},{year}Q{quarter})")
+        rs = _fetch_with_retry(fetch_growth, config.MAX_RETRY, f"bs_growth({bs_code},{year}Q{quarter})", config=config)
         if not rs:
             if _bs_state["circuit_open"]:
                 break
@@ -1549,7 +1598,7 @@ def _fetch_stock_pool_bs(config: Optional[StrategyConfig] = None) -> list[dict]:
                     return rs.get_data()
             return None  # 连续 10 天均为空（极端异常）
         
-        raw = _fetch_with_retry(fetch_list, config.LIST_MAX_RETRY, "bs_all_stock")
+        raw = _fetch_with_retry(fetch_list, config.LIST_MAX_RETRY, "bs_all_stock", config=config)
         if raw is None or raw.empty: return []
 
         # 仅保留 A 股股票（沪 60/68、深 00/30、北 4/8），剔除指数/基金/债券。
@@ -1608,7 +1657,7 @@ def _fetch_industry_bs(config: Optional[StrategyConfig] = None) -> dict[str, str
         _bs_mark_failure()
         raise RuntimeError(f"bs_industry 查询失败: {getattr(rs, 'error_msg', '')}")
 
-    rs = _fetch_with_retry(fetch_industry, config.MAX_RETRY, "bs_industry", retry_on_empty=True)
+    rs = _fetch_with_retry(fetch_industry, config.MAX_RETRY, "bs_industry", retry_on_empty=True, config=config)
     if rs is not None:
         try:
             for _, row in rs.get_data().iterrows():
@@ -1662,7 +1711,7 @@ def _fetch_daily_ak_sina(code: str, days: int, config: StrategyConfig) -> Option
     symbol = _ak_sina_symbol(code)
     raw = _fetch_with_retry(
         lambda: ak.stock_zh_a_daily(symbol=symbol, adjust=config.ADJUST),
-        config.MAX_RETRY, f"ak_sina({symbol})"
+        config.MAX_RETRY, f"ak_sina({symbol})", config=config
     )
     if raw is None or raw.empty or "date" not in raw.columns or "close" not in raw.columns: return None
     keep = [c for c in ("date", "open", "high", "low", "close", "volume", "amount", "turnover") if c in raw.columns]
@@ -1692,7 +1741,7 @@ def _fetch_daily_ak(code: str, days: int = 120, config: Optional[StrategyConfig]
         lambda: ak.stock_zh_a_hist(symbol=symbol, period="daily",
                                    start_date=start.replace("-", ""), end_date=end.replace("-", ""),
                                    adjust=config.ADJUST),
-        config.MAX_RETRY, f"ak_hist({symbol})"
+        config.MAX_RETRY, f"ak_hist({symbol})", config=config
     )
     df = _normalize_ak_hist(raw)
     # 通道 2：新浪（东财不可达时兜底）
@@ -1711,7 +1760,7 @@ def _fetch_index_daily_ak(symbol: str, config: StrategyConfig) -> Optional[pd.Da
             if (cached := _read_cache_csv(path)) is not None: return cached
     raw = _fetch_with_retry(
         lambda: ak.stock_zh_index_daily(symbol=ak_symbol),
-        config.MAX_RETRY, f"ak_index({ak_symbol})", retry_on_empty=True
+        config.MAX_RETRY, f"ak_index({ak_symbol})", retry_on_empty=True, config=config
     )
     if raw is None or "date" not in raw.columns or "close" not in raw.columns: return None
     df = raw.copy()
@@ -1746,7 +1795,7 @@ def _fetch_fundamentals_ak(code: str, config: Optional[StrategyConfig] = None) -
         "report_period": None,
     }
 
-    df_fin = _fetch_with_retry(lambda: ak.stock_financial_analysis_indicator(symbol=symbol, start_year=config.FUND_START_YEAR), config.MAX_RETRY, f"ak_fund({symbol})")
+    df_fin = _fetch_with_retry(lambda: ak.stock_financial_analysis_indicator(symbol=symbol, start_year=config.FUND_START_YEAR), config.MAX_RETRY, f"ak_fund({symbol})", config=config)
     if df_fin is not None and not df_fin.empty:
         # 显式按日期列取最大报告期，不假定接口返回顺序
         date_col = next((c for c in df_fin.columns if "日期" in str(c) or "报告期" in str(c)), None)
@@ -1770,7 +1819,7 @@ def _fetch_fundamentals_ak(code: str, config: Optional[StrategyConfig] = None) -
             if pd.notna(report_dt) and (result["roe"] is not None or result["debt_ratio"] is not None):
                 result["report_period"] = f"{int(report_dt.year)}Q{report_quarter}"
 
-    df_bs = _fetch_with_retry(lambda: ak.stock_balance_sheet_by_report_em(symbol=symbol), config.MAX_RETRY, f"ak_bs({symbol})")
+    df_bs = _fetch_with_retry(lambda: ak.stock_balance_sheet_by_report_em(symbol=symbol), config.MAX_RETRY, f"ak_bs({symbol})", config=config)
     if df_bs is not None and not df_bs.empty:
         row = df_bs.iloc[0]
         goodwill, net_assets = 0.0, 0.0
@@ -1783,7 +1832,7 @@ def _fetch_fundamentals_ak(code: str, config: Optional[StrategyConfig] = None) -
                 if not pd.isna(val) and val > 0: net_assets = float(val)
         if net_assets > 0: result["goodwill_ratio"] = goodwill / net_assets * 100
 
-    df_income = _fetch_with_retry(lambda: ak.stock_profit_sheet_by_report_em(symbol=symbol), config.MAX_RETRY, f"ak_income({symbol})")
+    df_income = _fetch_with_retry(lambda: ak.stock_profit_sheet_by_report_em(symbol=symbol), config.MAX_RETRY, f"ak_income({symbol})", config=config)
     if df_income is not None and not df_income.empty:
         row = df_income.iloc[0]
         net_profit, deducted_profit = 0.0, 0.0
@@ -1814,7 +1863,7 @@ def _fetch_stock_pool_ak(config: Optional[StrategyConfig] = None) -> list[dict]:
             df = _read_cache_csv(path, dtype={"code": str, "name": str})
             if df is not None and ("code" not in df.columns or "name" not in df.columns): df = None
     if df is None:
-        raw = _fetch_with_retry(lambda: ak.stock_info_a_code_name(), config.LIST_MAX_RETRY, "ak_stock_info", retry_on_empty=True)
+        raw = _fetch_with_retry(lambda: ak.stock_info_a_code_name(), config.LIST_MAX_RETRY, "ak_stock_info", retry_on_empty=True, config=config)
         if raw is None or "code" not in raw.columns or "name" not in raw.columns: return []
         df = raw[["code", "name"]].copy()
         df["code"] = df["code"].astype(str).str.zfill(6)
@@ -1854,7 +1903,7 @@ def _fetch_weekly_dual(code: str, config: StrategyConfig) -> Optional[pd.DataFra
         end = _beijing_now().strftime("%Y%m%d")
         raw = _fetch_with_retry(
             lambda: ak.stock_zh_a_hist(symbol=symbol, period="weekly", start_date=start, end_date=end, adjust=config.ADJUST),
-            config.MAX_RETRY, f"ak_weekly({symbol})"
+            config.MAX_RETRY, f"ak_weekly({symbol})", config=config
         )
         df = _normalize_ak_hist(raw)
     return _recompute_pct_chg(df)   # 同 _fetch_daily_dual：覆盖旧世代磁盘缓存
@@ -3551,10 +3600,17 @@ def build_industry_valuation_snapshot(config: StrategyConfig, cache: CacheManage
     progress_every = int(getattr(config, "SNAPSHOT_PROGRESS_LOG_EVERY", 200))
     counter = {"done": 0, "hit": 0}
     snapshot_start = time.time()
-    logger.info("行业估值快照构建开始：%d 只股票，%d 线程，快照日 %s（每 %d 只打印一次进度）",
-                total_stocks, config.MAX_WORKERS, snapshot_day, progress_every)
+    # 时间预算（SNAPSHOT_TIME_BUDGET_MIN）：超预算即停拉剩余股票并放弃本次快照
+    # （返回空 → 上层全市场回退 PE 绝对阈值）。run #109 快照 225.6 分钟、占 job
+    # 360 分钟硬上限 63%，筛选本身只要 1.8 分钟——不设预算时快照能把整个 job 拖死。
+    budget_sec = float(getattr(config, "SNAPSHOT_TIME_BUDGET_MIN", 60.0) or 0) * 60
+    stop = threading.Event()
+    logger.info("行业估值快照构建开始：%d 只股票，%d 线程，快照日 %s（每 %d 只打印一次进度，预算 %.0f 分钟）",
+                total_stocks, config.MAX_WORKERS, snapshot_day, progress_every, budget_sec / 60)
 
     def collect(stock: dict) -> None:
+        if stop.is_set():
+            return  # 已超预算：未开始的任务直接跳过，不计入已完成数
         hit = False
         try:
             code = str(stock.get("code", ""))
@@ -3593,6 +3649,10 @@ def build_industry_valuation_snapshot(config: StrategyConfig, cache: CacheManage
                 logger.info("行业估值快照进度: %d/%d (%.0f%%)，命中 %d，已用 %.1f 分钟，预计剩余 %.1f 分钟",
                             done, total_stocks, done / total_stocks * 100,
                             hits, elapsed / 60, eta_min)
+            if budget_sec > 0 and not stop.is_set() and time.time() - snapshot_start > budget_sec:
+                stop.set()
+                logger.warning("行业估值快照超过时间预算 %.1f 分钟（已完成 %d/%d），停止拉取剩余股票",
+                               budget_sec / 60, done, total_stocks)
 
     try:
         with ThreadPoolExecutor(max_workers=config.MAX_WORKERS) as pool:
@@ -3600,6 +3660,15 @@ def build_industry_valuation_snapshot(config: StrategyConfig, cache: CacheManage
     except Exception as e:  # noqa: BLE001  快照失败不得阻断选股，降级为绝对阈值
         logger.warning("行业估值快照构建失败（已完成 %d/%d，耗时 %.1f 分钟），本次回退绝对估值阈值: %s",
                        counter["done"], total_stocks, (time.time() - snapshot_start) / 60, e)
+        return {}
+    if stop.is_set():
+        # 放弃部分覆盖的快照而不是将就使用：行业分位建立在「全行业横截面」之上，
+        # 截断样本会让分位静默偏移（宁缺毋滥）。已拉取的日线仍在 cache/ 内，
+        # 筛选阶段直接复用，次日缓存放映后快照本身也更快。
+        logger.warning("行业估值快照因超过时间预算 %.1f 分钟而放弃（已完成 %d/%d，命中 %d，耗时 %.1f 分钟），"
+                       "本次回退绝对估值阈值；已拉取日线留在缓存，筛选阶段复用",
+                       budget_sec / 60, counter["done"], total_stocks, counter["hit"],
+                       (time.time() - snapshot_start) / 60)
         return {}
     snapshot: dict[str, dict] = {}
     for ind in set(pe_by_ind) | set(pb_by_ind):
