@@ -131,6 +131,11 @@ def main(argv: list[str] | None = None):
         logger.info("已启用 --no-notify：本次不推送飞书")
 
     config = LongTermQualityConfig()
+    # 长期工作流 job 上限 180 分钟；daily 的 300 分钟快照预算在这里会直接撞 job 超时。
+    # 120 分钟给快照、剩下约 60 分钟留给筛选/取数/落库/通知；命中快照缓存时几乎不耗时。
+    config.SNAPSHOT_TIME_BUDGET_MIN = min(float(config.SNAPSHOT_TIME_BUDGET_MIN), 120.0)
+    logger.info("行业估值快照预算：%.0f 分钟（长期工作流 job 上限 180 分钟）",
+                config.SNAPSHOT_TIME_BUDGET_MIN)
     if args.no_cache:
         config.USE_CACHE = False
         logger.info("已启用 --no-cache：跳过 cache/ 磁盘缓存读写")

@@ -29,8 +29,9 @@ cache/
 backtest_cache/
 backtest_output/
 
-# data/ 为 CI artifact 预留目录（当前策略不写入文件，见 README「运行方式」）
+# data/ 为 CI artifact 预留目录；影子账本运行时写入 data/shadow/，不入库
 !data/
+data/shadow/
 
 .cleanup_backup
 .workbuddy

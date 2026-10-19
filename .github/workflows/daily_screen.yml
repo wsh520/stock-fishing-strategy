@@ -91,14 +91,15 @@ jobs:
           # 资格校验仍由数据层独立执行，清理步骤不能替代交易日校验。
           # 删除不影响本 workflow 的策略间共享：同一 runner 上先跑的优质低估低位会全量拉取
           # 并重新写入当天行情，随后突破步骤直接读同一份文件（共享正是发生在这里）。
-          # 保留 stock_list(6天) / fund_v2(7天) / industry(30天) / market_regime_state.json：
+          # 保留 stock_list(6天) / fund_v2(7天) / industry(30天) / market_regime_state.json
+          # 以及 industry_valuation_snapshot_v1.json（行业估值快照，7 天复用；见 docs/snapshot_persistence.md）：
           # 它们是真正时间不敏感的数据，用 TTL 判定、与 mtime 无关，跨天复用是正确且必要的
-          # （基本面每天约 6000 次查询，正是靠 7 天 TTL 才不必重跑）。
+          # （基本面每天约 6000 次查询，正是靠 7 天 TTL 才不必重跑；行业快照冷启动要 150~225 分钟）。
           if [ -d cache ]; then
             before=$(find cache -maxdepth 1 -type f | wc -l)
             find cache -maxdepth 1 -type f \( -name 'daily_*' -o -name 'weekly_*' -o -name 'index_daily_*' \) -delete
             after=$(find cache -maxdepth 1 -type f | wc -l)
-            echo "cache/ 原有 $before 个文件；清除恢复的行情缓存 $((before-after)) 个，剩余 $after 个（股票列表/基本面/行业/regime 状态保留）"
+            echo "cache/ 原有 $before 个文件；清除恢复的行情缓存 $((before-after)) 个，剩余 $after 个（股票列表/基本面/行业/regime/行业快照保留）"
           else
             echo "cache/ 目录不存在：首次运行或缓存已过期淘汰"
           fi

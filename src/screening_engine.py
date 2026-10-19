@@ -30,6 +30,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -41,7 +42,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, asdict
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable, Optional
 
 from src.qv_diagnostics import GateAudit, mark_gate, log_gate_audit
@@ -802,7 +803,12 @@ class StrategyConfig:
     # 63%，而筛选本身仅 1.8 分钟；快照初期预估「剩余 244.9 分钟」，Baostock 再慢约
     # 60% 就会整 job 超时、两套策略全部丢失。已拉取的日线仍在 cache/ 内，筛选阶段
     # 直接复用，次日缓存放映后快照本身也更快。<=0 表示不设预算（不推荐）。
-    SNAPSHOT_TIME_BUDGET_MIN: float = 60.0
+    #
+    # 2026-10-19：预算从 60 提到 300。60 分钟在 #108/#109 的冷启动耗时（150/225 分钟）
+    # 面前必然中途放弃，等于把生产估值口径静默换成绝对 PE；300 分钟能覆盖已验证的
+    # 最坏情况（225.6 分钟），同时 300 + 筛选 2 分钟仍低于 job 360 分钟上限。真正的
+    # 加速靠下面的快照持久化（SNAPSHOT_CACHE_MAX_AGE_DAYS），预算只是最后一道保险。
+    SNAPSHOT_TIME_BUDGET_MIN: float = 300.0
     # 筛选进度日志间隔（每处理 N 只打印一次进度与 ETA）
     PROGRESS_LOG_EVERY: int = 500
 
@@ -835,6 +841,15 @@ class StrategyConfig:
     # 开启后上面 EXCLUDE_CHINEXT / EXCLUDE_STAR / EXCLUDE_BSE 三个开关冗余，
     # 关闭本项则退回由各开关组合控制
     MAIN_BOARD_ONLY: bool = True
+
+    # 行业估值快照持久化复用天数（日历天，<=0 关闭复用）。
+    # 行业 PE/PB 分位是横截面排名，不是逐日时序信号；在 7 天内复用不会改变“相对便宜/
+    # 贵”的排序，却能把 150~225 分钟的冷启动摊薄到一次。超过该天数则重建；重建失败
+    # 仍回退绝对阈值并打 warning，不会拿过期快照冒充当日口径。
+    # 放在 dataclass 末尾，避免新增字段改变既有位置参数顺序。
+    SNAPSHOT_CACHE_MAX_AGE_DAYS: float = 7.0
+    # 行业估值快照进度日志间隔（每处理 N 只打印一次）
+    SNAPSHOT_PROGRESS_LOG_EVERY: int = 200
 
     def __setattr__(self, name, value):
         """把旧配置名 QV_BEAR_TIMING_GATE 写穿到 QV_STABILIZATION_GATE（向后兼容）。
@@ -879,7 +894,8 @@ class StrategyConfig:
             raise ValueError("QV_LOW_ANCHOR_MODE must be recent_structure or legacy")
         for name in ("HISTORICAL_VALUATION_LOOKBACK", "HISTORICAL_VALUATION_MIN_SAMPLES",
                      "QV_TECHNICAL_EVENT_WINDOW", "QV_RECENT_LOW_WINDOW",
-                     "QV_RECENT_LOW_MIN_AGE", "QV_RECENT_LOW_MAX_AGE"):
+                     "QV_RECENT_LOW_MIN_AGE", "QV_RECENT_LOW_MAX_AGE",
+                     "PROGRESS_LOG_EVERY", "SNAPSHOT_PROGRESS_LOG_EVERY"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError(f"{name} must be a positive integer")
@@ -887,10 +903,11 @@ class StrategyConfig:
             raise ValueError("historical valuation sample minimum cannot exceed lookback")
         if not self.QV_RECENT_LOW_MIN_AGE <= self.QV_RECENT_LOW_MAX_AGE < self.QV_RECENT_LOW_WINDOW:
             raise ValueError("recent low ages must satisfy minimum <= maximum < window")
-        for name in ("SCREEN_TIME_BUDGET_MIN", "SNAPSHOT_TIME_BUDGET_MIN"):
+        for name in ("SCREEN_TIME_BUDGET_MIN", "SNAPSHOT_TIME_BUDGET_MIN",
+                     "SNAPSHOT_CACHE_MAX_AGE_DAYS"):
             value = float(getattr(self, name))
             if not np.isfinite(value) or value < 0:
-                raise ValueError(f"{name} must be finite and nonnegative (0 disables the budget)")
+                raise ValueError(f"{name} must be finite and nonnegative")
         for name in ("FETCH_RETRY_BACKOFF_BASE_SEC", "FETCH_RETRY_BACKOFF_MAX_SEC"):
             value = float(getattr(self, name))
             if not np.isfinite(value) or value <= 0:
@@ -1246,14 +1263,20 @@ def _read_cache_json(path: str) -> Optional[dict]:
     except Exception:
         return None
 
-def _write_cache_json(obj: dict, path: str) -> None:
+def _write_cache_json(obj: dict, path: str) -> bool:
     tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
     try:
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(obj, f, ensure_ascii=False)
         os.replace(tmp, path)
+        return True
     except Exception:
-        pass
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+        return False
 
 def _recompute_pct_chg(df: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
     """统一 pct_chg 口径：一律由 qfq 收盘价自算，不信任数据源提供的涨跌幅字段。
@@ -3566,6 +3589,130 @@ def compute_relative_strength(daily_df: Optional[pd.DataFrame],
         return None
 
 
+_SNAPSHOT_CACHE_VERSION = 1
+_SNAPSHOT_CACHE_FILE = "industry_valuation_snapshot_v1.json"
+
+
+def _snapshot_cache_path(config: StrategyConfig) -> str:
+    return _cache_path(config, _SNAPSHOT_CACHE_FILE)
+
+
+def _industry_map_digest(industry_map: dict) -> str:
+    """行业分类变化后，旧快照的分组不再可比，必须重建。"""
+    digest = hashlib.sha1()
+    normalized = {str(key): value for key, value in (industry_map or {}).items()}
+    for code in sorted(normalized):
+        digest.update(("%s\x1f%s\n" % (code, normalized[code])).encode("utf-8"))
+    return digest.hexdigest()
+
+
+def _finite_positive_array(values) -> np.ndarray:
+    try:
+        arr = np.asarray(values, dtype=float).ravel()
+    except (TypeError, ValueError):
+        return np.asarray([], dtype=float)
+    return np.sort(arr[np.isfinite(arr) & (arr > 0)])
+
+
+def _decode_snapshot_payload(raw) -> dict:
+    if not isinstance(raw, dict):
+        return {}
+    snapshot: dict[str, dict] = {}
+    for industry, bucket in raw.items():
+        if not isinstance(bucket, dict):
+            continue
+        pe = _finite_positive_array(bucket.get("pe"))
+        pb = _finite_positive_array(bucket.get("pb"))
+        peers: list[dict] = []
+        for item in bucket.get("comparable_peers") or []:
+            if not isinstance(item, dict):
+                continue
+            try:
+                peer_pe = float(item.get("pe"))
+                peer_pb = float(item.get("pb"))
+                earnings_to_equity = float(item.get("earnings_to_equity"))
+            except (TypeError, ValueError):
+                continue
+            if (np.isfinite([peer_pe, peer_pb, earnings_to_equity]).all()
+                    and peer_pe > 0 and peer_pb > 0 and earnings_to_equity > 0):
+                peers.append({"pe": peer_pe, "pb": peer_pb,
+                              "earnings_to_equity": earnings_to_equity})
+        if len(pe) or len(pb):
+            snapshot[str(industry)] = {"pe": pe, "pb": pb, "comparable_peers": peers}
+    return snapshot
+
+
+def _encode_snapshot_payload(snapshot: dict, snapshot_day: str, industry_map: dict) -> dict:
+    return {
+        "version": _SNAPSHOT_CACHE_VERSION,
+        "snapshot_day": str(snapshot_day)[:10],
+        "built_at": _beijing_now().isoformat(),
+        "industry_digest": _industry_map_digest(industry_map),
+        "industry_count": len(snapshot),
+        "snapshot": {
+            str(industry): {
+                "pe": [float(v) for v in bucket.get("pe", [])],
+                "pb": [float(v) for v in bucket.get("pb", [])],
+                "comparable_peers": [
+                    {"pe": float(p["pe"]), "pb": float(p["pb"]),
+                     "earnings_to_equity": float(p["earnings_to_equity"])}
+                    for p in (bucket.get("comparable_peers") or [])
+                    if isinstance(p, dict) and "pe" in p and "pb" in p and "earnings_to_equity" in p
+                ],
+            }
+            for industry, bucket in snapshot.items()
+        },
+    }
+
+
+def _load_cached_industry_snapshot(config: StrategyConfig, industry_map: dict):
+    """读取可复用的行业快照，返回 (snapshot, snapshot_day, age_days)；无可用缓存返回三个 None。"""
+    if not getattr(config, "USE_CACHE", True):
+        return None, None, None
+    max_age = float(getattr(config, "SNAPSHOT_CACHE_MAX_AGE_DAYS", 0.0) or 0.0)
+    if max_age <= 0:
+        return None, None, None
+    path = _snapshot_cache_path(config)
+    if not os.path.exists(path):
+        return None, None, None
+    payload = _read_cache_json(path)
+    if not isinstance(payload, dict) or payload.get("version") != _SNAPSHOT_CACHE_VERSION:
+        logger.warning("行业估值快照缓存版本不兼容，忽略并重建")
+        return None, None, None
+    if payload.get("industry_digest") != _industry_map_digest(industry_map):
+        logger.warning("行业估值快照缓存的行业分类与当前不一致，忽略并重建")
+        return None, None, None
+    day_text = str(payload.get("snapshot_day") or "")[:10]
+    try:
+        snapshot_day = date.fromisoformat(day_text)
+    except ValueError:
+        return None, None, None
+    age_days = (_beijing_now().date() - snapshot_day).days
+    if age_days < 0:
+        logger.warning("行业估值快照缓存日期位于未来（%s），忽略并重建", day_text)
+        return None, None, None
+    if age_days > max_age:
+        logger.info("行业估值快照缓存已过期：快照日 %s，距今 %d 天 > 上限 %d 天，重建",
+                    day_text, age_days, int(max_age))
+        return None, None, None
+    snapshot = _decode_snapshot_payload(payload.get("snapshot"))
+    if not snapshot:
+        return None, None, None
+    return snapshot, day_text, age_days
+
+
+def _save_cached_industry_snapshot(config: StrategyConfig, snapshot: dict,
+                                   snapshot_day: str, industry_map: dict) -> None:
+    if not snapshot or not getattr(config, "USE_CACHE", True):
+        return
+    path = _snapshot_cache_path(config)
+    if _write_cache_json(_encode_snapshot_payload(snapshot, snapshot_day, industry_map), path):
+        logger.info("行业估值快照已持久化：%s（快照日 %s，%d 个行业）",
+                    path, str(snapshot_day)[:10], len(snapshot))
+    else:
+        logger.warning("行业估值快照持久化失败（不影响本次筛选）：%s", path)
+
+
 def build_industry_valuation_snapshot(config: StrategyConfig, cache: CacheManager,
                                       stock_list: list[dict]) -> dict:
     """构建「行业 -> 当日 PE/PB 横截面（升序数组）」快照，供行业相对估值闸门使用。
@@ -3576,6 +3723,9 @@ def build_industry_valuation_snapshot(config: StrategyConfig, cache: CacheManage
     - 复用 get_daily_data 缓存：与随后的筛选阶段共享同一份日线，不额外增加取数成本
       （快照阶段触发取数并写入内存/磁盘缓存，筛选阶段直接命中）。
     - 仅纳入 peTTM/pbMRQ 有限且为正的样本（亏损/异常值会扭曲分位）。
+    - 成功构建后持久化到 cache/industry_valuation_snapshot_v1.json；后续运行在
+      SNAPSHOT_CACHE_MAX_AGE_DAYS 内直接复用。行业分位是横截面排名，跨日复用不会
+      改变“相对便宜/贵”的排序，但能把 150~225 分钟的冷启动摊薄到一次。
     """
     if not getattr(config, "USE_INDUSTRY_RELATIVE_VALUATION", False):
         return {}
@@ -3591,6 +3741,16 @@ def build_industry_valuation_snapshot(config: StrategyConfig, cache: CacheManage
         return {}
     snapshot_day = str(index.iloc[-1]["date"])[:10]
 
+    # ===== 持久化复用：先看缓存，避免每次定时运行都重拉 2963 只日线 =====
+    # 只有真正传入 CacheManager 的生产/回测调用才读写；cache=None 的纯函数测试
+    # 不碰磁盘，避免测试污染项目 cache/。
+    if cache is not None:
+        cached_snapshot, cached_day, cached_age = _load_cached_industry_snapshot(config, industry_map)
+        if cached_snapshot is not None:
+            logger.info("行业估值快照复用缓存：快照日 %s（T-%d 天），%d 个行业；跳过 %d 只逐股拉取",
+                        cached_day, cached_age, len(cached_snapshot), len(stock_list))
+            return cached_snapshot
+
     # ===== 纯观测层：快照阶段进度日志 =====
     # 本函数用独立 ThreadPoolExecutor 遍历全 A 拉日线，不走 run_concurrent_screen，
     # 因此既无心跳看门狗也无 PROGRESS_LOG_EVERY 进度；冷启动 cache 全 miss 时
@@ -3603,7 +3763,7 @@ def build_industry_valuation_snapshot(config: StrategyConfig, cache: CacheManage
     # 时间预算（SNAPSHOT_TIME_BUDGET_MIN）：超预算即停拉剩余股票并放弃本次快照
     # （返回空 → 上层全市场回退 PE 绝对阈值）。run #109 快照 225.6 分钟、占 job
     # 360 分钟硬上限 63%，筛选本身只要 1.8 分钟——不设预算时快照能把整个 job 拖死。
-    budget_sec = float(getattr(config, "SNAPSHOT_TIME_BUDGET_MIN", 60.0) or 0) * 60
+    budget_sec = float(getattr(config, "SNAPSHOT_TIME_BUDGET_MIN", 300.0) or 0) * 60
     stop = threading.Event()
     logger.info("行业估值快照构建开始：%d 只股票，%d 线程，快照日 %s（每 %d 只打印一次进度，预算 %.0f 分钟）",
                 total_stocks, config.MAX_WORKERS, snapshot_day, progress_every, budget_sec / 60)
@@ -3681,6 +3841,8 @@ def build_industry_valuation_snapshot(config: StrategyConfig, cache: CacheManage
         logger.info("行业估值快照：%d 个行业纳入横截面（行业相对估值闸门生效），完成 %d/%d，命中 %d，耗时 %.1f 分钟",
                     len(snapshot), counter["done"], total_stocks, counter["hit"],
                     (time.time() - snapshot_start) / 60)
+        if cache is not None:
+            _save_cached_industry_snapshot(config, snapshot, snapshot_day, industry_map)
     return snapshot
 
 

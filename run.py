@@ -25,6 +25,7 @@ from notify.feishu import (
     notify_screening_result,
 )
 from store.mysql_store import save_recommendations, fetch_recent_recommended_codes
+from src.shadow_ledger import record_shadow_pending
 
 logger = logging.getLogger("run")
 
@@ -192,6 +193,19 @@ def run(argv: list[str] | None = None):
         n_picks = 0 if output_df is None else len(output_df)
         logger.info("Step 2/4 完成 (%.1f 分钟)，正式推荐 %d 只，待核验候选 %d 只，波动率超限观察 %d 只",
                     (time.time() - t) / 60, n_picks, len(pending_rows), len(volatile_rows))
+        # P1 影子账本：把 pending/near-miss 写入独立 JSONL（cache/ 持久化 + data/ artifact）。
+        # 不参与准入、不通知、不写 stock_recommendation 正式表；--no-save 测试运行跳过。
+        if save_enabled:
+            try:
+                shadow_changed, shadow_total = record_shadow_pending(
+                    pending_rows, output_df, config, strategy="bottom_fishing")
+                logger.info("影子账本：写入/更新 %d 条 pending/near-miss，累计 %d 条"
+                            "（不通知、不写正式推荐表）", shadow_changed, shadow_total)
+            except Exception:
+                logger.warning("影子账本写入失败（不影响主流程）:\n%s",
+                               traceback.format_exc()[-400:])
+        else:
+            logger.info("影子账本：--no-save 模式跳过（测试运行不进入证据池）")
         if output_df is not None and not output_df.empty:
             for _, r in output_df.iterrows():
                 # 排序分 = 技术分 + 连续质量分，是决赛圈取 Top-N 的实际主键；

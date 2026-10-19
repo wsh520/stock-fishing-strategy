@@ -185,6 +185,8 @@ python run_longterm.py --compare          # 对比模式：同时跑生产 quali
 - **防假死**：模块级 `socket.setdefaulttimeout(20)`——数据源底层 socket 默认无超时，曾致持有锁线程永久阻塞、全池假死跑满 6h 被取消
 - **共享并发筛选骨架** `run_concurrent_screen`（三条 sleeve 同一模板，长期 sleeve 经 `_screen_quality_pool` 的 `evaluator` 参数复用）：线程池 + 心跳看门狗（每 1 分钟心跳，连续 4 分钟无完成打印在途股票代码定位卡点；`WATCHDOG_TICK_SEC`/`WATCHDOG_IDLE_WARN_SEC` 可调）+ 时间预算（`SCREEN_TIME_BUDGET_MIN`=240 分钟，超时取消未完成任务、按已完成结果出报告，漏斗统计按已处理数计）
 - **行业估值快照进度可观测**：`build_industry_valuation_snapshot` 用独立线程池遍历全 A 拉日线构建横截面，冷启动 cache 全 miss 时曾是 1~2h+ 静默黑洞；现补开始/每 `SNAPSHOT_PROGRESS_LOG_EVERY`（默认 200）只进度（带命中数与 ETA）/成功汇总（含耗时）三段日志，异常路径也带已完成数，纯观测不改口径
+- **行业估值快照持久化（2026-10-19）**：成功构建的快照写入 `cache/industry_valuation_snapshot_v1.json`，在 `SNAPSHOT_CACHE_MAX_AGE_DAYS`（默认 7 个日历天）内直接复用；定时清理只删 `daily_*`/`weekly_*`/`index_daily_*`，不删该文件。`SNAPSHOT_TIME_BUDGET_MIN` 从 60 提到 300 分钟，覆盖 #108/#109 已验证的 150.1/225.6 分钟冷启动；超预算仍放弃快照并回退绝对 PE（显式 warning），不会使用部分横截面。详见[快照持久化说明](docs/snapshot_persistence.md)
+- **影子账本（2026-10-19）**：`run.py` 把 pending / near-miss 写入 `cache/shadow_recommendations.jsonl`（Actions cache 持久化）与 `data/shadow/`（artifact），不通知、不写 `stock_recommendation` 正式表；`run_shadow_tracking.py` 每周按市场交易日计算 F5/F10/F15/F20/F40/F60，写 `data/shadow/shadow_tracking.json`。详见[影子账本说明](docs/shadow_ledger.md)
 - **取数来源统计**：`fetch_stats`（Baostock 命中 / AkShare 兜底 / 双源均失败），漏斗末尾汇总
 - **待核验淘汰归因**（`_screen_quality_pool`）：这是「今天为什么没推荐」的第一现场，逐层给出可复核证据：
   - `[QV_PENDING]` 逐只打印——行情日期、**阻断原因**、原因说明（中文）、全部标签、综合分/技术分（对照正式门槛）、止跌层级、年度质量/财务风险/近期经营/周期风险各自状态；
@@ -199,7 +201,7 @@ python run_longterm.py --compare          # 对比模式：同时跑生产 quali
 |--------|------------------|-------------------|------|
 | **Daily Stock Screening** | 交易日 21:00 | `0 13 * * 1-5` | 优质低估低位策略选股 → 落库 → 飞书通知；随后**同一 runner 内**顺序执行放量突破策略（复用前者的当日行情缓存）→ 组合层去重/总量上限 → 落库 → 飞书通知 |
 | **Daily Stock Screening (Long-term Quality)** | 交易日 21:30 | `30 13 * * 1-5` | 长期优质低估低位选股 → 落库（`strategy=longterm_quality`）→ 飞书通知；比主策略晚 30 分钟避免 Baostock 取数冲突，行情缓存用独立 key 前缀 `longterm-baostock-cache-`（同样带 `run_id`） |
-| **Weekly Recommendation Tracking** | 每周五 21:20 | `20 13 * * 5` | 按沪深300交易日定位推荐后第5/10/15/20/40/60个市场交易日并观测（115 日内可补跑）→ 落库 → 飞书汇总（按期限与策略分列） |
+| **Weekly Recommendation Tracking** | 每周五 21:20 | `20 13 * * 5` | 按沪深300交易日定位推荐后第5/10/15/20/40/60个市场交易日并观测（115 日内可补跑）→ 落库 → 飞书汇总（按期限与策略分列）；随后运行影子账本追踪（`run_shadow_tracking.py`，只写诊断文件、不通知） |
 | **Monthly Signal Attribution** | 每月 1 日 09:00 | `0 1 1 * *` | 各信号维度胜率/收益归因（总体仅取「推荐后20交易日」，未满者不计入并在卡片报数）→ 飞书月报 |
 
 **Job 超时预算**（GitHub 托管 runner 单 job 硬上限 6 小时）：`daily_screen` 设 `timeout-minutes: 360`（两套策略共享这一份预算）、`daily_screen_longterm` 180、`weekly_tracking` 120、`monthly_attribution` 30。策略内部另有 `SCREEN_TIME_BUDGET_MIN`=240 分钟的软预算：超时取消未完成任务、按已完成结果出报告，漏斗统计按已处理数计——两层预算独立，软预算先于硬超时生效，保证报告能落盘。
@@ -607,7 +609,7 @@ WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'stock_recommendation'
 
 **信号归因**：`run_monthly_attribution.py` 基于两表历史数据统计各信号维度（等级 / 评分分档 / 底背离 / 市场环境 / 策略 × 持有期限 / 策略）的胜率与收益，用于用真实运行数据反哺信号质量评估。**总体口径暂只取「推荐后 20 交易日」观测**（与历史月报可比；生产持有窗口 2026-10-13 起为 40~60 个交易日，待 40/60 观测积累 2~3 个月后应把总体口径改到 60 并同步卡片文案），**未满 20 交易日的条数在卡片上显式报出**（否则用户会以为「本期只有这么点推荐」）；持有期限维度按 5/10/15/20/40/60 交易日分别统计——**「20 日收割 vs 40/60 日收割」的收益差就在这里直接可见**，是执行中期化效果的度量口径。**平均峰值 = 该推荐在全部固定期限观测中的最高收益率**（不是每日最大浮盈、也不是区间最高价）；按期限分组的那一列是**组内极值**，卡片以「最高收益」显式标注，避免被读成均值。`market_env` / `grade` 缺失的推荐归入「未知」档而不是被 groupby 静默丢弃，**各分组样本数之和恒等于总数**。**这不是回测**——只统计已落库的真实推荐与真实追踪收益，因此样本需要时间积累。
 
-> **只有 `rec_tier='formal'` 的正式推荐会落库**；待核验候选（数据缺失）不写库、不参与追踪，避免污染归因样本。
+> **只有 `rec_tier='formal'` 的正式推荐会落库**；待核验候选（数据缺失）不写正式表、不参与固定期限追踪，避免污染归因样本。2026-10-19 起 pending 另写**影子账本**（`cache/shadow_recommendations.jsonl` + `data/shadow/`，JSONL，不是 MySQL），只供 `run_shadow_tracking.py` 做前瞻诊断，不通知、不进入正式追踪/归因。
 
 ## 通知样例
 

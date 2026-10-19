@@ -68,3 +68,28 @@ jobs:
           else
             python -u run_weekly_tracking.py
           fi
+
+      # 影子账本追踪：只读 cache/shadow_recommendations.jsonl（由每日 run.py 写入），
+      # 计算 pending/near-miss 的固定期限收益；不连 MySQL、不推送飞书、不改正式推荐。
+      # if: always() 保证正式追踪因未配置 MySQL/单票失败提前退出时，影子证据仍能更新。
+      - name: Run shadow ledger tracking (diagnostics only)
+        if: always()
+        continue-on-error: true
+        env:
+          TZ: Asia/Shanghai
+          PYTHONUNBUFFERED: "1"
+        run: |
+          if [ "${{ inputs.no_cache }}" = "true" ]; then
+            python -u run_shadow_tracking.py --no-cache
+          else
+            python -u run_shadow_tracking.py
+          fi
+
+      - name: Upload shadow tracking diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shadow-tracking-${{ github.run_number }}
+          path: data/shadow/
+          if-no-files-found: ignore
+          retention-days: 30
