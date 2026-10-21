@@ -103,6 +103,7 @@ if _AK_AVAILABLE:
     from src.akshare_resilience import configure as _ak_configure  # noqa: E402
     from src.akshare_resilience import format_summary as _ak_summary  # noqa: E402
     from src.akshare_resilience import install as _ak_install      # noqa: E402
+    from src.akshare_resilience import is_open as _ak_is_open      # noqa: E402
     from src.akshare_resilience import reset_channels as _ak_reset_channels  # noqa: E402
     _ak_install()
 else:  # 未装 akshare 时保持原有 ImportError 语义，调用方不用关心这个分支
@@ -110,6 +111,7 @@ else:  # 未装 akshare 时保持原有 ImportError 语义，调用方不用关�
         """占位：未安装 akshare 时不会有通道调用，仅为让 except 子句语法成立。"""
 
     _ak_call = _ak_configure = _ak_summary = _ak_install = _ak_reset_channels = None  # type: ignore
+    _ak_is_open = None  # type: ignore
 
 _MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(_MODULE_DIR)
@@ -850,11 +852,10 @@ class StrategyConfig:
     FETCH_RETRY_JITTER: float = 0.3
 
     # ===== 数据源主备与卡死股票放弃（2026-10-21）=====
-    # 主数据源顺序："baostock"（默认）或 "akshare"。取 "akshare" 时每次取数先走 AkShare，
-    # 失败再降级 Baostock；可用环境变量 DATA_SOURCE_PRIMARY 覆盖（便于在 Actions 里切换）。
-    # AkShare 作为主源的前提是 src/akshare_resilience.py 的韧性层已生效：
-    # 共享 keep-alive 连接、强制 HTTP 超时、通道熔断（东财 ↔ 新浪）。
-    DATA_SOURCE_PRIMARY: str = "baostock"
+    # 主数据源顺序："akshare"（默认，2026-10-21 起）或 "baostock"。AkShare 侧已补齐
+    # 韧性层（连接复用/强制超时/通道熔断）与估值列（百度 TTM/市净率），可作为主源；
+    # 取 "baostock" 时反之，可用环境变量 DATA_SOURCE_PRIMARY 覆盖（便于在 Actions 切回）。
+    DATA_SOURCE_PRIMARY: str = "akshare"
     # 单只股票的取数重试上限：连续失败达到该次数即放弃该股（记 FAIL_DATA 并入否决归因），
     # 不再让一只卡死的票拖住线程池——run #111 的 600511 卡住 30 分钟直到整条 job 被取消。
     STOCK_MAX_ATTEMPTS: int = 3
@@ -2093,16 +2094,19 @@ def _fetch_stock_pool_ak(config: Optional[StrategyConfig] = None) -> list[dict]:
 
 # 本次运行实际生效的主数据源。main() 按 config/env 设定；模块级函数（如
 # is_data_degraded）读它判断"谁是主源"，避免把 AkShare 主源下的 bs_ok=0 误判为降级。
-_PRIMARY_SOURCE = "baostock"
-
-
+_PRIMARY_SOURCE = "akshare"
 def _primary_is_akshare(config: Optional[StrategyConfig] = None) -> bool:
     """本次运行是否以 AkShare 为主数据源（传入 config 时以 config 为准）。"""
     if config is not None:
-        primary = str(getattr(config, "DATA_SOURCE_PRIMARY", "baostock") or "baostock")
+        primary = str(getattr(config, "DATA_SOURCE_PRIMARY", "akshare") or "akshare")
     else:
         primary = _PRIMARY_SOURCE
     return primary.lower() == "akshare" and _AK_AVAILABLE
+
+
+def _ak_channel_open(name: str) -> bool:
+    """通道是否处于熔断冷却期（冷却期内该通道的所有请求会被直接跳过）。"""
+    return bool(_ak_is_open(name)) if (_AK_AVAILABLE and _ak_is_open is not None) else False
 
 
 def _fetch_daily_dual(code: str, days: int, config: StrategyConfig) -> Optional[pd.DataFrame]:
@@ -2120,7 +2124,12 @@ def _fetch_daily_dual(code: str, days: int, config: StrategyConfig) -> Optional[
 
     df = None
     if _primary_is_akshare(config):
-        df = _try_ak()
+        # 估值通道熔断：AkShare 行情里没有 PE/PB，硬用它只会把候选全压成 pending。
+        # 此时整票改走 Baostock（一次请求自带估值），比"有价无估值"更接近真实结论。
+        if _ak_channel_open("baidu") and _bs_available():
+            df = _try_bs()
+        if df is None:
+            df = _try_ak()
         if df is None and _bs_available():
             df = _try_bs()
     else:

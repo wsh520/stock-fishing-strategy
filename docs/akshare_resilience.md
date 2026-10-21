@@ -70,21 +70,25 @@ AkShare 日线只有 OHLCV，没有 `peTTM/pbMRQ`。缺这两列时估值闸门�
 ## 主数据源切换
 
 ```text
-DATA_SOURCE_PRIMARY = baostock   # 默认：Baostock 优先，AkShare 兜底
-DATA_SOURCE_PRIMARY = akshare    # 反转：AkShare 优先，Baostock 兜底
+DATA_SOURCE_PRIMARY = akshare    # 默认（2026-10-21 起）：AkShare 优先，Baostock 兜底
+DATA_SOURCE_PRIMARY = baostock   # 回退：Baostock 优先，AkShare 兜底
 ```
 
 - 代码里改配置，或设同名环境变量（优先级更高）；
-- GitHub Actions 两种切换方式，优先级 **手动勾选项 > 仓库变量 > 默认值**：
+- GitHub Actions 两种切换方式，优先级 **手动勾选项 > 仓库变量 > 代码默认（akshare）**：
   - 仓库变量 `Settings → Secrets and variables → Actions → Variables → DATA_SOURCE_PRIMARY`：
     长期生效（定时任务也跟着切）；
   - 手动触发时的勾选项 `data_source_primary`（`inherit`/`baostock`/`akshare`）：只覆盖
-    本次运行，`inherit` 表示跟随仓库变量。适合"试一次 AkShare 又不想改仓库配置"；
+    本次运行，`inherit` 表示跟随仓库变量。适合"试一次另一个源又不想改仓库配置"；
+  - 两者都不设时解析步骤**不注入 env**，由代码默认值（akshare）决定——workflow 不硬编码
+    数据源，避免悄悄覆盖代码默认；
 - 两个策略步骤共用同一解析结果：`Resolve data source primary` 步骤把最终值写入
   `GITHUB_ENV`，`run.py` 与 `run_breakout.py` 读同一个值，不会一半 A 源一半 B 源；
   页面会打印 `::notice::主数据源=akshare（来源：手动触发勾选项 inputs.data_source_primary）`；
 - 切到 AkShare 主源时**不预登 Baostock**，省掉每次约 4 秒的登录成本；只有 AkShare
-  全程失败时才在路由处懒登录兜底；
+  全程失败（或估值通道熔断）时才在路由处懒登录兜底；
+- **估值通道熔断的降级**：百度通道连续失败进入冷却期时，整票改走 Baostock（一次请求自带
+  `peTTM/pbMRQ`），而不是拿"有价无估值"的 AkShare 行情把候选压成 pending；
 - `is_data_degraded()` 已按当前主源判定：AkShare 主源命中时不会因为 `bs_ok=0` 误报降级。
 
 ## 日志

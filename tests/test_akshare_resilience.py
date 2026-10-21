@@ -187,7 +187,7 @@ class PrimarySourceRoutingTests(unittest.TestCase):
         bs_fetch.assert_not_called()
 
     def test_baostock_primary_tries_baostock_first(self):
-        cfg = StrategyConfig()
+        cfg = StrategyConfig(DATA_SOURCE_PRIMARY="baostock")
         frame = pd.DataFrame({"date": ["2026-10-20"], "close": [10.0], "pct_chg": [0.0]})
         with patch.object(m, "_fetch_daily_ak", return_value=frame) as ak_fetch, \
              patch.object(m, "_fetch_daily_bs", return_value=frame) as bs_fetch, \
@@ -195,6 +195,25 @@ class PrimarySourceRoutingTests(unittest.TestCase):
             m._fetch_daily_dual("600000", days=30, config=cfg)
         bs_fetch.assert_called_once()
         ak_fetch.assert_not_called()
+
+    def test_default_primary_is_akshare(self):
+        self.assertEqual(StrategyConfig().DATA_SOURCE_PRIMARY, "akshare")
+
+    def test_baidu_breaker_routes_whole_stock_to_baostock(self):
+        """估值通道熔断时改用 Baostock：AkShare 有价无估值，硬用只会把候选压成 pending。"""
+        res.reset_channels()
+        cfg = StrategyConfig(DATA_SOURCE_PRIMARY="akshare")
+        frame = pd.DataFrame({"date": ["2026-10-20"], "close": [10.0], "pct_chg": [0.0]})
+        res.record_failure("baidu", threshold=1, cooldown_sec=60)
+        try:
+            with patch.object(m, "_fetch_daily_ak", return_value=frame) as ak_fetch, \
+                 patch.object(m, "_fetch_daily_bs", return_value=frame) as bs_fetch, \
+                 patch.object(m, "_bs_available", return_value=True):
+                m._fetch_daily_dual("600000", days=30, config=cfg)
+            bs_fetch.assert_called_once()
+            ak_fetch.assert_not_called()
+        finally:
+            res.reset_channels()
 
     def test_degraded_flag_uses_active_primary(self):
         m._PRIMARY_SOURCE = "akshare"

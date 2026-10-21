@@ -40,7 +40,7 @@ on:
         type: boolean
         default: false
       data_source_primary:
-        description: "主数据源：inherit=跟随仓库变量（默认）；akshare=本次强制 AkShare 主源；baostock=本次强制 Baostock"
+        description: "主数据源：inherit=跟随仓库变量（未设则用代码默认 akshare）；akshare=本次强制 AkShare 主源；baostock=本次强制 Baostock"
         type: choice
         default: inherit
         options:
@@ -139,8 +139,10 @@ jobs:
             SOURCE="手动触发勾选项 inputs.data_source_primary"
           fi
           if [ -z "${PRIMARY}" ]; then
-            PRIMARY="baostock"
-            SOURCE="默认值（仓库变量与勾选项均未设置）"
+            # 两者都没设：不注入 env，让策略用自己的默认值（当前为 akshare）。
+            # 这里不能写死 baostock——否则 workflow 会悄悄覆盖代码默认值。
+            echo "::notice::未显式指定主数据源，使用策略默认值 DATA_SOURCE_PRIMARY=akshare"
+            exit 0
           fi
           case "${PRIMARY}" in
             baostock|akshare) ;;
