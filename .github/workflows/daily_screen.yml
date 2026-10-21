@@ -39,6 +39,14 @@ on:
         description: "突破策略跳过飞书通知"
         type: boolean
         default: false
+      data_source_primary:
+        description: "主数据源：inherit=跟随仓库变量（默认）；akshare=本次强制 AkShare 主源；baostock=本次强制 Baostock"
+        type: choice
+        default: inherit
+        options:
+          - inherit
+          - baostock
+          - akshare
 
 jobs:
   screen:
@@ -116,6 +124,34 @@ jobs:
             echo "::notice::cache/ 不存在，本次由数据源拉取行情"
           fi
 
+      # 主数据源解析：手动触发时可用勾选项覆盖仓库变量，避免为了试一次 AkShare 就改仓库配置。
+      # 结果写进 GITHUB_ENV，后续 run.py / run_breakout.py 两个步骤读同一个值，不会一半 A 源一半 B 源。
+      # 优先级：手动勾选项（非 inherit）> 仓库变量 vars.DATA_SOURCE_PRIMARY > baostock 默认值。
+      - name: Resolve data source primary
+        env:
+          INPUT_PRIMARY: ${{ inputs.data_source_primary }}
+          VAR_PRIMARY: ${{ vars.DATA_SOURCE_PRIMARY }}
+        run: |
+          PRIMARY="${VAR_PRIMARY}"
+          SOURCE="仓库变量 vars.DATA_SOURCE_PRIMARY"
+          if [ -n "${INPUT_PRIMARY}" ] && [ "${INPUT_PRIMARY}" != "inherit" ]; then
+            PRIMARY="${INPUT_PRIMARY}"
+            SOURCE="手动触发勾选项 inputs.data_source_primary"
+          fi
+          if [ -z "${PRIMARY}" ]; then
+            PRIMARY="baostock"
+            SOURCE="默认值（仓库变量与勾选项均未设置）"
+          fi
+          case "${PRIMARY}" in
+            baostock|akshare) ;;
+            *) echo "::error::非法主数据源 '${PRIMARY}'：只允许 baostock / akshare"; exit 1 ;;
+          esac
+          echo "DATA_SOURCE_PRIMARY=${PRIMARY}" >> "$GITHUB_ENV"
+          echo "::notice::主数据源=${PRIMARY}（来源：${SOURCE}）"
+          if [ "${PRIMARY}" = "akshare" ]; then
+            echo "::warning::AkShare 主源目前只用于连接层试跑：akshare 日线不含 peTTM/pbMRQ，估值闸门会记缺项、候选转 pending，正式推荐可能为 0"
+          fi
+
       - name: Run bottom-fishing strategy
         env:
           # 按触发方式选飞书机器人：定时(schedule)=生产机器人 FEISHU_WEBHOOK_URL；
@@ -132,11 +168,8 @@ jobs:
           TZ: Asia/Shanghai
           # 关闭 stdout 缓冲：否则 Python 输出按块缓冲，任务超时/取消后缓冲的日志全部丢失
           PYTHONUNBUFFERED: "1"
-          # 主数据源：留空或 baostock = Baostock 优先（默认）；akshare = AkShare 优先。
-          # 在仓库 Settings → Secrets and variables → Actions → Variables 配置
-          # DATA_SOURCE_PRIMARY 即可切换，不必改代码。AkShare 主源依赖
-          # src/akshare_resilience.py（连接复用 + 强制超时 + 通道熔断）。
-          DATA_SOURCE_PRIMARY: ${{ vars.DATA_SOURCE_PRIMARY }}
+          # 主数据源由上面的 Resolve data source primary 步骤解析后经 GITHUB_ENV 注入，
+          # 这里不要再设 step 级 env：step env 会覆盖 GITHUB_ENV，让勾选项/仓库变量失效。
           # 定时任务【使用】磁盘缓存（不再强制 --no-cache）：这是共享当日行情的前提 ——
           # 优质低估低位必须把当天日线/基本面写进 cache/，同一 runner 上的突破步骤才能零重拉复用。
           # 定时运行「必须基于当日最新行情」这一正确性要求，由上面的 Purge restored quote

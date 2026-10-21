@@ -50,8 +50,14 @@ DATA_SOURCE_PRIMARY = akshare    # 反转：AkShare 优先，Baostock 兜底
 ```
 
 - 代码里改配置，或设同名环境变量（优先级更高）；
-- GitHub Actions 里配仓库变量 `Settings → Secrets and variables → Actions → Variables →
-  DATA_SOURCE_PRIMARY`，`daily_screen.yml` 已透传，不需要改 workflow；
+- GitHub Actions 两种切换方式，优先级 **手动勾选项 > 仓库变量 > 默认值**：
+  - 仓库变量 `Settings → Secrets and variables → Actions → Variables → DATA_SOURCE_PRIMARY`：
+    长期生效（定时任务也跟着切）；
+  - 手动触发时的勾选项 `data_source_primary`（`inherit`/`baostock`/`akshare`）：只覆盖
+    本次运行，`inherit` 表示跟随仓库变量。适合"试一次 AkShare 又不想改仓库配置"；
+- 两个策略步骤共用同一解析结果：`Resolve data source primary` 步骤把最终值写入
+  `GITHUB_ENV`，`run.py` 与 `run_breakout.py` 读同一个值，不会一半 A 源一半 B 源；
+  页面会打印 `::notice::主数据源=akshare（来源：手动触发勾选项 inputs.data_source_primary）`；
 - 切到 AkShare 主源时**不预登 Baostock**，省掉每次约 4 秒的登录成本；只有 AkShare
   全程失败时才在路由处懒登录兜底；
 - `is_data_degraded()` 已按当前主源判定：AkShare 主源命中时不会因为 `bs_ok=0` 误报降级。

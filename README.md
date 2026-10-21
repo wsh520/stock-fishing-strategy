@@ -185,7 +185,7 @@ python run_longterm.py --compare          # 对比模式：同时跑生产 quali
 - **防假死**：模块级 `socket.setdefaulttimeout(20)`——数据源底层 socket 默认无超时，曾致持有锁线程永久阻塞、全池假死跑满 6h 被取消
 - **AkShare 通道韧性（2026-10-21）**：`src/akshare_resilience.py` 为所有 AkShare 接口补四层保护——线程内复用 keep-alive 连接（实测同一批股票 1.63s/次 → 0.31s/次）、调用方未传 `timeout` 时注入 20 秒（接口自带 `timeout=None`，而 `socket.setdefaulttimeout` 对 requests 无效）、东财/新浪按通道熔断（连续 3 次失败后冷却 120 秒，期间直接走备用通道，不再逐只重试死连接）、单通道有限重试（`MAX_RETRY+1` 次，指数退避+抖动）。运行末尾打印 `AkShare 通道: eastmoney 成功N/失败N/跳过N`。详见[通道韧性说明](docs/akshare_resilience.md)
 - **卡死股票放弃**：`run_concurrent_screen` 对单只股票最多尝试 `STOCK_MAX_ATTEMPTS`（默认 3）次，连续失败即放弃并记 `FAIL_DATA`，不再占住线程池——run #111 的 600511 曾卡住 1750 秒以上，直到整条 job 被取消；看门狗告警同时打印在途股票已等待秒数
-- **主数据源可切换**：`DATA_SOURCE_PRIMARY`（默认 `baostock`，可设 `akshare`）决定先走哪个源、另一个作兜底；同名环境变量可覆盖配置，Actions 里配仓库变量即可切换，不必改代码
+- **主数据源可切换**：`DATA_SOURCE_PRIMARY`（默认 `baostock`，可设 `akshare`）决定先走哪个源、另一个作兜底；同名环境变量可覆盖配置。Actions 里两种切换方式：仓库变量 `DATA_SOURCE_PRIMARY`（长期生效），或手动触发时勾选 `data_source_primary`（只覆盖本次，优先级更高，不必改仓库配置）
 - **共享并发筛选骨架** `run_concurrent_screen`（三条 sleeve 同一模板，长期 sleeve 经 `_screen_quality_pool` 的 `evaluator` 参数复用）：线程池 + 心跳看门狗（每 1 分钟心跳，连续 4 分钟无完成打印在途股票代码定位卡点；`WATCHDOG_TICK_SEC`/`WATCHDOG_IDLE_WARN_SEC` 可调）+ 时间预算（`SCREEN_TIME_BUDGET_MIN`=240 分钟，超时取消未完成任务、按已完成结果出报告，漏斗统计按已处理数计）
 - **行业估值快照进度可观测**：`build_industry_valuation_snapshot` 用独立线程池遍历全 A 拉日线构建横截面，冷启动 cache 全 miss 时曾是 1~2h+ 静默黑洞；现补开始/每 `SNAPSHOT_PROGRESS_LOG_EVERY`（默认 200）只进度（带命中数与 ETA）/成功汇总（含耗时）三段日志，异常路径也带已完成数，纯观测不改口径
 - **行业估值快照持久化（2026-10-19）**：成功构建的快照写入 `cache/industry_valuation_snapshot_v1.json`，在 `SNAPSHOT_CACHE_MAX_AGE_DAYS`（默认 7 个日历天）内直接复用；定时清理只删 `daily_*`/`weekly_*`/`index_daily_*`，不删该文件。`SNAPSHOT_TIME_BUDGET_MIN` 从 60 提到 300 分钟，覆盖 #108/#109 已验证的 150.1/225.6 分钟冷启动；超预算仍放弃快照并回退绝对 PE（显式 warning），不会使用部分横截面。详见[快照持久化说明](docs/snapshot_persistence.md)
@@ -220,6 +220,7 @@ python run_longterm.py --compare          # 对比模式：同时跑生产 quali
 | `no_notify` | 关 | 两套策略都跳过飞书通知 |
 | `skip_breakout` | 关 | 只跑优质低估低位，跳过放量突破 |
 | `breakout_no_save` / `breakout_no_notify` | 关 | 只针对突破策略跳过落库 / 通知（细粒度控制，与 `no_save` / `no_notify` 取或） |
+| `data_source_primary` | `inherit` | 主数据源：`inherit` 跟随仓库变量 `DATA_SOURCE_PRIMARY`；`akshare` / `baostock` 只覆盖本次运行。解析结果经 `GITHUB_ENV` 注入，`run.py` 与 `run_breakout.py` 用同一个值 |
 
 - **为什么是 21:00**：Baostock 一般 17:30 起陆续更新当日数据、20:00 前完成，21:00 起跑留足安全边际。
 - **两套策略为什么合并进同一个 job**：优质低估低位与放量突破的数据层是同一组函数（`get_daily_data` / `get_fundamentals` / `get_stock_list` 由突破模块直接导入），`DAILY_BARS` / `WEEKLY_BARS` / `ADJUST` / `CACHE_DIR` 也完全一致，因此**缓存文件名逐字相同**（`daily_sh.600000_last120_qfq.csv`）。放在同一个 job 里顺序执行，二者共用同一个 `cache/` 目录：优质低估低位侧全量拉取并写入当天行情，突破随后直接读同一份文件，**几乎零重拉**。相比两条独立流水线，既省掉约 3000 次日线 + 数千次基本面查询（这些查询被全局锁 `bs_lock` 串行化，正是运行时长的大头），也天然保证顺序——组合层去重由**后运行者**执行（`fetch_rec_codes_for_date` 剔除当日已被优质低估低位推荐的个股，并按 `DAILY_TOTAL_MAX_PICKS` 默认 7 截取合计上限），不再依赖 cron 时间差。
