@@ -183,6 +183,9 @@ python run_longterm.py --compare          # 对比模式：同时跑生产 quali
 
 - **统一 logging**：全项目 `%(asctime)s [%(levelname)s] %(name)s` 格式，入口 `run.py` / `run_breakout.py` / `run_longterm.py` / `run_weekly_tracking.py` / `run_monthly_attribution.py` 与策略 `__main__` 各自 `_setup_logging()`
 - **防假死**：模块级 `socket.setdefaulttimeout(20)`——数据源底层 socket 默认无超时，曾致持有锁线程永久阻塞、全池假死跑满 6h 被取消
+- **AkShare 通道韧性（2026-10-21）**：`src/akshare_resilience.py` 为所有 AkShare 接口补四层保护——线程内复用 keep-alive 连接（实测同一批股票 1.63s/次 → 0.31s/次）、调用方未传 `timeout` 时注入 20 秒（接口自带 `timeout=None`，而 `socket.setdefaulttimeout` 对 requests 无效）、东财/新浪按通道熔断（连续 3 次失败后冷却 120 秒，期间直接走备用通道，不再逐只重试死连接）、单通道有限重试（`MAX_RETRY+1` 次，指数退避+抖动）。运行末尾打印 `AkShare 通道: eastmoney 成功N/失败N/跳过N`。详见[通道韧性说明](docs/akshare_resilience.md)
+- **卡死股票放弃**：`run_concurrent_screen` 对单只股票最多尝试 `STOCK_MAX_ATTEMPTS`（默认 3）次，连续失败即放弃并记 `FAIL_DATA`，不再占住线程池——run #111 的 600511 曾卡住 1750 秒以上，直到整条 job 被取消；看门狗告警同时打印在途股票已等待秒数
+- **主数据源可切换**：`DATA_SOURCE_PRIMARY`（默认 `baostock`，可设 `akshare`）决定先走哪个源、另一个作兜底；同名环境变量可覆盖配置，Actions 里配仓库变量即可切换，不必改代码
 - **共享并发筛选骨架** `run_concurrent_screen`（三条 sleeve 同一模板，长期 sleeve 经 `_screen_quality_pool` 的 `evaluator` 参数复用）：线程池 + 心跳看门狗（每 1 分钟心跳，连续 4 分钟无完成打印在途股票代码定位卡点；`WATCHDOG_TICK_SEC`/`WATCHDOG_IDLE_WARN_SEC` 可调）+ 时间预算（`SCREEN_TIME_BUDGET_MIN`=240 分钟，超时取消未完成任务、按已完成结果出报告，漏斗统计按已处理数计）
 - **行业估值快照进度可观测**：`build_industry_valuation_snapshot` 用独立线程池遍历全 A 拉日线构建横截面，冷启动 cache 全 miss 时曾是 1~2h+ 静默黑洞；现补开始/每 `SNAPSHOT_PROGRESS_LOG_EVERY`（默认 200）只进度（带命中数与 ETA）/成功汇总（含耗时）三段日志，异常路径也带已完成数，纯观测不改口径
 - **行业估值快照持久化（2026-10-19）**：成功构建的快照写入 `cache/industry_valuation_snapshot_v1.json`，在 `SNAPSHOT_CACHE_MAX_AGE_DAYS`（默认 7 个日历天）内直接复用；定时清理只删 `daily_*`/`weekly_*`/`index_daily_*`，不删该文件。`SNAPSHOT_TIME_BUDGET_MIN` 从 60 提到 300 分钟，覆盖 #108/#109 已验证的 150.1/225.6 分钟冷启动；超预算仍放弃快照并回退绝对 PE（显式 warning），不会使用部分横截面。详见[快照持久化说明](docs/snapshot_persistence.md)

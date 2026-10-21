@@ -93,6 +93,24 @@ except ImportError:
     ak = None
     _AK_AVAILABLE = False
 
+# AkShare 通道韧性层（2026-10-21）：共享 keep-alive 连接 + 强制超时 + 通道熔断。
+# run #111/#112/#113 实证：akshare 每个接口内部 requests.get(timeout=None) 且新建
+# Session —— 每只股票一次 TCP/TLS 握手（实测 1.63s/次 → 复用后 0.31s/次），超时缺省时
+# 单次调用可无限挂起（600511 卡 1750s+）。详见 src/akshare_resilience.py。
+if _AK_AVAILABLE:
+    from src.akshare_resilience import ChannelUnavailable  # noqa: E402
+    from src.akshare_resilience import call as _ak_call            # noqa: E402
+    from src.akshare_resilience import configure as _ak_configure  # noqa: E402
+    from src.akshare_resilience import format_summary as _ak_summary  # noqa: E402
+    from src.akshare_resilience import install as _ak_install      # noqa: E402
+    from src.akshare_resilience import reset_channels as _ak_reset_channels  # noqa: E402
+    _ak_install()
+else:  # 未装 akshare 时保持原有 ImportError 语义，调用方不用关心这个分支
+    class ChannelUnavailable(RuntimeError):  # type: ignore[no-redef]
+        """占位：未安装 akshare 时不会有通道调用，仅为让 except 子句语法成立。"""
+
+    _ak_call = _ak_configure = _ak_summary = _ak_install = _ak_reset_channels = None  # type: ignore
+
 _MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(_MODULE_DIR)
 
@@ -831,6 +849,23 @@ class StrategyConfig:
     FETCH_RETRY_BACKOFF_MAX_SEC: float = 8.0
     FETCH_RETRY_JITTER: float = 0.3
 
+    # ===== 数据源主备与卡死股票放弃（2026-10-21）=====
+    # 主数据源顺序："baostock"（默认）或 "akshare"。取 "akshare" 时每次取数先走 AkShare，
+    # 失败再降级 Baostock；可用环境变量 DATA_SOURCE_PRIMARY 覆盖（便于在 Actions 里切换）。
+    # AkShare 作为主源的前提是 src/akshare_resilience.py 的韧性层已生效：
+    # 共享 keep-alive 连接、强制 HTTP 超时、通道熔断（东财 ↔ 新浪）。
+    DATA_SOURCE_PRIMARY: str = "baostock"
+    # 单只股票的取数重试上限：连续失败达到该次数即放弃该股（记 FAIL_DATA 并入否决归因），
+    # 不再让一只卡死的票拖住线程池——run #111 的 600511 卡住 30 分钟直到整条 job 被取消。
+    STOCK_MAX_ATTEMPTS: int = 3
+    # AkShare 接口自带 timeout=None 时必须注入默认超时，否则 socket 可无限挂起
+    # （socket.setdefaulttimeout 对 requests 无效）。
+    AK_HTTP_TIMEOUT_SEC: float = 20.0
+    # 通道熔断：同一通道连续失败达到阈值后，冷却期内跳过该通道直接用备用通道。
+    # 3 次 ≈ 3 只连续失败即判定东财不可用；120 秒足够其恢复，又不至于整轮都错过。
+    AK_CHANNEL_FAIL_THRESHOLD: int = 3
+    AK_CHANNEL_COOLDOWN_SEC: float = 120.0
+
     FILTER_ST: bool = True
     EXCLUDE_DELISTING: bool = True
     EXCLUDE_BSE: bool = True
@@ -884,6 +919,10 @@ class StrategyConfig:
         legacy = self.QV_BEAR_TIMING_GATE
         if legacy is not None:
             object.__setattr__(self, "QV_STABILIZATION_GATE", bool(legacy))
+        # 环境变量覆盖：Actions 里用 repo variable / env 切换主数据源，不必改代码。
+        env_primary = (os.environ.get("DATA_SOURCE_PRIMARY") or "").strip().lower()
+        if env_primary:
+            object.__setattr__(self, "DATA_SOURCE_PRIMARY", env_primary)
         self._validate_score_weights()
         self._validate_recommendation_config()
 
@@ -915,6 +954,16 @@ class StrategyConfig:
         jitter = float(getattr(self, "FETCH_RETRY_JITTER"))
         if not np.isfinite(jitter) or not 0 <= jitter <= 1:
             raise ValueError("FETCH_RETRY_JITTER must be finite and between 0 and 1")
+        if str(self.DATA_SOURCE_PRIMARY).lower() not in {"baostock", "akshare"}:
+            raise ValueError("DATA_SOURCE_PRIMARY must be baostock or akshare")
+        for name in ("STOCK_MAX_ATTEMPTS", "AK_CHANNEL_FAIL_THRESHOLD"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"{name} must be a positive integer")
+        for name in ("AK_HTTP_TIMEOUT_SEC", "AK_CHANNEL_COOLDOWN_SEC"):
+            value = float(getattr(self, name))
+            if not np.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be finite and nonnegative")
         for name in ("HISTORICAL_VALUATION_PERCENTILE_MAX", "HISTORICAL_VALUATION_WEIGHT"):
             value = float(getattr(self, name))
             if not np.isfinite(value) or not 0 <= value <= 1:
@@ -1098,6 +1147,10 @@ def is_data_degraded() -> bool:
     "数据降级导致的零推荐"会被误读为"今天没有好票"。run.py / run_breakout.py 据此在
     日志与飞书无信号卡片上明示数据状态。仅读全局状态，无副作用、可在任意时刻调用。
     """
+    if _primary_is_akshare():
+        # 主源是 AkShare 时，bs_ok=0 是正常现象，不能用旧判据（会被误报为降级）：
+        # 只有主源全程零命中且确实有失败，才算降级。
+        return fetch_stats.get("ak_ok", 0) == 0 and fetch_stats.get("fail", 0) > 0
     if _bs_state.get("circuit_open"):
         return True
     # 主源全程未命中、却有 AkShare 兜底命中 → 等价于降级（即使未触发熔断阈值）
@@ -1191,24 +1244,42 @@ def latest_completed_trade_day(config: StrategyConfig, cache: Optional[CacheMana
     stored = _read_cache_json(path) if path and _cache_fresh(path, 1) else None
     if stored and stored.get("through") == str(now.date()):
         rows = stored.get("rows")
-    if rows is None and _bs_available():
+    def _calendar_from_bs():
+        if not _bs_available():
+            return None
         try:
             with bs_lock:
-                rs = bs.query_trade_dates(start_date=(now - timedelta(days=45)).strftime(_DATE_FMT), end_date=now.strftime(_DATE_FMT))
+                rs = bs.query_trade_dates(start_date=(now - timedelta(days=45)).strftime(_DATE_FMT),
+                                          end_date=now.strftime(_DATE_FMT))
             if rs.error_code == "0":
-                rows = rs.get_data().to_dict("records")
+                return rs.get_data().to_dict("records")
         except Exception as exc:
             logger.warning("交易日历主源失败: %s", exc)
-    if rows is None and _AK_AVAILABLE:
+        return None
+
+    def _calendar_from_ak():
+        if not _AK_AVAILABLE:
+            return None
         try:
-            raw = ak.tool_trade_date_hist_sina()
+            raw = _ak_call("sina", lambda: ak.tool_trade_date_hist_sina(), "ak_calendar",
+                           retries=1, config=config)
             trading = set(pd.to_datetime(raw["trade_date"], errors="coerce").dropna().dt.strftime(_DATE_FMT))
             # Provider's dated historical calendar must actually cover the requested date.
             if trading and max(trading) >= now.strftime(_DATE_FMT):
-                rows = [{"calendar_date": d.strftime(_DATE_FMT), "is_trading_day": "1" if d.strftime(_DATE_FMT) in trading else "0"}
+                return [{"calendar_date": d.strftime(_DATE_FMT), "is_trading_day": "1" if d.strftime(_DATE_FMT) in trading else "0"}
                         for d in pd.date_range(now.date() - timedelta(days=45), now.date())]
         except Exception as exc:
             logger.warning("交易日历备用源失败: %s", exc)
+        return None
+
+    if rows is None:
+        # 主源优先：AkShare 为主源时不再先试 Baostock（会先付一次登录成本再失败）。
+        sources = ([_calendar_from_ak, _calendar_from_bs] if _primary_is_akshare(config)
+                   else [_calendar_from_bs, _calendar_from_ak])
+        for source in sources:
+            rows = source()
+            if rows:
+                break
     day = latest_completed_day(rows, now)
     if day is not None:
         if path: _write_cache_json({"through": str(now.date()), "rows": rows}, path)
@@ -1731,11 +1802,13 @@ def _ak_sina_symbol(code: str) -> str:
 
 def _fetch_daily_ak_sina(code: str, days: int, config: StrategyConfig) -> Optional[pd.DataFrame]:
     """新浪通道兜底：东财接口不可达时使用。返回全量历史需截窗；无 pct_chg 列，用收盘价自算。"""
+    if not _AK_AVAILABLE: return None
     symbol = _ak_sina_symbol(code)
-    raw = _fetch_with_retry(
-        lambda: ak.stock_zh_a_daily(symbol=symbol, adjust=config.ADJUST),
-        config.MAX_RETRY, f"ak_sina({symbol})", config=config
-    )
+    try:
+        raw = _ak_call("sina", lambda: ak.stock_zh_a_daily(symbol=symbol, adjust=config.ADJUST),
+                       f"ak_sina({symbol})", retries=config.MAX_RETRY, config=config)
+    except ChannelUnavailable:
+        return None
     if raw is None or raw.empty or "date" not in raw.columns or "close" not in raw.columns: return None
     keep = [c for c in ("date", "open", "high", "low", "close", "volume", "amount", "turnover") if c in raw.columns]
     df = raw[keep].copy()
@@ -1759,15 +1832,21 @@ def _fetch_daily_ak(code: str, days: int = 120, config: Optional[StrategyConfig]
         if _cache_fresh_today(path):
             if (cached := _read_cache_csv(path)) is not None: return cached
     start, end = _window_dates(days, "days")
-    # 通道 1：东方财富
-    raw = _fetch_with_retry(
-        lambda: ak.stock_zh_a_hist(symbol=symbol, period="daily",
-                                   start_date=start.replace("-", ""), end_date=end.replace("-", ""),
-                                   adjust=config.ADJUST),
-        config.MAX_RETRY, f"ak_hist({symbol})", config=config
-    )
-    df = _normalize_ak_hist(raw)
-    # 通道 2：新浪（东财不可达时兜底）
+    # 通道 1：东方财富。通道熔断中直接抛 ChannelUnavailable → 立刻走新浪，
+    # 不再对判死的通道逐只重试（run #109/#111 的「一直重连」就是这里放大的）。
+    df = None
+    try:
+        raw = _ak_call(
+            "eastmoney",
+            lambda: ak.stock_zh_a_hist(symbol=symbol, period="daily",
+                                       start_date=start.replace("-", ""), end_date=end.replace("-", ""),
+                                       adjust=config.ADJUST),
+            f"ak_hist({symbol})", retries=config.MAX_RETRY, config=config,
+        )
+        df = _normalize_ak_hist(raw)
+    except ChannelUnavailable:
+        df = None
+    # 通道 2：新浪（东财不可达/熔断时兜底）
     if df is None:
         df = _fetch_daily_ak_sina(code, days, config)
     if df is not None and path: _write_cache_csv(df, path)
@@ -1781,10 +1860,13 @@ def _fetch_index_daily_ak(symbol: str, config: StrategyConfig) -> Optional[pd.Da
         path = _cache_path(config, f"index_daily_{ak_symbol}.csv")
         if _cache_fresh_today(path):
             if (cached := _read_cache_csv(path)) is not None: return cached
-    raw = _fetch_with_retry(
-        lambda: ak.stock_zh_index_daily(symbol=ak_symbol),
-        config.MAX_RETRY, f"ak_index({ak_symbol})", retry_on_empty=True, config=config
-    )
+    raw = None
+    try:
+        raw = _ak_call("sina", lambda: ak.stock_zh_index_daily(symbol=ak_symbol),
+                       f"ak_index({ak_symbol})", retries=config.MAX_RETRY,
+                       retry_on_empty=True, config=config)
+    except ChannelUnavailable:
+        raw = None
     if raw is None or "date" not in raw.columns or "close" not in raw.columns: return None
     df = raw.copy()
     df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.strftime(_DATE_FMT)
@@ -1818,7 +1900,15 @@ def _fetch_fundamentals_ak(code: str, config: Optional[StrategyConfig] = None) -
         "report_period": None,
     }
 
-    df_fin = _fetch_with_retry(lambda: ak.stock_financial_analysis_indicator(symbol=symbol, start_year=config.FUND_START_YEAR), config.MAX_RETRY, f"ak_fund({symbol})", config=config)
+    def _fund_call(channel_name: str, fetcher, label: str):
+        """基本面走通道熔断：熔断中直接返回 None，不再逐只重试。"""
+        try:
+            return _ak_call(channel_name, fetcher, label, retries=config.MAX_RETRY, config=config)
+        except ChannelUnavailable:
+            return None
+
+    df_fin = _fund_call("sina", lambda: ak.stock_financial_analysis_indicator(
+        symbol=symbol, start_year=config.FUND_START_YEAR), f"ak_fund({symbol})")
     if df_fin is not None and not df_fin.empty:
         # 显式按日期列取最大报告期，不假定接口返回顺序
         date_col = next((c for c in df_fin.columns if "日期" in str(c) or "报告期" in str(c)), None)
@@ -1842,7 +1932,7 @@ def _fetch_fundamentals_ak(code: str, config: Optional[StrategyConfig] = None) -
             if pd.notna(report_dt) and (result["roe"] is not None or result["debt_ratio"] is not None):
                 result["report_period"] = f"{int(report_dt.year)}Q{report_quarter}"
 
-    df_bs = _fetch_with_retry(lambda: ak.stock_balance_sheet_by_report_em(symbol=symbol), config.MAX_RETRY, f"ak_bs({symbol})", config=config)
+    df_bs = _fund_call("eastmoney", lambda: ak.stock_balance_sheet_by_report_em(symbol=symbol), f"ak_bs({symbol})")
     if df_bs is not None and not df_bs.empty:
         row = df_bs.iloc[0]
         goodwill, net_assets = 0.0, 0.0
@@ -1855,7 +1945,7 @@ def _fetch_fundamentals_ak(code: str, config: Optional[StrategyConfig] = None) -
                 if not pd.isna(val) and val > 0: net_assets = float(val)
         if net_assets > 0: result["goodwill_ratio"] = goodwill / net_assets * 100
 
-    df_income = _fetch_with_retry(lambda: ak.stock_profit_sheet_by_report_em(symbol=symbol), config.MAX_RETRY, f"ak_income({symbol})", config=config)
+    df_income = _fund_call("eastmoney", lambda: ak.stock_profit_sheet_by_report_em(symbol=symbol), f"ak_income({symbol})")
     if df_income is not None and not df_income.empty:
         row = df_income.iloc[0]
         net_profit, deducted_profit = 0.0, 0.0
@@ -1886,7 +1976,12 @@ def _fetch_stock_pool_ak(config: Optional[StrategyConfig] = None) -> list[dict]:
             df = _read_cache_csv(path, dtype={"code": str, "name": str})
             if df is not None and ("code" not in df.columns or "name" not in df.columns): df = None
     if df is None:
-        raw = _fetch_with_retry(lambda: ak.stock_info_a_code_name(), config.LIST_MAX_RETRY, "ak_stock_info", retry_on_empty=True, config=config)
+        try:
+            raw = _ak_call("eastmoney", lambda: ak.stock_info_a_code_name(),
+                           "ak_stock_info", retries=config.LIST_MAX_RETRY,
+                           retry_on_empty=True, config=config)
+        except ChannelUnavailable:
+            raw = None
         if raw is None or "code" not in raw.columns or "name" not in raw.columns: return []
         df = raw[["code", "name"]].copy()
         df["code"] = df["code"].astype(str).str.zfill(6)
@@ -1896,57 +1991,118 @@ def _fetch_stock_pool_ak(config: Optional[StrategyConfig] = None) -> list[dict]:
 
 
 # ===========================================================================
-# 主备数据源路由（Baostock 优先，失败/熔断自动降级 AkShare）
+# 主备数据源路由（默认 Baostock 优先；DATA_SOURCE_PRIMARY=akshare 时反之）
 # ===========================================================================
 
+# 本次运行实际生效的主数据源。main() 按 config/env 设定；模块级函数（如
+# is_data_degraded）读它判断"谁是主源"，避免把 AkShare 主源下的 bs_ok=0 误判为降级。
+_PRIMARY_SOURCE = "baostock"
+
+
+def _primary_is_akshare(config: Optional[StrategyConfig] = None) -> bool:
+    """本次运行是否以 AkShare 为主数据源（传入 config 时以 config 为准）。"""
+    if config is not None:
+        primary = str(getattr(config, "DATA_SOURCE_PRIMARY", "baostock") or "baostock")
+    else:
+        primary = _PRIMARY_SOURCE
+    return primary.lower() == "akshare" and _AK_AVAILABLE
+
+
 def _fetch_daily_dual(code: str, days: int, config: StrategyConfig) -> Optional[pd.DataFrame]:
-    df = None
-    if _bs_available():
-        df = _fetch_daily_bs(code, days=days, config=config)
-        if df is not None:
-            fetch_stats["bs_ok"] += 1
-    if df is None:
+    def _try_ak() -> Optional[pd.DataFrame]:
         df = _fetch_daily_ak(code, days=days, config=config)
         if df is not None:
             fetch_stats["ak_ok"] += 1
-        else:
-            fetch_stats["fail"] += 1
+        return df
+
+    def _try_bs() -> Optional[pd.DataFrame]:
+        df = _fetch_daily_bs(code, days=days, config=config)
+        if df is not None:
+            fetch_stats["bs_ok"] += 1
+        return df
+
+    df = None
+    if _primary_is_akshare(config):
+        df = _try_ak()
+        if df is None and _bs_available():
+            df = _try_bs()
+    else:
+        if _bs_available():
+            df = _try_bs()
+        if df is None and _AK_AVAILABLE:
+            df = _try_ak()
+    if df is None:
+        fetch_stats["fail"] += 1
     # 磁盘缓存命中路径（_read_cache_csv）不经过 _normalize_*，旧世代缓存里存的仍是
     # 数据源原始 pct_chg。在出口统一重算，使口径与缓存写入时间无关。
     return _recompute_pct_chg(df)
 
+
 def _fetch_weekly_dual(code: str, config: StrategyConfig) -> Optional[pd.DataFrame]:
-    """周线双源拉取（仅决赛圈周线趋势确认使用）：Baostock 优先，失败降级 AkShare"""
-    df = None
-    if _bs_available():
-        df = _fetch_weekly_bs(code, weeks=config.WEEKLY_BARS, config=config)
-    if df is None and _AK_AVAILABLE:
+    """周线双源拉取（仅决赛圈周线趋势确认使用）：主源优先，失败降级另一源。"""
+    def _try_ak() -> Optional[pd.DataFrame]:
+        if not _AK_AVAILABLE:
+            return None
         symbol = _ak_symbol(code)
         start = (_beijing_now() - timedelta(weeks=config.WEEKLY_BARS)).strftime("%Y%m%d")
         end = _beijing_now().strftime("%Y%m%d")
-        raw = _fetch_with_retry(
-            lambda: ak.stock_zh_a_hist(symbol=symbol, period="weekly", start_date=start, end_date=end, adjust=config.ADJUST),
-            config.MAX_RETRY, f"ak_weekly({symbol})", config=config
+        raw = _ak_call(
+            "eastmoney",
+            lambda: ak.stock_zh_a_hist(symbol=symbol, period="weekly", start_date=start,
+                                       end_date=end, adjust=config.ADJUST),
+            f"ak_weekly({symbol})", retries=config.MAX_RETRY, config=config,
         )
-        df = _normalize_ak_hist(raw)
+        return _normalize_ak_hist(raw)
+
+    df = None
+    if _primary_is_akshare(config):
+        df = _try_ak()
+        if df is None and _bs_available():
+            df = _fetch_weekly_bs(code, weeks=config.WEEKLY_BARS, config=config)
+    else:
+        if _bs_available():
+            df = _fetch_weekly_bs(code, weeks=config.WEEKLY_BARS, config=config)
+        if df is None:
+            df = _try_ak()
     return _recompute_pct_chg(df)   # 同 _fetch_daily_dual：覆盖旧世代磁盘缓存
 
+
 def _fetch_index_daily_dual(symbol: str, config: StrategyConfig) -> Optional[pd.DataFrame]:
+    if _primary_is_akshare(config):
+        df = _fetch_index_daily_ak(symbol, config)
+        if df is not None:
+            return df
+        return _fetch_index_daily_bs(symbol, config) if _bs_available() else df
     if _bs_available():
         df = _fetch_index_daily_bs(symbol, config)
-        if df is not None: return df
+        if df is not None:
+            return df
     return _fetch_index_daily_ak(symbol, config)
 
+
 def _fetch_fundamentals_dual(code: str, config: Optional[StrategyConfig] = None) -> Optional[dict]:
+    if _primary_is_akshare(config):
+        data = _fetch_fundamentals_ak(code, config)
+        if data is not None:
+            return data
+        return _fetch_fundamentals_bs(code, config) if _bs_available() else data
     if _bs_available():
         data = _fetch_fundamentals_bs(code, config)
-        if data is not None: return data
+        if data is not None:
+            return data
     return _fetch_fundamentals_ak(code, config)
 
+
 def _fetch_stock_pool_dual(config: StrategyConfig) -> list[dict]:
+    if _primary_is_akshare(config):
+        stocks = _fetch_stock_pool_ak(config)
+        if stocks:
+            return stocks
+        return _fetch_stock_pool_bs(config) if _bs_available() else stocks
     if _bs_available():
         stocks = _fetch_stock_pool_bs(config)
-        if stocks: return stocks
+        if stocks:
+            return stocks
     return _fetch_stock_pool_ak(config)
 
 
@@ -5154,6 +5310,8 @@ def run_concurrent_screen(
       仍无心跳——此时"开始并发筛选"与"进度: N/N (100%)"已足够 bracket 整段。
     - 时间预算：超过 SCREEN_TIME_BUDGET_MIN 取消未完成任务，按已完成结果出报告，
       漏斗统计按 processed 计（预算截断时不失真）。
+    - 单票放弃：每只股票最多尝试 STOCK_MAX_ATTEMPTS（默认 3）次，连续失败即返回
+      (None, "FAIL_DATA") 而不是让异常冒泡——一只卡死的票不该带走整轮结论。
     - 进度日志：每 PROGRESS_LOG_EVERY 只打印一次进度与 ETA。
 
     返回 (results, processed, time_budget_hit)：results 为已完成任务的
@@ -5168,9 +5326,44 @@ def run_concurrent_screen(
     watchdog_idle_warn = float(getattr(config, "WATCHDOG_IDLE_WARN_SEC", 240.0))
     progress = {"done": 0, "t": screen_start}
     stop_watch = threading.Event()
+    started_at: dict[str, float] = {}
+    giveup = {"count": 0, "codes": []}
+    giveup_lock = threading.Lock()
+    max_attempts = max(1, int(getattr(config, "STOCK_MAX_ATTEMPTS", 3) or 1))
+
+    def _screen_with_retry(stock: dict) -> tuple:
+        """单只股票最多尝试 STOCK_MAX_ATTEMPTS 次，连续失败即放弃该股（记 FAIL_DATA）。
+
+        run #111 实证：一只卡死的票（600511）占住 1 个线程 30 分钟，整条 job 被取消，
+        全池结果一起丢失。放弃单只票的代价远小于放弃整轮；日线取数失败与非选中原因
+        （FAIL_DATA）在否决归因里可查，不会假装"看过这只票"。
+        """
+        code = str(stock.get("code", "?"))
+        started_at[code] = time.time()
+        last_error: Optional[BaseException] = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                return screen_one(stock)
+            except Exception as exc:  # noqa: BLE001 - 取数异常一律按失败重试
+                last_error = exc
+                if attempt < max_attempts:
+                    time.sleep(_retry_backoff_seconds(attempt - 1, config))
+        with giveup_lock:
+            giveup["count"] += 1
+            first_ones = giveup["count"] <= 20
+            if first_ones:
+                giveup["codes"].append(code)
+        if first_ones:
+            # 前 20 只逐只 warning（含异常类型），其余只计数：既能定位系统性问题，
+            # 又不会在一次数据源故障里刷出 3000 行日志。
+            log.warning("个股 %s 连续 %d 次失败，放弃（记 FAIL_DATA）：%s: %s",
+                        code, max_attempts, type(last_error).__name__, last_error)
+        else:
+            log.debug("个股 %s 连续 %d 次失败，放弃（记 FAIL_DATA）", code, max_attempts)
+        return None, "FAIL_DATA"
 
     pool = ThreadPoolExecutor(max_workers=config.MAX_WORKERS)
-    futures = {pool.submit(screen_one, s): s for s in stock_list}
+    futures = {pool.submit(_screen_with_retry, s): s for s in stock_list}
 
     def _watchdog() -> None:
         # tick-first：wait(N) 先睡后判，所以首轮心跳在启动后 N 秒触发。
@@ -5179,7 +5372,10 @@ def run_concurrent_screen(
         while not stop_watch.wait(watchdog_tick):
             idle = time.time() - progress["t"]
             if idle >= watchdog_idle_warn:
-                hanging = [futures[f]["code"] for f in futures if not f.done()][:8]
+                pending = [f for f in futures if not f.done()]
+                now = time.time()
+                hanging = ["%s(%.0fs)" % (futures[f].get("code", "?"), now - started_at.get(str(futures[f].get("code", "?")), now))
+                           for f in pending[:8]]
                 log.warning("已 %d 秒无任务完成，疑似数据源卡住：%d/%d 完成，在途代码: %s",
                             int(idle), progress["done"], total, ",".join(hanging) or "-")
             else:
@@ -5212,6 +5408,10 @@ def run_concurrent_screen(
     finally:
         stop_watch.set()
         pool.shutdown(wait=True, cancel_futures=True)
+    if giveup["count"]:
+        log.warning("本次放弃 %d 只连续 %d 次取数失败的个股（记 FAIL_DATA）：%s%s",
+                    giveup["count"], max_attempts, ",".join(giveup["codes"]),
+                    " 等" if giveup["count"] > len(giveup["codes"]) else "")
     return results, processed, time_budget_hit
 
 
@@ -5234,9 +5434,23 @@ def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] 
     fetch_stats["bs_ok"] = fetch_stats["ak_ok"] = fetch_stats["fail"] = 0
 
     # ==========================
-    # 初始化数据源：Baostock 优先，登录失败降级 AkShare
+    # 初始化数据源：按 DATA_SOURCE_PRIMARY 决定主备顺序（默认 Baostock 优先）
     # ==========================
-    if not _bs_login(max_retry=5):
+    global _PRIMARY_SOURCE
+    _PRIMARY_SOURCE = str(getattr(config, "DATA_SOURCE_PRIMARY", "baostock") or "baostock").lower()
+    if _PRIMARY_SOURCE == "akshare" and not _AK_AVAILABLE:
+        logger.warning("DATA_SOURCE_PRIMARY=akshare 但未安装 akshare，本次回退 Baostock")
+        _PRIMARY_SOURCE = "baostock"
+    if _PRIMARY_SOURCE == "akshare":
+        # 配置发出前先设好：默认超时用于所有 AkShare 接口；通道状态按运次重置。
+        if _ak_configure is not None:
+            _ak_configure(config.AK_HTTP_TIMEOUT_SEC)
+        if _ak_reset_channels is not None:
+            _ak_reset_channels()
+        logger.info("数据源: AkShare（主数据源，备用: Baostock；%s）",
+                    "连接复用 + 强制超时 + 通道熔断已启用" if _ak_install is not None else "韧性层不可用")
+        # 主源不预登 Baostock：只有 AkShare 全程失败时才在路由处懒登录，省掉每次 4 秒登录成本。
+    elif not _bs_login(max_retry=5):
         if _AK_AVAILABLE:
             logger.warning("Baostock 登录失败（已重试 5 次），本次运行降级为 AkShare 备用数据源")
             _bs_state["circuit_open"] = True
@@ -5364,6 +5578,8 @@ def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] 
                         stats["fail_volatile"])
         logger.info("日线取数来源: Baostock %d 只，AkShare 兜底 %d 只，双源均失败 %d 只",
                     fetch_stats["bs_ok"], fetch_stats["ak_ok"], fetch_stats["fail"])
+        if _AK_AVAILABLE and _ak_summary is not None:
+            logger.info("%s", _ak_summary())
         logger.info("=" * 50)
 
         # 波动率风控否决明细：技术面已过准入分数线、仅 ATR 超限被拦的标的逐只留档。

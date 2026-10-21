@@ -132,6 +132,11 @@ jobs:
           TZ: Asia/Shanghai
           # 关闭 stdout 缓冲：否则 Python 输出按块缓冲，任务超时/取消后缓冲的日志全部丢失
           PYTHONUNBUFFERED: "1"
+          # 主数据源：留空或 baostock = Baostock 优先（默认）；akshare = AkShare 优先。
+          # 在仓库 Settings → Secrets and variables → Actions → Variables 配置
+          # DATA_SOURCE_PRIMARY 即可切换，不必改代码。AkShare 主源依赖
+          # src/akshare_resilience.py（连接复用 + 强制超时 + 通道熔断）。
+          DATA_SOURCE_PRIMARY: ${{ vars.DATA_SOURCE_PRIMARY }}
           # 定时任务【使用】磁盘缓存（不再强制 --no-cache）：这是共享当日行情的前提 ——
           # 优质低估低位必须把当天日线/基本面写进 cache/，同一 runner 上的突破步骤才能零重拉复用。
           # 定时运行「必须基于当日最新行情」这一正确性要求，由上面的 Purge restored quote
