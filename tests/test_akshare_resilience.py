@@ -208,6 +208,7 @@ class PrimarySourceRoutingTests(unittest.TestCase):
         cfg.USE_CACHE = False
         cfg.AK_CHANNEL_FAIL_THRESHOLD = 1
         with patch.object(m, "ak", Mock(stock_zh_a_daily=Mock(return_value=_sina_frame()))) as fake_ak, \
+             patch.object(m, "_fetch_valuation_ak", return_value=None), \
              patch.object(res.time, "sleep"):
             res.reset_channels()
             res.record_failure("eastmoney", threshold=1, cooldown_sec=60)
@@ -216,6 +217,92 @@ class PrimarySourceRoutingTests(unittest.TestCase):
         fake_ak.stock_zh_a_hist.assert_not_called()
         fake_ak.stock_zh_a_daily.assert_called_once()
         res.reset_channels()
+
+
+def _valuation_frame(dates, pe=10.0, pb=1.5):
+    return pd.DataFrame({"date": list(dates), "peTTM": [pe] * len(dates), "pbMRQ": [pb] * len(dates)})
+
+
+class ValuationChannelTests(unittest.TestCase):
+    """AkShare 日线补估值（百度 TTM）：让 AkShare 主源不再因缺 peTTM 而全员 pending。"""
+
+    def setUp(self):
+        res.reset_channels()
+        self.cfg = StrategyConfig()
+        self.cfg.USE_CACHE = False
+
+    def _daily(self, dates):
+        return pd.DataFrame({"date": list(dates), "close": [10.0] * len(dates), "pct_chg": [0.0] * len(dates)})
+
+    def test_merges_pe_pb_by_date(self):
+        with patch.object(m, "_fetch_valuation_ak",
+                          return_value=_valuation_frame(["2026-10-19", "2026-10-20"])):
+            out = m._attach_ak_valuation("600000", self._daily(["2026-10-19", "2026-10-20"]), self.cfg)
+        self.assertEqual(list(out["peTTM"]), [10.0, 10.0])
+        self.assertEqual(list(out["pbMRQ"]), [1.5, 1.5])
+        self.assertEqual(list(out["val_carried"]), [False, False])
+
+    def test_carries_previous_valuation_for_last_bar(self):
+        daily = self._daily(["2026-10-19", "2026-10-20", "2026-10-21"])
+        with patch.object(m, "_fetch_valuation_ak",
+                          return_value=_valuation_frame(["2026-10-19", "2026-10-20"])), \
+             patch.object(m, "_valuation_carry", {"count": 0}), \
+             patch.object(m, "_valuation_carry_lock", __import__("threading").Lock()):
+            out = m._attach_ak_valuation("600000", daily, self.cfg)
+        self.assertEqual(list(out["peTTM"]), [10.0, 10.0, 10.0])
+        self.assertTrue(bool(out["val_carried"].iloc[-1]))
+        self.assertFalse(bool(out["val_carried"].iloc[-2]))
+
+    def test_no_carry_beyond_limit(self):
+        daily = self._daily(["2026-10-19", "2026-10-26"])
+        with patch.object(m, "_fetch_valuation_ak", return_value=_valuation_frame(["2026-10-19"])):
+            out = m._attach_ak_valuation("600000", daily, self.cfg)
+        self.assertFalse(bool(out["val_carried"].iloc[-1]))
+        self.assertTrue(pd.isna(out["peTTM"].iloc[-1]), "超过顺延上限必须保留缺项，不能拿过期估值放行")
+
+    def test_missing_channel_still_adds_empty_columns(self):
+        with patch.object(m, "_fetch_valuation_ak", return_value=None):
+            out = m._attach_ak_valuation("600000", self._daily(["2026-10-20"]), self.cfg)
+        self.assertIn("peTTM", out.columns)
+        self.assertIn("pbMRQ", out.columns)
+        self.assertTrue(pd.isna(out["peTTM"].iloc[-1]))
+
+    def test_valuation_channel_unavailable_returns_none(self):
+        res.record_failure("baidu", threshold=1, cooldown_sec=60)
+        with patch.object(m, "ak", Mock()):
+            self.assertIsNone(m._fetch_valuation_ak("600000", self.cfg))
+        res.reset_channels()
+
+    def test_cache_without_valuation_is_treated_as_miss(self):
+        import shutil
+        from pathlib import Path
+
+        tmp = Path(".test-artifacts") / "cache_valuation_case"
+        shutil.rmtree(tmp, ignore_errors=True)
+        tmp.mkdir(parents=True, exist_ok=True)
+        try:
+            cfg = StrategyConfig()
+            cfg.CACHE_DIR = str(tmp)
+            cfg.USE_CACHE = True
+            # 末 bar 必须是"今天"，否则 meta 校验会判旧缓存（quote_cache_valid），命中不了缓存
+            idx = pd.date_range(end=m._beijing_now().date(), periods=40, freq="D")
+            hist = _hist_frame(40).assign(日期=[d.strftime("%Y-%m-%d") for d in idx])
+            fake = Mock(stock_zh_a_hist=Mock(return_value=hist))
+            with patch.object(m, "ak", fake), \
+                 patch.object(m, "_fetch_valuation_ak", return_value=_valuation_frame(hist["日期"])):
+                first = m._fetch_daily_ak("600000", days=30, config=cfg)
+                self.assertIn("peTTM", first.columns)
+                m._fetch_daily_ak("600000", days=30, config=cfg)
+            self.assertEqual(fake.stock_zh_a_hist.call_count, 1, "当日缓存应直接命中")
+            # 模拟估值列接入前写下的旧缓存：没有 peTTM 时必须重新取数
+            cached = [p for p in tmp.iterdir() if p.suffix == ".csv"][0]
+            pd.DataFrame({"date": hist["日期"], "close": [10.0] * len(hist)}).to_csv(cached, index=False)
+            with patch.object(m, "ak", fake), \
+                 patch.object(m, "_fetch_valuation_ak", return_value=_valuation_frame(hist["日期"])):
+                m._fetch_daily_ak("600000", days=30, config=cfg)
+            self.assertEqual(fake.stock_zh_a_hist.call_count, 2)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 if __name__ == "__main__":

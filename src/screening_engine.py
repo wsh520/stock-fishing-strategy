@@ -1775,6 +1775,16 @@ _AK_COLUMN_MAP = {
     "涨跌幅": "pct_chg", "换手率": "turnover",
 }
 _AK_INDEX_NUMERIC_COLS = ("open", "high", "low", "close", "volume")
+# AkShare 日线不含估值列，用百度股市通逐票补 PE(TTM)/PB（口径与 Baostock peTTM/pbMRQ 一致）。
+# 近三年约 730 个样本，覆盖 HISTORICAL_VALUATION_LOOKBACK=250 且远高于最小样本 120。
+_AK_VALUATION_INDICATORS = (("市盈率(TTM)", "peTTM"), ("市净率", "pbMRQ"))
+_AK_VALUATION_PERIOD = "近三年"
+# 估值顺延上限（自然日）：百度 TTM 晚于东财行情一个交易日是常态，超过 3 天说明通道异常，
+# 不再顺延，让估值闸门按缺项处理（宁可 pending，也不用过期估值放行）。
+_AK_VALUATION_CARRY_DAYS = 3
+_valuation_carry = {"count": 0}
+_valuation_missing = {"count": 0}
+_valuation_carry_lock = threading.Lock()
 
 def _ak_symbol(code: str) -> str:
     """转为 AkShare 6 位数字代码（如 sh.600000 / 600000 -> 600000）"""
@@ -1821,16 +1831,100 @@ def _fetch_daily_ak_sina(code: str, days: int, config: StrategyConfig) -> Option
     df = df.tail(days + 30).reset_index(drop=True)
     return df if not df.empty else None
 
+def _fetch_valuation_ak(code: str, config: StrategyConfig) -> Optional[pd.DataFrame]:
+    """AkShare 估值通道：百度股市通逐票历史 PE(TTM)/PB，补上 AkShare 日线缺的估值列。
+
+    口径：`市盈率(TTM)` 与 Baostock 的 peTTM 同为滚动市盈率（实测 600000：百度 6.35 vs
+    Baostock 6.345084、PB 0.43 vs 0.431204，差异仅来自百度保留两位小数），可直接用于
+    绝对阈值闸门（MAX_PE_TTM/MAX_PB_MRQ）、自身历史分位（HISTORICAL_VALUATION_*，
+    需要 ≥120 个样本）与行业估值快照（只用末 bar）。
+
+    为什么不是 stock_a_indicator_lg：本环境 akshare 1.18 已无该接口（AttributeError）；
+    百度通道实测 0.66~0.73s/指标、返回 365 天序列，是当前可用的 TTM 历史源。
+    """
+    if not _AK_AVAILABLE: return None
+    symbol = _ak_symbol(code)
+    parts: list[pd.DataFrame] = []
+    for indicator, column in _AK_VALUATION_INDICATORS:
+        try:
+            raw = _ak_call(
+                "baidu",
+                lambda ind=indicator: ak.stock_zh_valuation_baidu(
+                    symbol=symbol, indicator=ind, period=_AK_VALUATION_PERIOD),
+                f"ak_val({symbol},{column})", retries=config.MAX_RETRY,
+                retry_on_empty=True, config=config,
+            )
+        except ChannelUnavailable:
+            return None
+        if raw is None or raw.empty or "date" not in raw.columns or "value" not in raw.columns:
+            continue
+        part = raw[["date", "value"]].copy()
+        part["date"] = pd.to_datetime(part["date"], errors="coerce").dt.strftime(_DATE_FMT)
+        part[column] = pd.to_numeric(part["value"], errors="coerce")
+        part = part.drop(columns=["value"]).dropna(subset=["date"]).drop_duplicates("date")
+        if part[column].notna().any():
+            parts.append(part)
+    if not parts:
+        return None
+    merged = parts[0]
+    for part in parts[1:]:
+        merged = merged.merge(part, on="date", how="outer")
+    for column in ("peTTM", "pbMRQ"):
+        if column not in merged.columns:
+            merged[column] = np.nan
+    return merged.sort_values("date").reset_index(drop=True)
+
+
+def _attach_ak_valuation(code: str, df: pd.DataFrame, config: StrategyConfig) -> pd.DataFrame:
+    """把估值列并入 AkShare 日线；取不到就原样返回（上层按缺项处理，不伪造已核验）。
+
+    末 bar 缺估值时做**有界顺延**：百度 TTM 通常比东财行情晚一个交易日发布（16:10 实测
+    东财已有 2026-10-21 收盘 bar、百度最新只有 2026-10-20），而 21:00 正式跑时两者都已
+    更新。顺延只在「最近有效估值距末 bar ≤ AK_VALUATION_CARRY_DAYS 个自然日」时生效，
+    并逐票记 val_carried=True + 汇总计数——绝不静默。PE/PB 的日变化等于当日价格涨跌，
+    对 MAX_PE_TTM=25 / MAX_PB_MRQ=3 这类远离边界的阈值没有实质影响。
+    """
+    if df is None or df.empty or "date" not in df.columns:
+        return df
+    if "peTTM" in df.columns and "pbMRQ" in df.columns:
+        return df
+    valuation = _fetch_valuation_ak(code, config)
+    if valuation is None or valuation.empty:
+        # 估值通道不可用也补空列：缓存里带列名才算"已尝试过"，否则每次调用都会因
+        # 「缓存缺 peTTM」重新拉一遍日线（百度熔断期间会放大成成倍的东财请求）。
+        df = df.copy()
+        df["peTTM"], df["pbMRQ"], df["val_carried"] = np.nan, np.nan, False
+        with _valuation_carry_lock:
+            _valuation_missing["count"] += 1
+        return df
+    merged = df.merge(valuation, on="date", how="left")
+    merged["val_carried"] = False
+    last_idx = merged.index[-1]
+    if pd.isna(merged.at[last_idx, "peTTM"]):
+        valued = merged.loc[merged["peTTM"].notna()]
+        if not valued.empty:
+            gap = pd.to_datetime(merged.at[last_idx, "date"]) - pd.to_datetime(valued["date"].iloc[-1])
+            if pd.notna(gap) and 0 <= gap.days <= _AK_VALUATION_CARRY_DAYS:
+                merged.loc[last_idx, ["peTTM", "pbMRQ"]] = valued.iloc[-1][["peTTM", "pbMRQ"]].values
+                merged.at[last_idx, "val_carried"] = True
+                with _valuation_carry_lock:
+                    _valuation_carry["count"] += 1
+    return merged
+
+
 def _fetch_daily_ak(code: str, days: int = 120, config: Optional[StrategyConfig] = None) -> Optional[pd.DataFrame]:
     if not _AK_AVAILABLE: return None
     config = config or StrategyConfig()
     symbol = _ak_symbol(code)
     path = ""
     if config.USE_CACHE:
-        # 纯数字命名，与 Baostock 缓存（带 sh. 前缀）天然隔离
+        # 纯数字命名，与 Baostock 缓存（带 sh. 前缀）天然隔离。
+        # 无 peTTM 的旧缓存（估值列接入前写入）视为未命中：否则当天会一直拿到缺估值的
+        # 缓存，估值闸门永远记缺项、候选永远 pending。
         path = _cache_path(config, _window_cache_name("daily", symbol, days, config))
         if _cache_fresh_today(path):
-            if (cached := _read_cache_csv(path)) is not None: return cached
+            if (cached := _read_cache_csv(path)) is not None and "peTTM" in cached.columns:
+                return cached
     start, end = _window_dates(days, "days")
     # 通道 1：东方财富。通道熔断中直接抛 ChannelUnavailable → 立刻走新浪，
     # 不再对判死的通道逐只重试（run #109/#111 的「一直重连」就是这里放大的）。
@@ -1849,6 +1943,9 @@ def _fetch_daily_ak(code: str, days: int = 120, config: Optional[StrategyConfig]
     # 通道 2：新浪（东财不可达/熔断时兜底）
     if df is None:
         df = _fetch_daily_ak_sina(code, days, config)
+    # 通道 3：估值（东财/新浪日线都不带 peTTM/pbMRQ，缺了它估值闸门只能记缺项）
+    if df is not None:
+        df = _attach_ak_valuation(code, df, config)
     if df is not None and path: _write_cache_csv(df, path)
     return df
 
@@ -5432,6 +5529,9 @@ def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] 
     if cache is None: cache = CacheManager(expire_hours=config.CACHE_EXPIRE_HOURS)
 
     fetch_stats["bs_ok"] = fetch_stats["ak_ok"] = fetch_stats["fail"] = 0
+    with _valuation_carry_lock:
+        _valuation_carry["count"] = 0
+        _valuation_missing["count"] = 0
 
     # ==========================
     # 初始化数据源：按 DATA_SOURCE_PRIMARY 决定主备顺序（默认 Baostock 优先）
@@ -5576,8 +5676,9 @@ def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] 
         if stats["fail_volatile"] > 0:
             logger.info("   其中 %d 只仅因波动率超限被否决（技术面已达准入线），明细见下方 [VOLATILE] 区块",
                         stats["fail_volatile"])
-        logger.info("日线取数来源: Baostock %d 只，AkShare 兜底 %d 只，双源均失败 %d 只",
-                    fetch_stats["bs_ok"], fetch_stats["ak_ok"], fetch_stats["fail"])
+        logger.info("日线取数来源: Baostock %d 只，AkShare 兜底 %d 只，双源均失败 %d 只，估值顺延 %d 只，估值缺项 %d 只",
+                    fetch_stats["bs_ok"], fetch_stats["ak_ok"], fetch_stats["fail"],
+                    _valuation_carry["count"], _valuation_missing["count"])
         if _AK_AVAILABLE and _ak_summary is not None:
             logger.info("%s", _ak_summary())
         logger.info("=" * 50)

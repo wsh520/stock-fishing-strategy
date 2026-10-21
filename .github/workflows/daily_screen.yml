@@ -149,7 +149,7 @@ jobs:
           echo "DATA_SOURCE_PRIMARY=${PRIMARY}" >> "$GITHUB_ENV"
           echo "::notice::主数据源=${PRIMARY}（来源：${SOURCE}）"
           if [ "${PRIMARY}" = "akshare" ]; then
-            echo "::warning::AkShare 主源目前只用于连接层试跑：akshare 日线不含 peTTM/pbMRQ，估值闸门会记缺项、候选转 pending，正式推荐可能为 0"
+            echo "::notice::AkShare 主源：PE(TTM)/PB 由百度估值通道补齐（末 bar 缺失时顺延上一交易日，上限 3 天），日线+估值实测约 0.49s/只"
           fi
 
       - name: Run bottom-fishing strategy
