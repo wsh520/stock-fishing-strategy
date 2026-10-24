@@ -171,6 +171,70 @@ class RecommendationDisplayTests(unittest.TestCase):
         self.assertIn("非自动交易指令", text)
         self.assertNotIn("止损参考带", text)
 
+    def test_trade_plan_has_execution_rules_and_review_nodes(self):
+        from src.screening_engine import describe_trade_plan
+        text = "\n".join(describe_trade_plan(dict(close=10., stop_loss=8.5, take_profit=13.,
+                                                  rr_ratio=2., atr14=0.3, quality_score=70.)))
+        self.assertIn("执行规则：次日开盘落在区间内按计划执行", text)
+        self.assertIn("高于上沿视为追高、放弃本轮", text)
+        self.assertIn("低于下沿", text)
+        self.assertIn("按失效重估", text)
+        self.assertIn("复核节点：买入后第 5/10/15/20/40/60 个交易日", text)
+        self.assertIn("止跌或经营证据反转时立即重估", text)
+
+    def test_position_hint_tiers_by_atr_pct(self):
+        from src.screening_engine import _position_hint, StrategyConfig
+        cfg = StrategyConfig()
+        low = _position_hint(0.30, 10., cfg)   # ATR 3.0% → 低波档
+        mid = _position_hint(0.40, 10., cfg)   # ATR 4.0% → 中波档
+        high = _position_hint(0.55, 10., cfg)  # ATR 5.5% → 观察档
+        self.assertIn("低波档", low)
+        self.assertIn("标准仓", low)
+        self.assertIn("中波档", mid)
+        self.assertIn("降半档", mid)
+        self.assertIn("观察档", high)
+        self.assertIn("风控上限", high)
+        self.assertEqual("", _position_hint(None, 10., cfg))
+        self.assertEqual("", _position_hint(0.3, 0., cfg))
+        self.assertEqual("", _position_hint(0.0, 10., cfg))
+
+    def test_observation_lines_render_only_with_evidence_fields(self):
+        from src.screening_engine import _observation_lines
+        strong = "\n".join(_observation_lines(dict(stabilization_level="strong",
+                                                   operating_status="verified",
+                                                   bottom_structure=True)))
+        self.assertIn("**继续持有信号:**", strong)
+        self.assertIn("止跌强确认", strong)
+        self.assertIn("经营证据已核验", strong)
+        self.assertIn("有效底部结构", strong)
+        weak = "\n".join(_observation_lines(dict(stabilization_level="weak",
+                                                 operating_status="weak")))
+        self.assertIn("**减仓离场信号:**", weak)
+        self.assertIn("止跌仅弱确认", weak)
+        self.assertIn("经营走弱", weak)
+        self.assertNotIn("继续持有信号", weak)
+        self.assertEqual([], _observation_lines(dict(stabilization_level="not_required",
+                                                     operating_status="not_required")))
+        self.assertEqual([], _observation_lines({}))
+
+    def test_quality_card_includes_actionability_blocks(self):
+        row = recommendation(weekly_status="not_required", quality_score=88.,
+                             valuation_score=82., pe_ttm=12., pb_mrq=1.4, position_250=.2,
+                             technical_trend_score=32., technical_momentum_score=24.,
+                             technical_volume_score=18., atr14=0.35,
+                             stabilization_level="medium", operating_status="verified",
+                             bottom_structure=True, operating_summary="经营证据通过")
+        body = self.body(self.payloads([row], strategy="bottom_fishing")[1])
+        for text in ("执行规则", "高于上沿视为追高", "仓位参考", "非投资建议",
+                     "复核节点", "继续持有信号", "止跌中确认"):
+            self.assertIn(text, body)
+
+    def test_legacy_card_unchanged_by_actionability_blocks(self):
+        body = self.body(self.payloads([recommendation()])[1])
+        for text in ("仓位参考", "复核节点", "继续持有信号", "减仓离场信号", "执行规则："):
+            self.assertNotIn(text, body)
+        self.assertIn("高于上沿不追，低于下沿按失效重估", body)
+
 
 if __name__ == "__main__":
     unittest.main()

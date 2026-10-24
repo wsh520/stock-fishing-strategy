@@ -593,6 +593,18 @@ class StrategyConfig:
     # 回 10~20，不随本改动变长；长期 sleeve 维持 30~90（其上限仍长于生产）。
     HOLD_DAYS_HINT_MIN: int = 40
     HOLD_DAYS_HINT_MAX: int = 60
+    # ===== 单票仓位档位提示（2026-10-24，纯展示）=====
+    # 依据：低波异象——RANK_QUALITY_WEIGHT 体系里 RQ_W_LOW_VOL=0.35 的实证是
+    # 「ATR% 越低未来收益越好、止损越不容易被日常波动扫掉」；MAX_ATR_PCT=6%
+    # 已把高波票挡在门外，正式推荐 ATR% 全部 ≤6%，档位只在通过者内部区分
+    # 风险暴露，不产生新的通过/否决。纯展示：不参与任何准入、排序、否决，
+    # 亦不构成投资建议（卡片文案同步注明）。
+    POSITION_ATR_LOW_PCT: float = 3.0     # ATR% ≤ 此值：标准仓档
+    POSITION_ATR_MID_PCT: float = 4.5     # ATR% ≤ 此值：半仓档；以上至 MAX_ATR_PCT：观察档
+    # 周度追踪复核节点（与 store.mysql_store.TRACK_HORIZONS 同源口径）。
+    # 展示层不 import store 包（避免把 PyMySQL 依赖拖进筛选引擎的导入链），
+    # 用惰性 import + 兜底常量；改动 TRACK_HORIZONS 时需同步此处。
+    TRACK_REVIEW_DAYS: tuple = (5, 10, 15, 20, 40, 60)
 
     MIN_AMOUNT: float = 30_000_000.0  # 近 20 日日均成交额下限（元）；原 500 万对主板几乎无筛选力，上调至 3000 万过滤低流动性标的
     MIN_DAYS: int = 60
@@ -2764,6 +2776,71 @@ def _fmt_cell(v: Any, default: str = "-") -> Any:
     return v
 
 
+def _position_hint(atr: Any, close: Any, cfg: Any) -> str:
+    """单票仓位档位提示（2026-10-24，纯展示）：按 ATR% 分档，与低波异象一致。
+
+    正式推荐已过 MAX_ATR_PCT(6%) 风控，档位只在通过者内部区分风险暴露：
+    ATR% ≤ POSITION_ATR_LOW_PCT 标准仓档；≤ POSITION_ATR_MID_PCT 半仓档；
+    再高至 MAX_ATR_PCT 观察档。仅为风险管理参考，非投资建议；缺失 ATR 时返回空串。
+    """
+    a, c = _num_or_none(atr), _num_or_none(close)
+    if a is None or c is None or c <= 0 or a <= 0:
+        return ""
+    pct = a / c * 100.0
+    lo = float(getattr(cfg, "POSITION_ATR_LOW_PCT", 3.0) or 0.0)
+    mid = float(getattr(cfg, "POSITION_ATR_MID_PCT", 4.5) or 0.0)
+    cap = float(getattr(cfg, "MAX_ATR_PCT", 6.0) or 6.0)
+    if pct <= lo:
+        return f"仓位参考：ATR {pct:.1f}%（≤{lo:g}% 低波档）单票可按标准仓，止损最不易被日常波动扫掉"
+    if pct <= mid:
+        return f"仓位参考：ATR {pct:.1f}%（{lo:g}~{mid:g}% 中波档）单票建议降半档"
+    return f"仓位参考：ATR {pct:.1f}%（>{mid:g}% 偏高，风控上限 {cap:g}%）单票建议观察档小仓"
+
+
+def _track_review_days(cfg: Any = None) -> tuple:
+    """周度追踪复核节点（交易日）：惰性 import store，失败回落 config 常量。"""
+    try:
+        from store.mysql_store import TRACK_HORIZONS
+        return tuple(int(d) for d in TRACK_HORIZONS)
+    except Exception:  # noqa: BLE001 store 不可用（离线/缺 PyMySQL）时用同源常量
+        days = getattr(cfg, "TRACK_REVIEW_DAYS", None) if cfg is not None else None
+        return tuple(int(d) for d in days) if days else (5, 10, 15, 20, 40, 60)
+
+
+def _observation_lines(row: dict) -> list[str]:
+    """持有期观察清单（2026-10-24，纯展示）：继续持有信号 / 减仓离场信号。
+
+    只从行内已有字段派生（stabilization_level / operating_status /
+    bottom_structure），不新增 Signal 字段、不取数、不否决、不改分层。
+    旧数据（technical/突破模式、历史行）缺这些字段时整块不渲染，
+    对既有调用与测试向后兼容。
+    """
+    stab = str(row.get("stabilization_level") or "")
+    op = str(row.get("operating_status") or "")
+    if stab not in ("strong", "medium", "weak") and op not in ("verified", "weak"):
+        return []
+    confirm: list[str] = []
+    negate: list[str] = []
+    if stab == "strong":
+        confirm.append("止跌强确认已成立：只要不放量跌破MA20且MACD柱不转负，底部逻辑延续")
+    elif stab == "medium":
+        confirm.append("止跌中确认：站稳MA20且MACD柱继续改善则升级强确认，可继续持有")
+    elif stab == "weak":
+        negate.append("止跌仅弱确认：跌破MA20或MACD柱转负即减仓重估，不等失效价")
+    if op == "verified":
+        confirm.append("经营证据已核验：下一报告期收入/净利同比不低于当期则逻辑延续")
+    elif op == "weak":
+        negate.append("经营走弱观察中：下一报告期收入或净利同比继续下滑则离场，不接飞刀")
+    if row.get("bottom_structure"):
+        confirm.append("已现有效底部结构：守住结构低点（见失效价）即持有")
+    lines: list[str] = []
+    if confirm:
+        lines.append("**继续持有信号:** " + "；".join(confirm))
+    if negate:
+        lines.append("**减仓离场信号:** " + "；".join(negate))
+    return lines
+
+
 def describe_trade_plan(row: dict, config: Optional[StrategyConfig] = None) -> list[str]:
     """渲染「可执行交易计划」：建仓区间 / 止损 / 止盈 / 建议持有周期。
 
@@ -2832,6 +2909,12 @@ def describe_trade_plan(row: dict, config: Optional[StrategyConfig] = None) -> l
             legacy.append(f"建议持有 {hold_lo}~{hold_hi} 个交易日")
         return legacy
     lines = ["**人工参考区间（非自动交易指令）**", entry]
+    # 执行规则（与 StrategyConfig.ENTRY_BAND_PCT 注释同口径）：区间内执行、
+    # 上沿不追、下沿重估。此前仅 legacy（technical/突破）分支渲染该规则，
+    # quality_value 分支缺失——2026-10-24 补齐，保证同一只票无论从哪个入口
+    # 的卡片看到，操作口径完全一致（纯展示，不改任何筛选）。
+    lines.append("执行规则：次日开盘落在区间内按计划执行；高于上沿视为追高、放弃本轮；"
+                 "低于下沿说明隔夜出现不利变动，按失效重估而非「越低越买」。")
     # 区间半宽取 0.5×ATR，反映个股当下日常波动；止损/止盈中点仍沿用
     # 策略计算的参考价，不改变筛选逻辑，亦不代表必然成交价。
     half_band = 0.5 * atr if atr is not None and atr > 0 else None
@@ -2854,9 +2937,14 @@ def describe_trade_plan(row: dict, config: Optional[StrategyConfig] = None) -> l
         lines.append(" | ".join(price_bits))
     if atr is not None and atr > 0:
         lines.append(f"区间说明：止盈/止损带以参考价为中点，半宽为 0.5×ATR14（ATR14={atr:.2f}）；需结合估值、基本面和实际行情人工判断。")
+    hint = _position_hint(atr, close, cfg)
+    if hint:
+        lines.append(hint + "（风险管理参考，非投资建议）")
     lines.append("建仓区间以信号日收盘为锚，仅作观察范围；跳空、基本面变化或市场环境变化时应重新评估，不机械追价/补仓。")
     if hold_lo > 0 and hold_hi >= hold_lo:
         lines.append(f"建议复核窗口 {hold_lo}~{hold_hi} 个交易日（仅为观察周期，不代表到期必须卖出）。")
+    review = "/".join(str(d) for d in _track_review_days(cfg))
+    lines.append(f"复核节点：买入后第 {review} 个交易日对照周度追踪复盘；止跌或经营证据反转时立即重估，不必等到复核窗口。")
     return lines
 
 
@@ -2907,9 +2995,12 @@ def describe(row: dict) -> str:
 
     1. 基础评分/等级：分数与等级同源（均按原始技术分定级，熊市只抬门槛不扣展示分）；
     2. 入选依据：实际触发的技术条件（放量企稳/放量上涨/放量冲高回落措辞区分）；
-    3. 操作计划：建仓区间 / 止损 / 止盈 / 建议持有周期（见 describe_trade_plan）；
+    3. 操作计划：建仓区间 / 执行规则 / 止损 / 止盈 / 仓位参考 / 建议持有周期 /
+       复核节点（见 describe_trade_plan）；
     4. 核验状态：财务/周线是否已核验、缺项明细（可选指标缺失只标注不降级）。
-    quality_value 模式额外附 P5 决策简报（信心/今日触发/看多/风险/失效价）。
+    quality_value 模式额外附 P5 决策简报（信心/今日触发/看多/风险/失效价）
+    与持有期观察清单（继续持有信号/减仓离场信号，见 _observation_lines）。
+    新增条目均为纯展示：不新增 Signal 字段、不取数、不参与准入/排序/否决。
 
     标题里的「正式推荐」即 tier=formal——飞书卡片在渲染前已过滤掉全部非 formal 标的，
     故卡片上每一只都已落库并被周度追踪统计战绩。此处不再使用「候选」措辞：该词在中文里
@@ -2933,6 +3024,7 @@ def describe(row: dict) -> str:
             + (f" | 缺项: {_missing_tags_zh(str(row.get('missing_tags')))}" if row.get('missing_tags') else "")
         )
         lines.extend(_brief_lines(row))
+        lines.extend(_observation_lines(row))
         return "\n".join(lines)
     verify_bits = [
         _FUND_STATUS_ZH.get(str(row.get("fund_status", "")), "财务未核验"),
@@ -2956,6 +3048,7 @@ def describe(row: dict) -> str:
         + (" | 底背离" if row.get("has_divergence") else "")
     )
     lines.extend(_brief_lines(row))
+    lines.extend(_observation_lines(row))
     return "\n".join(lines)
 
 def describe_pending(row: dict) -> str:
