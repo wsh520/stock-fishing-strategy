@@ -13,14 +13,20 @@ AkShare 的每个接口内部都是 `requests.get(url, ..., timeout=None)`：
 3. **没有通道级熔断** → 东财（push2his.eastmoney.com）抖动时，每只股票都要先重试
    `MAX_RETRY` 次再走新浪兜底，3000 只股票 = 9000 次无效请求，日志里就是「一直重连」。
 
-## 本层做的四件事（全部幂等、只影响本进程）
+## 本层做的五件事（全部幂等、只影响本进程）
 
 1. 线程内复用 keep-alive Session（连接池），把每只股票的握手成本摊掉；
 2. 调用方未指定 timeout 时注入默认值（`AK_HTTP_TIMEOUT_SEC`，默认 20 秒），
    把「无限挂起」变成「可重试的失败」；
 3. 通道熔断：连续失败达阈值（默认 3 次）后冷却（默认 120 秒），期间**直接跳过**该通道，
    由上层走备用通道（东财 → 新浪），不再对每只股票重试同一批死连接；
-4. 单通道有限重试（默认 3 次，指数退避 + 抖动，参数与 `FETCH_RETRY_*` 同源）。
+4. 熔断冷却**逐级升级** + 真实错误可见（2026-10-24，run #116~#118 实证）：
+   东财在 GitHub Actions 云 IP 上基本不可达（同代码本地 0.5 秒成功 ⇒ IP 级封锁），
+   每次运行熔断 14~16 次、每 120 秒重试一次死通道。升级规则：第 N 次熔断冷却
+   = 基础冷却 × ESCALATE^(N-1)，封顶 MAX_SEC，通道恢复成功即清零；
+   同时把最近一次失败的类型与消息写进熔断 WARNING（此前只有 DEBUG，CI 日志
+   看不到东财到底怎么失败的），让下一次运行自诊断；
+5. 单通道有限重试（默认 3 次，指数退避 + 抖动，参数与 `FETCH_RETRY_*` 同源）。
 
 不改变任何**选股口径**：只影响「同一接口请求怎么发、失败后怎么办」。
 """
@@ -39,6 +45,10 @@ logger = logging.getLogger("akshare_http")
 DEFAULT_TIMEOUT_SEC = 20.0
 DEFAULT_CHANNEL_FAIL_THRESHOLD = 3
 DEFAULT_CHANNEL_COOLDOWN_SEC = 120.0
+# 熔断冷却升级（2026-10-24）：1.0 = 不升级（旧行为），由 StrategyConfig.
+# AK_CHANNEL_COOLDOWN_ESCALATE 覆盖；None/0 = 不封顶。
+DEFAULT_CHANNEL_COOLDOWN_ESCALATE = 1.0
+DEFAULT_CHANNEL_COOLDOWN_MAX_SEC = None
 
 _timeout = {"sec": DEFAULT_TIMEOUT_SEC}
 _install_lock = threading.Lock()
@@ -59,7 +69,7 @@ class ChannelUnavailable(RuntimeError):
 
 
 class _Channel:
-    __slots__ = ("name", "failures", "open_until", "ok", "failed", "skipped")
+    __slots__ = ("name", "failures", "open_until", "ok", "failed", "skipped", "trips", "last_error")
 
     def __init__(self, name: str):
         self.name = name
@@ -68,6 +78,8 @@ class _Channel:
         self.ok = 0
         self.failed = 0
         self.skipped = 0
+        self.trips = 0             # 本次运行内熔断次数（成功即清零；用于冷却升级）
+        self.last_error = None     # 最近一次失败原因（随熔断 WARNING 输出，便于 CI 诊断）
 
 
 _channels: dict[str, _Channel] = {}
@@ -214,21 +226,49 @@ def record_success(name: str) -> None:
     state = channel(name)
     state.failures = 0
     state.open_until = 0.0
+    state.trips = 0  # 通道恢复 ⇒ 熔断升级清零，下次故障从基础冷却重新开始
     state.ok += 1
 
 
+def _escalated_cooldown(trips: int, base: float, escalate: float,
+                        max_cooldown: Optional[float]) -> float:
+    """第 N 次熔断的冷却时长：base × escalate^(N-1)，封顶 max_cooldown。
+
+    trips<=1 或 escalate<=1 时恒等于 base（向后兼容旧行为）。
+    """
+    if trips <= 1 or escalate <= 1.0:
+        return base
+    grown = base * (escalate ** (trips - 1))
+    if max_cooldown is not None and max_cooldown > 0:
+        grown = min(float(max_cooldown), grown)
+    return grown
+
+
 def record_failure(name: str, threshold: int = DEFAULT_CHANNEL_FAIL_THRESHOLD,
-                   cooldown_sec: float = DEFAULT_CHANNEL_COOLDOWN_SEC) -> None:
+                   cooldown_sec: float = DEFAULT_CHANNEL_COOLDOWN_SEC,
+                   escalate: float = DEFAULT_CHANNEL_COOLDOWN_ESCALATE,
+                   max_cooldown_sec: Optional[float] = DEFAULT_CHANNEL_COOLDOWN_MAX_SEC,
+                   error: Optional[BaseException] = None) -> None:
     state = channel(name)
     state.failures += 1
     state.failed += 1
+    if error is not None:
+        state.last_error = f"{type(error).__name__}: {str(error)[:160]}"
     threshold = max(1, int(threshold))
     if state.failures >= threshold:
         first_time = state.open_until <= time.time()
-        state.open_until = time.time() + max(0.0, float(cooldown_sec))
         if first_time:
-            logger.warning("AkShare 通道 %s 连续失败 %d 次，熔断 %.0f 秒：期间跳过该通道改用备用通道",
-                           name, state.failures, max(0.0, float(cooldown_sec)))
+            state.trips += 1
+        effective = _escalated_cooldown(state.trips, max(0.0, float(cooldown_sec)),
+                                        float(escalate or 1.0), max_cooldown_sec)
+        state.open_until = time.time() + effective
+        if first_time:
+            # 错误类型+消息随 WARNING 输出：CI 日志只看 WARNING 以上，
+            # 没有它就无法区分「超时/403/连接重置」，下次运行仍是盲修。
+            detail = f"；最近错误: {state.last_error}" if state.last_error else ""
+            logger.warning("AkShare 通道 %s 第 %d 次熔断（累计失败 %d 次），冷却 %.0f 秒："
+                           "期间跳过该通道改用备用通道%s",
+                           name, state.trips, state.failures, effective, detail)
 
 
 def reset_channels() -> None:
@@ -238,7 +278,7 @@ def reset_channels() -> None:
 
 
 def snapshot() -> dict[str, dict[str, Any]]:
-    """通道状态快照，供日志留档（ok/failed/skipped/熔断剩余秒数）。"""
+    """通道状态快照，供日志留档（ok/failed/skipped/trips/熔断剩余秒数/最近错误）。"""
     now = time.time()
     with _channels_lock:
         items = list(_channels.items())
@@ -248,7 +288,9 @@ def snapshot() -> dict[str, dict[str, Any]]:
             "failed": st.failed,
             "skipped": st.skipped,
             "failures": st.failures,
+            "trips": st.trips,
             "open_for_sec": round(max(0.0, st.open_until - now), 1),
+            "last_error": st.last_error,
         }
         for name, st in items
     }
@@ -261,8 +303,12 @@ def format_summary() -> str:
     parts = []
     for name, st in sorted(snap.items()):
         piece = f"{name} 成功{st['ok']}/失败{st['failed']}/跳过{st['skipped']}"
+        if st.get("trips"):
+            piece += f"/熔断{st['trips']}次"
         if st["open_for_sec"] > 0:
             piece += f"（熔断剩余{st['open_for_sec']:.0f}秒）"
+        if st.get("last_error"):
+            piece += f"（最近错误: {st['last_error']}）"
         parts.append(piece)
     return "AkShare 通道: " + "，".join(parts)
 
@@ -305,6 +351,10 @@ def call(channel_name: str, fetcher: Callable[[], Any], label: str,
                     or DEFAULT_CHANNEL_FAIL_THRESHOLD)
     cooldown = float(getattr(config, "AK_CHANNEL_COOLDOWN_SEC", DEFAULT_CHANNEL_COOLDOWN_SEC)
                      or DEFAULT_CHANNEL_COOLDOWN_SEC)
+    escalate = float(getattr(config, "AK_CHANNEL_COOLDOWN_ESCALATE", DEFAULT_CHANNEL_COOLDOWN_ESCALATE)
+                     or DEFAULT_CHANNEL_COOLDOWN_ESCALATE)
+    raw_max = getattr(config, "AK_CHANNEL_COOLDOWN_MAX_SEC", DEFAULT_CHANNEL_COOLDOWN_MAX_SEC)
+    max_cooldown = float(raw_max) if raw_max else None
     attempts = max(0, int(retries)) + 1
     last_error: Optional[BaseException] = None
 
@@ -327,7 +377,8 @@ def call(channel_name: str, fetcher: Callable[[], Any], label: str,
         if attempt < attempts - 1:
             time.sleep(_backoff_seconds(attempt, config))
 
-    record_failure(channel_name, threshold, cooldown)
+    record_failure(channel_name, threshold, cooldown, escalate=escalate,
+                   max_cooldown_sec=max_cooldown, error=last_error)
     logger.debug("%s 获取失败（通道 %s，已尝试 %d 次）: %s", label, channel_name, attempts, last_error)
     return None
 

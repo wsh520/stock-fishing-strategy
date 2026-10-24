@@ -878,6 +878,15 @@ class StrategyConfig:
     # 3 次 ≈ 3 只连续失败即判定东财不可用；120 秒足够其恢复，又不至于整轮都错过。
     AK_CHANNEL_FAIL_THRESHOLD: int = 3
     AK_CHANNEL_COOLDOWN_SEC: float = 120.0
+    # ===== 熔断冷却逐级升级（2026-10-24，run #116~#118 实证）=====
+    # 东财在 GitHub Actions 云 IP 上基本不可达（同代码本地 0.5 秒成功 ⇒ IP 级
+    # 封锁），固定 120 秒冷却意味着每次运行熔断 14~16 次、每 2 分钟重试一次死
+    # 通道，纯浪费请求与日志。升级规则：第 N 次熔断冷却 = 基础 × ESCALATE^(N-1)，
+    # 封顶 MAX_SEC；通道恢复成功即清零（record_success 重置 trips）。
+    # 冷却只影响「多久后再试这个通道」，不影响选股口径；熔断期间照常走新浪。
+    # 1.0 = 关闭升级（旧行为）。600 秒封顶 ≈ 30 分钟运行的后半程不再碰东财。
+    AK_CHANNEL_COOLDOWN_ESCALATE: float = 2.0
+    AK_CHANNEL_COOLDOWN_MAX_SEC: float = 600.0
 
     FILTER_ST: bool = True
     EXCLUDE_DELISTING: bool = True

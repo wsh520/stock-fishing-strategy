@@ -43,6 +43,9 @@ audit_*.out
 # 诊断脚本的结构化输出（diag_real_recs.py → audit_real_recs_out.csv）：同上，可再生产物。
 # 重建方式：把新落库推荐补进 diag_real_recs.py 的 RECS 表后 python diag_real_recs.py
 audit_*_out.csv
+# diag_*_*.py 的结构化输出（如 diag_cooldown_forward → data/diag_cooldown_forward_20261024.csv、
+# diag_operating_relax → data/diag_operating_relax_20260604.csv）：可再生产物，重跑脚本即可。
+data/diag_*.csv
 
 # Local recommendation test and permission-diagnostic artifacts
 .test-artifacts/

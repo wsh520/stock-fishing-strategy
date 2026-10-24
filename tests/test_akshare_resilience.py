@@ -118,6 +118,77 @@ class ChannelBreakerTests(unittest.TestCase):
             res.call("sina", lambda: (_ for _ in ()).throw(TimeoutError()), "x", retries=0, config=self.cfg)
         self.assertFalse(res.is_open("sina"))
 
+    def test_cooldown_escalates_on_repeated_trips_and_caps(self):
+        """2026-10-24：东财在 CI 云 IP 上基本不可达，死通道不能每 120 秒重试一次。"""
+        clock = {"t": 1000.0}
+        cfg = StrategyConfig()
+        cfg.AK_CHANNEL_COOLDOWN_ESCALATE = 2.0
+        cfg.AK_CHANNEL_COOLDOWN_MAX_SEC = 500.0
+        with patch.object(res.time, "time", lambda: clock["t"]):
+            for trip, want in enumerate((120, 240, 480, 500, 500), start=1):
+                clock["t"] += 10_000.0  # 推进到上次冷却过期，触发下一次熔断
+                res.record_failure("eastmoney", threshold=1, cooldown_sec=120,
+                                   escalate=cfg.AK_CHANNEL_COOLDOWN_ESCALATE,
+                                   max_cooldown_sec=cfg.AK_CHANNEL_COOLDOWN_MAX_SEC)
+                state = res.channel("eastmoney")
+                self.assertAlmostEqual(state.open_until - clock["t"], want, places=0)
+                self.assertEqual(state.trips, trip)
+
+    def test_default_escalate_keeps_base_cooldown(self):
+        """escalate 缺省 1.0：恒等基础冷却，旧行为不变。"""
+        clock = {"t": 0.0}
+        with patch.object(res.time, "time", lambda: clock["t"]):
+            for _ in range(4):
+                clock["t"] += 10_000.0
+                res.record_failure("sina", threshold=1, cooldown_sec=120)
+            self.assertAlmostEqual(res.channel("sina").open_until - clock["t"], 120, places=0)
+
+    def test_success_resets_escalation(self):
+        clock = {"t": 0.0}
+        with patch.object(res.time, "time", lambda: clock["t"]):
+            res.record_failure("eastmoney", threshold=1, cooldown_sec=120, escalate=2.0)
+            clock["t"] += 200
+            res.record_failure("eastmoney", threshold=1, cooldown_sec=120, escalate=2.0)
+            self.assertEqual(res.channel("eastmoney").trips, 2)
+            res.record_success("eastmoney")
+            self.assertEqual(res.channel("eastmoney").trips, 0)
+            clock["t"] += 200
+            res.record_failure("eastmoney", threshold=1, cooldown_sec=120, escalate=2.0)
+            self.assertAlmostEqual(res.channel("eastmoney").open_until - clock["t"], 120, places=0)
+
+    def test_breaker_warning_includes_last_error(self):
+        """真实错误必须进 WARNING：CI 日志只看 WARNING 以上，否则下次仍是盲修。"""
+        with self.assertLogs("akshare_http", level="WARNING") as logs:
+            res.record_failure("eastmoney", threshold=1, cooldown_sec=60,
+                               error=TimeoutError("read timeout"))
+        output = "\n".join(logs.output)
+        self.assertIn("第 1 次熔断", output)
+        self.assertIn("TimeoutError", output)
+        self.assertIn("read timeout", output)
+        self.assertIn("TimeoutError", res.format_summary())
+
+    def test_call_passes_config_escalation_to_breaker(self):
+        clock = {"t": 1000.0}
+        cfg = StrategyConfig()
+        cfg.AK_CHANNEL_FAIL_THRESHOLD = 1
+        cfg.AK_CHANNEL_COOLDOWN_ESCALATE = 3.0
+        cfg.AK_CHANNEL_COOLDOWN_MAX_SEC = 1000.0
+        cfg.FETCH_RETRY_BACKOFF_BASE_SEC = 0.001
+        cfg.FETCH_RETRY_BACKOFF_MAX_SEC = 0.002
+        cfg.FETCH_RETRY_JITTER = 0.0
+
+        def boom():
+            raise ConnectionError("reset by peer")
+
+        with patch.object(res.time, "time", lambda: clock["t"]), \
+             patch.object(res.time, "sleep"):
+            res.call("eastmoney", boom, "ak_hist(TEST)", retries=0, config=cfg)
+            clock["t"] += 200
+            res.call("eastmoney", boom, "ak_hist(TEST)", retries=0, config=cfg)
+        state = res.channel("eastmoney")
+        self.assertAlmostEqual(state.open_until - clock["t"], 360, places=0)
+        self.assertEqual(state.trips, 2)
+
 
 class FailedStockGiveUpTests(unittest.TestCase):
     def setUp(self):
