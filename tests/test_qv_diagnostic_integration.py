@@ -43,17 +43,28 @@ class QVDiagnosticIntegrationTests(unittest.TestCase):
         self.assertIn("重复推荐冷却", m._missing_tags_zh(pending[0]["missing_tags"]))
 
     def test_funnel_distinguishes_qualification_cooldown_and_pending(self):
+        """分层漏斗：资格通过 / 冷却（block 转出、label 标注）/ 普通待核验 必须可分辨。
+
+        2026-10-26：冷却默认动作由 block 改为 label（命中票保留推荐 + 打标签），
+        故此处两个模式都要锁：block 保留为可回退值，label 是生产默认。
+        """
         signal = self.signal()
         passed = replace(signal, code="600002", tier="formal", missing_tags="")
         blocked = replace(signal, missing_tags="operating_weak", tier="pending")
-        pending = []
-        with patch.object(m, "get_stock_list", return_value=[{"code": s.code, "name": s.name} for s in (passed, blocked)]), \
-             patch.object(m, "run_concurrent_screen", return_value=([(passed, "PASS"), (blocked, "PASS")], 2, False)), \
-             patch.object(m, "get_daily_data", side_effect=AssertionError("offline")), \
-             self.assertLogs(m.logger, level="INFO") as logs:
-            result = m._screen_quality_pool(self.config(), m.CacheManager(), {}, DAY, pending,
-                                            recently_recommended={"600002"})
-        text = "\n".join(logs.output)
+
+        def _run(mode):
+            pending = []
+            cfg = self.config(QV_REPEAT_COOLDOWN_MODE=mode)
+            with patch.object(m, "get_stock_list", return_value=[{"code": s.code, "name": s.name} for s in (passed, blocked)]), \
+                 patch.object(m, "run_concurrent_screen", return_value=([(passed, "PASS"), (blocked, "PASS")], 2, False)), \
+                 patch.object(m, "get_daily_data", side_effect=AssertionError("offline")), \
+                 self.assertLogs(m.logger, level="INFO") as logs:
+                result = m._screen_quality_pool(cfg, m.CacheManager(), {}, DAY, pending,
+                                                recently_recommended={"600002"})
+            return result, pending, "\n".join(logs.output)
+
+        # ① block（旧行为，可回退）：命中即转出 pending，正式推荐为空
+        result, pending, text = _run("block")
         self.assertTrue(result.empty)
         self.assertEqual(len(pending), 2)
         self.assertTrue(all(row["tier"] == "pending" for row in pending))
@@ -61,6 +72,22 @@ class QVDiagnosticIntegrationTests(unittest.TestCase):
                          "最终可推送=0", "[QV_COOLDOWN]", "[QV_PENDING_TECH]", "不含冷却转出"):
             self.assertIn(fragment, text)
         self.assertNotIn("technical_diagnostics", pending[0])
+
+        # ② label（生产默认）：命中票留在 formal 且被标注，不进 pending
+        result, pending, text = _run("label")
+        self.assertEqual(list(result["code"]), ["600002"], "label 不得把票从推荐里拿掉")
+        self.assertEqual(len(pending), 1, "label 只留普通待核验，不再产生冷却转出行")
+        self.assertEqual(int(result.iloc[0]["repeat_count"]), 1)
+        self.assertIn("重复推荐", str(result.iloc[0]["signals_hit"]))
+        for fragment in ("资格通过 1", "冷却转出 0", "冷却标注 1", "普通待核验 1",
+                         "观察合计 1", "最终可推送=1", "[QV_COOLDOWN_LABEL]"):
+            self.assertIn(fragment, text)
+
+        # ③ off：完全不查库不判定（等价 QV_REPEAT_COOLDOWN_DAYS=0）
+        result, pending, text = _run("off")
+        self.assertEqual(list(result["code"]), ["600002"])
+        self.assertEqual(len(pending), 1)
+        self.assertIn("动作=不判定", text)
 
     def test_financial_names_and_whitelist_are_excluded_before_screening(self):
         stocks = [{"code": "600015", "name": "华夏银行"}, {"code": "601318", "name": "中国平安"},

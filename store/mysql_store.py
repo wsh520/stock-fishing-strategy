@@ -78,11 +78,14 @@ CREATE TABLE IF NOT EXISTS stock_recommendation (
     missing_tags     TEXT            NULL COMMENT '缺失项标签（逗号分隔）',
     score_weights    VARCHAR(24)     NULL COMMENT '综合分权重快照 质量/估值/技术，例 0.45/0.30/0.25',
     stop_rule        VARCHAR(32)     NULL COMMENT '止损失口径快照，例 atr3x_floor15 / fixed15',
+    repeat_seq       TINYINT UNSIGNED NULL COMMENT '同一 code+strategy 的重复推荐序号（首次=1，冷却窗口内第2次=2），NULL=未知',
+    superseded_by    BIGINT UNSIGNED NULL COMMENT '被哪条更新的推荐取代（旧行打废弃标签；NULL=仍是最新）。仅标注，统计不排除',
     created_at       DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '写入时间',
     PRIMARY KEY (id),
     UNIQUE KEY uk_rec_date_code_strategy (rec_date, code, strategy),
     KEY idx_code (code),
-    KEY idx_rec_date (rec_date)
+    KEY idx_rec_date (rec_date),
+    KEY idx_code_strategy_seq (code, strategy, repeat_seq)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='每日选股推荐记录'
 """,
     """
@@ -128,6 +131,11 @@ _RECOMMENDATION_ALTERS = {
     # stop_loss 10-07 前为纯 3×ATR、之后为 max(3×ATR,15%)。
     "score_weights": "ADD COLUMN score_weights VARCHAR(24) NULL COMMENT '综合分权重快照 质量/估值/技术，例 0.45/0.30/0.25' AFTER missing_tags",
     "stop_rule": "ADD COLUMN stop_rule VARCHAR(32) NULL COMMENT '止损失口径快照，例 atr3x_floor15 / fixed15' AFTER score_weights",
+    # 2026-10-26 重复推荐标注列。用户要求：进入冷却的票**可以重新推荐**，新推荐把旧行
+    # 打上「废弃」标签，但统计时旧行照常计入、按多条分开统计、统计规则不变。
+    # 故这两列只是**标注**，任何统计/追踪查询都不得按 superseded_by 过滤。
+    "repeat_seq": "ADD COLUMN repeat_seq TINYINT UNSIGNED NULL COMMENT '同一 code+strategy 的重复推荐序号（首次=1，冷却窗口内第2次=2），NULL=未知' AFTER stop_rule",
+    "superseded_by": "ADD COLUMN superseded_by BIGINT UNSIGNED NULL COMMENT '被哪条更新的推荐取代（旧行打废弃标签；NULL=仍是最新）。仅标注，统计不排除' AFTER repeat_seq",
 }
 
 # ===== 文本列容量升级（幂等，非破坏，不改任何已有数据）=====
@@ -391,6 +399,68 @@ def _ensure_schema_cached() -> None:
         logger.warning("预探测表结构失败（落库阶段会重试；文本列将不做截断）: %s", e)
 
 
+def _repeat_seq_map(cur, strategy: str, keys: list[tuple[str, str, str]]) -> dict[str, int]:
+    """落库**前**查询每个 code 在本 sleeve 的历史推荐条数，返回「本次是第几次」。
+
+    【用户口径（2026-10-26）】冷却的票可以重新推荐；新推荐把旧行打「废弃」标签；
+    统计时旧行仍正常计入、支持按多条分开统计、统计规则不变。要让「第 N 次推荐的
+    胜率是否更差」真正可验证，必须先有 repeat_seq 这一维，否则只能靠 signals_hit
+    里的人类可读文本反推。
+
+    必须在 INSERT 之前调用：计数含历史行但不含本次新行，+1 后即为本次序号。
+    """
+    codes = sorted({str(k[1]) for k in keys})
+    if not codes:
+        return {}
+    ph = ", ".join(["%s"] * len(codes))
+    cur.execute(
+        f"SELECT code, COUNT(*) FROM stock_recommendation "
+        f"WHERE strategy = %s AND code IN ({ph}) GROUP BY code",
+        [strategy, *codes])
+    prior = {str(r[0]): int(r[1]) for r in cur.fetchall()}
+    return {c: prior.get(c, 0) + 1 for c in codes}
+
+
+def _mark_repeat_sequence(cur, strategy: str, keys: list[tuple[str, str, str]],
+                          seq_map: dict[str, int]) -> int:
+    """落库**后**写 repeat_seq，并把同股更早的行标为 superseded_by=新行 id。
+
+    只写标注列，**不做任何排除性过滤**：统计/追踪查询一律不得按 superseded_by
+    过滤，否则等于把旧推荐从样本里删掉，与「统计照常」的要求相反。
+    返回被标为废弃的旧行数。
+
+    失败不抛错：存量库若 repeat_seq/superseded_by 两列未 ALTER 成功，
+    标注失败不应让整批推荐落库失败（与「宁可少标注也要落库」一致）。
+    """
+    if not keys:
+        return 0
+    pair_ph = ", ".join(["(%s, %s)"] * len(keys))
+    flat: list = []
+    for rec_date, code, _strat in keys:
+        flat.extend([str(rec_date), str(code)])
+    cur.execute(
+        f"SELECT id, rec_date, code FROM stock_recommendation "
+        f"WHERE strategy = %s AND (rec_date, code) IN ({pair_ph})",
+        [strategy, *flat])
+    new_ids = {(str(r[1]), str(r[2])): int(r[0]) for r in cur.fetchall()}
+    seq_updates, sup_updates = [], []
+    for rec_date, code, _strat in keys:
+        nid = new_ids.get((str(rec_date), str(code)))
+        if nid is None:
+            continue
+        seq_updates.append((max(1, int(seq_map.get(str(code)) or 1)), nid))
+        sup_updates.append((nid, str(code), strategy, str(rec_date), nid))
+    if not seq_updates:
+        return 0
+    cur.executemany(
+        "UPDATE stock_recommendation SET repeat_seq = %s WHERE id = %s", seq_updates)
+    marked = cur.executemany(
+        "UPDATE stock_recommendation SET superseded_by = %s "
+        "WHERE code = %s AND strategy = %s AND rec_date < %s AND id <> %s "
+        "AND superseded_by IS NULL", sup_updates)
+    return int(marked or 0)
+
+
 def save_recommendations(df: Optional[pd.DataFrame], strategy: str = STRATEGY_BOTTOM_FISHING) -> int:
     """将选股结果写入 stock_recommendation，(rec_date, code, strategy) 重复时检查入库时间。
 
@@ -510,17 +580,34 @@ def save_recommendations(df: Optional[pd.DataFrame], strategy: str = STRATEGY_BO
 
                 # 过滤掉未过期的已存在记录，只插入新记录和已过期的记录
                 rows_to_insert = []
+                insert_keys = []
                 for i, key in enumerate(keys):
                     if key not in existing_records or key in expired_keys:
                         rows_to_insert.append(rows[i])
+                        insert_keys.append(key)
+
+                # 重复推荐序号必须在 INSERT 之前取（计数含历史行、不含本次新行）
+                seq_map = _repeat_seq_map(cur, strategy, insert_keys) if insert_keys else {}
 
                 inserted = 0
                 if rows_to_insert:
                     inserted = cur.executemany(insert_sql, rows_to_insert)
 
+                # ===== 重复推荐标注（2026-10-26）=====
+                # 新推荐照常入库；同股更早的行只打 superseded_by 标签，
+                # 统计侧（select_observations / get_active_recommendations）**不过滤**。
+                superseded = 0
+                if inserted and insert_keys:
+                    try:
+                        superseded = _mark_repeat_sequence(cur, strategy, insert_keys, seq_map)
+                    except Exception as me:  # noqa: BLE001
+                        logger.warning("重复推荐标注失败（推荐已落库，仅缺 repeat_seq/"
+                                       "superseded_by 标注）: %s", me)
+
             logger.info(
-                "推荐结果已落库[%s]：新增 %d 条（共提交 %d 条，跳过 %d 条未过期记录）",
-                strategy, inserted or 0, len(rows), skipped_count
+                "推荐结果已落库[%s]：新增 %d 条（共提交 %d 条，跳过 %d 条未过期记录，"
+                "旧推荐标废弃 %d 条）",
+                strategy, inserted or 0, len(rows), skipped_count, superseded
             )
             return int(inserted or 0)
         finally:
@@ -646,6 +733,73 @@ def fetch_recent_recommended_codes(strategy: str, since_date: str,
     except Exception as e:
         logger.warning("查询近期已推荐代码失败（降级为不启用冷却）: %s", e)
         return set()
+
+
+def fetch_recent_recommendation_detail(strategy: str, since_date: str,
+                                       cross_sleeve: bool = False) -> dict[str, dict]:
+    """查询 since_date（含）以来已落库推荐的**明细**（冷却标注用）。
+
+    返回 {code: {"count": 第几次, "last_date": 上次推荐日, "last_close": 上次推荐价}}。
+    与 fetch_recent_recommended_codes 的差别只在「带明细」：冷却从 block 改为 label 后，
+    卡片与日志要写明「10 日内第 2 次、上次 27.95 → 本次 27.56(-1.4%)」，
+    否则重复推荐反而制造困惑。
+
+    count 语义：max(窗口内推荐条数, 该行 repeat_seq)，即**累计第几次**而不是窗口内第几次——
+    用窗口内计数会把「20 天前推过 1 次、今天第 2 次」标成「第 1 次」。
+    repeat_seq 为 NULL（存量行/标注失败）时退化为窗口内条数，不伪造成已知。
+
+    **不过滤 superseded_by**：被标为废弃的旧推荐仍是一次真实推荐，
+    统计口径要求「旧行照常计入」，冷却判定也一样——它是「10 日内推过」的事实。
+
+    未配置 MySQL 或查询失败返回空 dict（降级为不冷却），由调用方把生效状态打进日志。
+    """
+    if not is_configured():
+        # 必须显式留痕：否则入口脚本会打印「已查库…命中 0 只」，
+        # 让人误以为冷却真的跑了（死闸门原则）。
+        logger.info("MySQL 未配置，近期推荐明细为空 → 重复推荐冷却不生效")
+        return {}
+    if cross_sleeve:
+        inner = ("SELECT code, MAX(rec_date) AS last_date, COUNT(*) AS n "
+                 "FROM stock_recommendation WHERE rec_date >= %s GROUP BY code")
+        outer_where = ""
+        params: tuple = (str(since_date),)
+    else:
+        inner = ("SELECT code, MAX(rec_date) AS last_date, COUNT(*) AS n "
+                 "FROM stock_recommendation WHERE strategy = %s AND rec_date >= %s "
+                 "GROUP BY code")
+        outer_where = "WHERE r.strategy = %s"
+        params = (str(strategy), str(since_date), str(strategy))
+    sql = (f"SELECT r.code, g.n, g.last_date, r.rec_close, r.repeat_seq "
+           f"FROM stock_recommendation r "
+           f"JOIN ({inner}) g ON g.code = r.code AND g.last_date = r.rec_date "
+           f"{outer_where} ORDER BY r.id DESC")
+    try:
+        conn = _connect()
+        try:
+            _ensure_tables(conn)
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                out: dict[str, dict] = {}
+                for code, n, last_date, last_close, seq in cur.fetchall():
+                    code = str(code)
+                    if code in out:  # 跨 sleeve 时同一 code 同一天可能有多行，取最新一条
+                        continue
+                    window_n = int(n or 0)
+                    try:
+                        seq_n = int(seq) if seq is not None else 0
+                    except (TypeError, ValueError):
+                        seq_n = 0
+                    out[code] = {
+                        "count": max(window_n, seq_n, 1),
+                        "last_date": str(last_date) if last_date is not None else None,
+                        "last_close": float(last_close) if last_close is not None else None,
+                    }
+                return out
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.warning("查询近期推荐明细失败（降级为不启用冷却标注）: %s", e)
+        return {}
 
 
 def save_tracking(rec_id: int, rec_date: Any, code: str, week_no: int,

@@ -664,7 +664,8 @@ class StrategyConfig:
     NEUTRAL_MAX_PICKS: int = 4
     BEAR_MAX_PICKS: int = 2
     # ===== 重复推荐冷却（2026-10-13 新增，默认 10 个交易日）=====
-    # 同一只股票在冷却期内被推荐过一次后，本次运行不再重复推送为正式推荐。
+    # 同一只股票在冷却期内被推荐过一次后，`block` 下不再重复推送为正式推荐；
+    # `label`（默认）下照常推送但标明是第几次。
     #
     # 【为什么需要】真实落库推荐追踪（diag_real_recs.py，2026-09-08~10-09）发现
     # 存在「越跌越推」闭环：云天化(600096) 于 09-17 / 09-23 / 09-24 被连续推荐 3 次，
@@ -674,15 +675,36 @@ class StrategyConfig:
     # 对使用者而言这是**同一只正在亏钱的票被反复推送**，会显著放大
     # 「推荐后总是下跌」的体感，也让每日卡片信息量下降。
     #
-    # 【为什么这样改是安全的】只减不增：不动任何闸门判定，仅在排序完成后把
-    # 命中票从 formal 移入 pending_out（可见、可查，但不推送、不落库）。
+    # 【动作由 QV_REPEAT_COOLDOWN_MODE 决定（2026-10-26）】默认 "label"：不动闸门、
+    # 也不动放行集合，只给命中票加标注（第几次 / 上次价→本次价）并把 repeat_seq 落库；
+    # 旧行为 "block" 才是「移入 pending_out（可见、可查，但不推送、不落库）」。
     #
-    # 【口径边界】冷却集合由调用方查库后传入（run.py → store.fetch_recent_recommended_codes），
-    # 策略层不依赖 DB。未配置 DB / 查询失败 / 未传入集合时该机制整体不生效——
-    # 因此 _screen_quality_pool 每次都会显式打印冷却是否真的生效，
+    # 【口径边界】冷却明细由调用方查库后传入
+    # （run.py → store.fetch_recent_recommendation_detail），
+    # 策略层不依赖 DB。未配置 DB / 查询失败 / 未传入明细时该机制整体不生效——
+    # 因此 _screen_quality_pool 每次都会显式打印冷却是否真的生效**以及实际动作**，
     # 杜绝「看起来有冷却、实际没生效」这种死闸门。
     # 设为 0 可完全关闭（仅测试用）。
     QV_REPEAT_COOLDOWN_DAYS: int = 10
+    # ===== 冷却动作模式（2026-10-26 新增，默认 "label"）=====
+    # 【为什么改】block 模式把命中票静默移入 pending（不推送、不落库），使用者
+    # 看到的是「这只票消失了」——既无法判断它是被冷却拦掉还是被闸门否决，
+    # 也无法事后统计「同一只票第 2、3 次推荐到底赚不赚」。用户要求：冷却的可以
+    # 重新推荐，旧推荐打废弃标签，但统计仍按多条分别统计、口径不变。
+    #
+    #   "label"（默认）：命中票**保留在 formal**，照常推送与落库；行上写
+    #       repeat_count / prev_rec_date / prev_rec_close，并在 signals_hit 追加
+    #       「重复推荐(10日内第2次，上次27.95→27.56 -1.4%)」这类标签。
+    #       落库时 repeat_seq 记第几次、旧行 superseded_by 标为被本次取代。
+    #   "block"：2026-10-13 的旧行为，命中即移入 pending_out（不推、不落库）。
+    #       保留该值是为了可一键回退——它不是死代码，由 test_stab_cooldown_20261013
+    #       持续锁定。
+    #   "off"：不查库、不判定（等价 QV_REPEAT_COOLDOWN_DAYS=0）。
+    #
+    # 【代价须知】label 是**放宽**：放行集合变大，卡片上会出现重复票。
+    # 补偿是「可见性 + 可统计」：标签写明第几次、上次推荐价与本次价差，
+    # 落库的 repeat_seq 让「第 N 次推荐的胜率是否更差」可以被真正验证。
+    QV_REPEAT_COOLDOWN_MODE: str = "label"
     # 市场级熔断：沪深300 近 MARKET_CRASH_LOOKBACK 个交易日累计跌幅低于该阈值（%）
     # → 本次运行不推荐。急跌期间全市场同步满足 RSI 超卖 / MA5 拐头 / 创新低底背离，
     # 抄底信号会批量触发，而 MA20_TREND_MIN_SLOPE 是个股级过滤，抓不到系统性风险。
@@ -5257,29 +5279,103 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
         **brief), "PASS"
 
 
-def _apply_repeat_cooldown(formal: pd.DataFrame, frame: pd.DataFrame,
-                           cooldown_codes: set, cooldown_days: int,
-                           pending_out: Optional[list]) -> pd.DataFrame:
-    """重复推荐冷却：把冷却期内已推过的票移出 formal，并转入 pending_out。
+def _normalize_cooldown_info(cooldown_info) -> dict[str, dict]:
+    """把冷却入参统一成 {code: {"count": n, "last_date": d, "last_close": c}}。
 
-    【为什么】真实落库推荐追踪发现「越跌越推」：云天化 09-17/09-23/09-24 连推 3 次，
-    推荐价 28.29 → 27.95 → 27.56 一路走低，三次推荐后 F1 全为负。
-    跌 → 更低位更便宜 → 再满足准入 → 再推 → 再跌，对使用者就是同一只亏钱票被反复推送。
-
-    【口径边界】只减不增：不动任何闸门判定，只在最终分层后过滤 formal。
-    命中票**不丢弃**——转入 pending_out 保留可见性，便于回答「今天为什么没推 X」；
-    但不推送、不落库、不参与追踪归因。
+    兼容两种形态：旧调用/单测传 set（只有代码，没有次数与上次价格），
+    新调用传 dict（store 查回的明细）。set 形态无法标注第几次与上次价格，
+    退化为 count=1、last_* 为 None —— 标签照样打，只是信息少一些。
     """
-    if not cooldown_codes or formal is None or getattr(formal, "empty", True):
+    if not cooldown_info:
+        return {}
+    if isinstance(cooldown_info, dict):
+        out: dict[str, dict] = {}
+        for k, v in cooldown_info.items():
+            out[str(k)] = dict(v) if isinstance(v, dict) else {"count": int(v or 1)}
+        return out
+    return {str(c): {"count": 1, "last_date": None, "last_close": None}
+            for c in cooldown_info}
+
+
+def _apply_repeat_cooldown(formal: pd.DataFrame, frame: pd.DataFrame,
+                           cooldown_info, cooldown_days: int,
+                           pending_out: Optional[list],
+                           mode: str = "block") -> pd.DataFrame:
+    """重复推荐冷却：按 mode 决定「标注后照常推荐」还是「移出 formal 转 pending」。
+
+    【为什么需要】真实落库推荐追踪发现「越跌越推」：云天化 09-17/09-23/09-24 连推 3 次，
+    推荐价 28.29 → 27.95 → 27.56 一路走低，三次推荐后 F1 全为负。
+    跌 → 更低位更便宜 → 再满足准入 → 再推 → 再跌。
+
+    【mode 语义（2026-10-26）】
+      · "label"（生产默认，由 config.QV_REPEAT_COOLDOWN_MODE 传入）：**不再拦截**，
+        命中票留在 formal 照常推送与落库，但行上写 repeat_count / prev_rec_date /
+        prev_rec_close，并在 signals_hit 追加可读标签。旧推荐由落库层标 superseded_by。
+        理由：静默移入 pending 等于让使用者「看不到这只票」，既分不清是冷却还是闸门
+        否决，也无法事后验证「第 2、3 次推荐是否更差」。改为标注后，信息不丢，
+        且 repeat_seq 落库使「重复推荐的表现」可被统计。
+      · "block"：2026-10-13 的旧行为，命中即移出 formal 并转入 pending_out
+        （不丢弃、可查、但不推送不落库）。**保留此模式即可一键回退**，
+        tests/test_stab_cooldown_20261013.py 持续锁定它。
+
+    【函数默认值为 block 的原因】既有调用点与回归测试按位置传 5 个参数，改了默认值
+    会静默改变它们锁定的语义。生产路径由 _screen_quality_pool 显式传入 config 值，
+    并在日志里打出实际生效模式 —— 不可观测的模式等于没有模式。
+    """
+    info = _normalize_cooldown_info(cooldown_info)
+    if not info or formal is None or getattr(formal, "empty", True):
         return formal
-    hit_mask = formal["code"].astype(str).isin(cooldown_codes)
+    mode = str(mode or "block").strip().lower()
+    if mode not in ("label", "block"):
+        # 未知取值一律退到 block（保守方向 = 少推荐），绝不静默变成 label。
+        # 生产路径由 _screen_quality_pool 先归一化并 warning，这里只作最后一道防线。
+        logger.warning("重复推荐冷却：未知 mode=%r，按 block 处理", mode)
+        mode = "block"
+    hit_mask = formal["code"].astype(str).isin(set(info))
     if not bool(hit_mask.any()):
         return formal
     hit_codes = sorted(set(formal.loc[hit_mask, "code"].astype(str)))
+
+    if mode == "label":
+        out = formal.copy()
+        for _c in hit_codes:
+            meta = info.get(_c) or {}
+            cnt = int(meta.get("count") or 1)
+            prev_date = meta.get("last_date")
+            prev_close = meta.get("last_close")
+            sel = out["code"].astype(str) == _c
+            if not bool(sel.any()):
+                continue
+            row = out.loc[sel].iloc[0]
+            # 注意：evaluate_quality_value 里的 finite() 是局部函数，此处不可用（曾误用致 NameError）
+            try:
+                cur = float(row.get("close"))
+            except (TypeError, ValueError):
+                cur = None
+            if cur is not None and not np.isfinite(cur):
+                cur = None
+            tag = f"重复推荐({cooldown_days}日内第{cnt + 1}次)"
+            if prev_close is not None and cur is not None and prev_close:
+                chg = (cur / float(prev_close) - 1) * 100
+                tag += f"，上次{prev_date}@{float(prev_close):.2f}→本次{cur:.2f}({chg:+.1f}%)"
+            out.loc[sel, "repeat_count"] = cnt
+            out.loc[sel, "prev_rec_date"] = "" if prev_date is None else str(prev_date)
+            out.loc[sel, "prev_rec_close"] = (
+                float(prev_close) if prev_close is not None else float("nan"))
+            out.loc[sel, "signals_hit"] = [
+                ",".join([t for t in str(v or "").split(",") if t] + [tag])
+                for v in out.loc[sel, "signals_hit"]]
+            logger.info("  冷却命中(标注): %s 已推 %d 次（%d 个交易日内）| %s",
+                        _c, cnt, cooldown_days, tag)
+        logger.info("重复推荐冷却(label)：%d 只命中，**保留推荐并标注**（不改放行集合）",
+                    len(hit_codes))
+        return out
+
+    # ---- block：2026-10-13 旧行为 ----
     for _c in hit_codes:
         logger.info("  冷却命中: %s（%s 个交易日内已落库推荐过，本次不重复推送）",
                     _c, cooldown_days)
-    logger.info("重复推荐冷却：%d 只命中，转入待核验（不丢弃、不推送）", len(hit_codes))
+    logger.info("重复推荐冷却(block)：%d 只命中，转入待核验（不丢弃、不推送）", len(hit_codes))
     if pending_out is not None and frame is not None:
         for record in frame.loc[frame["code"].astype(str).isin(hit_codes)
                                 & frame["tier"].eq("formal")].to_dict("records"):
@@ -5297,7 +5393,7 @@ def _screen_quality_pool(config: StrategyConfig, cache: CacheManager, market_env
                          evaluator=None, max_picks: Optional[int] = None,
                          index_df: Optional[pd.DataFrame] = None,
                          volatile_out: Optional[list] = None,
-                         recently_recommended: Optional[set] = None) -> Optional[pd.DataFrame]:
+                         recently_recommended: Optional[Any] = None) -> Optional[pd.DataFrame]:
     """先廉价行情筛选、后年度财务核验；核验完所有候选才排序和行业限额。
 
     max_picks：本次推荐数量上限（由 main 按市场环境 resolve_max_picks 解析后传入）；
@@ -5305,8 +5401,11 @@ def _screen_quality_pool(config: StrategyConfig, cache: CacheManager, market_env
     index_df：沪深300日线，用于计算近60日相对强度（复用主流程已取得的指数数据，不额外取数）。
     行业相对估值开启时，先用全池日线构建「行业 PE/PB 横截面快照」（复用缓存，不额外取数），
     再据此为每只候选计算行业内分位上下文 val_context 传入评估器；快照不可用时自动回退绝对阈值。
-    recently_recommended：近期已落库推荐的代码集合（由调用方查库传入，策略层不碰 DB）。
-    见 StrategyConfig.QV_REPEAT_COOLDOWN_DAYS：命中冷却的票不进正式推荐，只记 pending 并打日志。
+    recently_recommended：近期已落库推荐明细（由调用方查库传入，策略层不碰 DB）。
+        兼容两种形态：set[str]（旧调用/单测）或 dict{code: {count, last_date, last_close}}。
+        见 StrategyConfig.QV_REPEAT_COOLDOWN_DAYS / QV_REPEAT_COOLDOWN_MODE：
+        mode="label"（默认）命中票**保留在正式推荐**并打「重复推荐」标签（放行集合不变），
+        mode="block" 命中票移入待核验（不推送、不落库），mode="off" 不判定。
     """
     evaluator = evaluator or evaluate
     stocks = get_stock_list(config, cache)
@@ -5322,19 +5421,32 @@ def _screen_quality_pool(config: StrategyConfig, cache: CacheManager, market_env
         if financial_stocks:
             logger.info("[QV_FINANCIAL_EXCLUDED] %s", "，".join(
                 f"{s['name']}({s['code']})" for s in financial_stocks))
-    # ===== 重复推荐冷却（2026-10-13 新增，默认开启，只减不增）=====
+    # ===== 重复推荐冷却（2026-10-13 新增；2026-10-26 默认动作改为「标注」）=====
     # 真实推荐追踪显示「越跌越推」：云天化 3 次、盐津铺子/西藏药业/新乳业各 2 次，
     # 每次推荐后 F1 均为负。跌→更低位更便宜→再满足准入→再推 的闭环。
-    # 冷却只拦「已在冷却期内被推过的同一只票」，不改变任何闸门判定，故放行集合只减不增。
-    # 机制必须可观测：即使未配置 DB（集合为空），也要把状态打进日志，
+    #
+    # 【2026-10-26 语义变更】原实现（block）命中即把票移入 pending：不推送、不落库，
+    # 使用者看到的是「这只票消失了」，既分不清是冷却拦的还是闸门否决的，也无法事后
+    # 统计「同一只票第 2、3 次推荐到底赚不赚」。用户要求改为：冷却的可以重新推荐，
+    # 旧推荐打废弃标签，统计仍按多条分别统计、规则不变。故生产默认 mode="label"。
+    # 注意这与「放行集合只减不增」的原则**有意的例外**：label 是放宽，补偿是
+    # 可见性（标签写明第几次/上次价与本次价差）+ 可统计（repeat_seq 落库）。
+    # 机制必须可观测：即使未配置 DB（明细为空），也要把状态与生效模式打进日志，
     # 否则「看起来有冷却、实际没生效」和死闸门一样危险。
     _cooldown_days = max(0, int(getattr(config, "QV_REPEAT_COOLDOWN_DAYS", 0) or 0))
-    _cooldown_set = set(recently_recommended or ())
-    _cooldown_on = bool(_cooldown_days > 0)
-    logger.info("重复推荐冷却：%s（冷却期 %d 个交易日，已落库近期推荐 %d 只）",
-                "启用" if _cooldown_on and _cooldown_set else
+    _cooldown_mode = str(getattr(config, "QV_REPEAT_COOLDOWN_MODE", "label") or "label").strip().lower()
+    if _cooldown_mode not in ("label", "block", "off"):
+        logger.warning("重复推荐冷却：QV_REPEAT_COOLDOWN_MODE=%r 非法，按 label 处理"
+                       "（合法值 label/block/off）", _cooldown_mode)
+        _cooldown_mode = "label"
+    _cooldown_info = _normalize_cooldown_info(recently_recommended)
+    _cooldown_on = bool(_cooldown_days > 0) and _cooldown_mode != "off"
+    _cooldown_action = {"label": "标注后照常推荐", "block": "移入待核验(不推送)",
+                        "off": "不判定"}[_cooldown_mode]
+    logger.info("重复推荐冷却：%s（冷却期 %d 个交易日，已落库近期推荐 %d 只，动作=%s）",
+                "启用" if _cooldown_on and _cooldown_info else
                 ("未生效（库中无近期推荐记录或未配置 DB）" if _cooldown_on else "关闭"),
-                _cooldown_days, len(_cooldown_set))
+                _cooldown_days, len(_cooldown_info), _cooldown_action)
     cap = int(config.MAX_PICKS if max_picks is None else max_picks)
     # 行业估值横截面快照（#4a）：行业数据不可用 → 空 dict → 全市场回退 PE 绝对上限
     needs_industry = (config.USE_INDUSTRY_RELATIVE_VALUATION or config.REQUIRE_CYCLICAL_NORMALIZED_VALUATION
@@ -5443,18 +5555,38 @@ def _screen_quality_pool(config: StrategyConfig, cache: CacheManager, market_env
     formal = frame[frame["tier"] == "formal"].copy()
     qualified_count = len(formal)
     cooldown_rows = []
-    if _cooldown_on and _cooldown_set:
-        formal = _apply_repeat_cooldown(formal, frame, _cooldown_set, _cooldown_days, cooldown_rows)
+    cooldown_labeled = 0
+    cooldown_hit_codes: list[str] = []
+    if _cooldown_on and _cooldown_info:
+        _before_rows = len(formal)
+        formal = _apply_repeat_cooldown(formal, frame, _cooldown_info, _cooldown_days,
+                                        cooldown_rows, mode=_cooldown_mode)
+        if _cooldown_mode == "label" and not formal.empty and "repeat_count" in formal.columns:
+            # label 模式不改行数，命中数 = 被打了 repeat_count 的行数
+            cooldown_labeled = int(formal["repeat_count"].notna().sum())
+            cooldown_hit_codes = sorted(formal.loc[formal["repeat_count"].notna(),
+                                                   "code"].astype(str))
+        elif _cooldown_mode == "block":
+            cooldown_hit_codes = sorted({str(r.get("code")) for r in cooldown_rows})
+        if _cooldown_mode == "label" and len(formal) != _before_rows:
+            logger.warning("冷却(label)应保持行数不变，实际 %d → %d，请检查标注逻辑",
+                           _before_rows, len(formal))
     if pending_out is not None:
         pending_out.extend(pending.to_dict("records"))
         pending_out.extend(cooldown_rows)
-    logger.info("优质低估低位最终分层：候选 %d，资格通过 %d，冷却转出 %d，普通待核验 %d，"
-                "观察合计 %d，冷却后正式 %d（行业去重/名额截取前）",
-                len(frame), qualified_count, len(cooldown_rows), len(pending),
-                len(pending) + len(cooldown_rows), len(formal))
+    logger.info("优质低估低位最终分层：候选 %d，资格通过 %d，冷却转出 %d，冷却标注 %d，"
+                "普通待核验 %d，观察合计 %d，冷却后正式 %d（行业去重/名额截取前）",
+                len(frame), qualified_count, len(cooldown_rows), cooldown_labeled,
+                len(pending), len(pending) + len(cooldown_rows), len(formal))
     for row in cooldown_rows:
         logger.info("[QV_COOLDOWN] %s(%s) | 资格=passed | 推送=cooldown | 原因=repeat_cooldown | 冷却期=%d",
                     row.get("name"), row.get("code"), _cooldown_days)
+    for _c in cooldown_hit_codes:
+        _meta = _cooldown_info.get(_c) or {}
+        logger.info("[QV_COOLDOWN_LABEL] %s | 已推 %s 次 | 上次=%s | 冷却期=%d 交易日 | 动作=保留推荐",
+                    _c, int(_meta.get("count") or 1) + 1,
+                    f"{_meta.get('last_date')}@{_meta.get('last_close')}"
+                    if _meta.get("last_date") else "未知", _cooldown_days)
     if not pending.empty:
         tag_counts, sole_counts, combination_counts = Counter(), Counter(), Counter()
         dual_guard = bool(getattr(config, "QV_VALUATION_DUAL_GUARD", False))
@@ -5521,8 +5653,10 @@ def _screen_quality_pool(config: StrategyConfig, cache: CacheManager, market_env
     if not selected.empty:
         for _k, _v in params_fingerprint(config).items():
             selected[_k] = _v
-    logger.info("[QV_DELIVERY_SUMMARY] 最终可推送=%d，资格通过=%d，冷却转出=%d，普通待核验=%d，观察合计=%d",
-                len(selected), qualified_count, len(cooldown_rows), len(pending), len(pending) + len(cooldown_rows))
+    logger.info("[QV_DELIVERY_SUMMARY] 最终可推送=%d，资格通过=%d，冷却转出=%d，冷却标注=%d，"
+                "普通待核验=%d，观察合计=%d",
+                len(selected), qualified_count, len(cooldown_rows), cooldown_labeled,
+                len(pending), len(pending) + len(cooldown_rows))
     return selected
 
 
@@ -5678,16 +5812,18 @@ def run_concurrent_screen(
 
 def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] = None,
          pending_out: Optional[list] = None, volatile_out: Optional[list] = None,
-         recently_recommended: Optional[set] = None) -> Optional[pd.DataFrame]:
+         recently_recommended: Optional[Any] = None) -> Optional[pd.DataFrame]:
     """执行选股主流程，返回正式推荐（formal）DataFrame。
 
     pending_out：可选 list，传出「待核验候选」（财务/周线数据缺失、不与正式推荐混排），
     由调用方决定是否展示——数据缺失不等于筛选通过，宁可少荐。
     volatile_out：可选 list，传出「波动率风控否决」明细（技术面已达标、仅 ATR 超限），
     仅用于 CI 日志留档（**不发送飞书**），不落库、不参与追踪与归因。
-    recently_recommended：近期已落库推荐的代码集合，供重复推荐冷却使用
-    （见 StrategyConfig.QV_REPEAT_COOLDOWN_DAYS）。由调用方查库后传入，
-    策略层不直接访问 DB；不传则冷却不生效（测试/回测路径即为此默认值）。
+    recently_recommended：近期已落库推荐明细，供重复推荐冷却使用
+    （见 StrategyConfig.QV_REPEAT_COOLDOWN_DAYS / QV_REPEAT_COOLDOWN_MODE）。
+    由调用方查库后传入 set[str]（仅代码）或 dict{code:{count,last_date,last_close}}（带明细，
+    label 模式才能标出「第几次、上次价→本次价」）；策略层不直接访问 DB；
+    不传则冷却不生效（测试/回测路径即为此默认值）。
     """
     if config is None: config = StrategyConfig()
     if cache is None: cache = CacheManager(expire_hours=config.CACHE_EXPIRE_HOURS)

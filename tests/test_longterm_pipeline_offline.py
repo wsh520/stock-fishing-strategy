@@ -375,6 +375,8 @@ class LongTermOfflineTest(unittest.TestCase):
 
         index_df = pd.DataFrame({"date": ["2026-10-09", "2026-10-12", "2026-10-13"],
                                  "close": [3900.0, 3950.0, 4000.0]})
+        COOLDOWN_DETAIL = {"603013": {"count": 2, "last_date": "2026-10-22",
+                                      "last_close": 15.30}}
 
         def _run(argv):
             with patch.object(self.bfs, "get_market_environment",
@@ -385,26 +387,28 @@ class LongTermOfflineTest(unittest.TestCase):
                  patch.object(self.bfs, "is_data_degraded", return_value=False), \
                  patch.object(self.bfs, "_screen_quality_pool",
                               MagicMock(return_value=None)) as screen_mock, \
-                 patch.object(run_longterm, "fetch_recent_recommended_codes",
-                              MagicMock(return_value={"603013"})) as fetch_mock, \
+                 patch.object(run_longterm, "fetch_recent_recommendation_detail",
+                              MagicMock(return_value=COOLDOWN_DETAIL)) as fetch_mock, \
                  patch.object(run_longterm, "save_recommendations", MagicMock(return_value=0)), \
                  patch.object(run_longterm, "notify_screening_result", MagicMock()):
                 run_longterm.main(argv)
                 return screen_mock, fetch_mock
 
-        # ① 正常路径：查库 → 传入冷却集合
+        # ① 正常路径：查库 → 传入冷却明细（2026-10-26 起为 dict 而非 set：
+        #    冷却动作改为 label 后，标签必须能写出「第几次 + 上次价 → 本次价」）
         screen_mock, fetch_mock = _run([])
         fetch_mock.assert_called_once()
         self.assertTrue(fetch_mock.call_args.kwargs.get("cross_sleeve") is True,
                         "冷却查询必须跨 sleeve，否则两套策略互不可见")
         self.assertEqual(str(fetch_mock.call_args.args[0]), "longterm_quality")
         passed = screen_mock.call_args.kwargs.get("recently_recommended")
-        self.assertEqual(passed, {"603013"}, "冷却名单必须真的传进筛选层")
+        self.assertEqual(passed, COOLDOWN_DETAIL, "冷却明细必须真的传进筛选层")
+        self.assertEqual(passed["603013"]["count"], 2, "必须带上「已推第几次」")
 
-        # ② --no-save：不查库（避免无意义连接），传空集
+        # ② --no-save：不查库（避免无意义连接），传空 dict
         screen_mock, fetch_mock = _run(["--no-save"])
         fetch_mock.assert_not_called()
-        self.assertEqual(screen_mock.call_args.kwargs.get("recently_recommended"), set())
+        self.assertEqual(screen_mock.call_args.kwargs.get("recently_recommended"), {})
 
 
 if __name__ == "__main__":

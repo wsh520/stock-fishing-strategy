@@ -54,7 +54,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from notify.feishu import notify_screening_result
 from store.mysql_store import (
     STRATEGY_LONGTERM_QUALITY,
-    fetch_recent_recommended_codes,
+    fetch_recent_recommendation_detail,
     save_recommendations,
 )
 
@@ -72,9 +72,9 @@ def _setup_logging() -> None:
     )
 
 
-def _recent_recommended_codes(config, enabled: bool = True,
-                              cross_sleeve: bool = True) -> set:
-    """查询冷却期内已落库推荐的代码，供重复推荐冷却使用（跨 sleeve）。
+def _recent_recommended_detail(config, enabled: bool = True,
+                               cross_sleeve: bool = True) -> dict:
+    """查询冷却期内已落库推荐**明细**，供重复推荐冷却使用（跨 sleeve）。
 
     2026-10-26 补齐。在此之前 run_longterm.py **从不查冷却**，导致：
       · 亚普股份(603013) 10-21 / 10-22 / 10-23 连续三天各被 longterm_quality
@@ -83,27 +83,34 @@ def _recent_recommended_codes(config, enabled: bool = True,
       · 后果一：用户看到的是「反复推送同一只票」；
       · 后果二：月/周归因把 1 个观点计成 3~4 个观测，胜率分布被污染。
 
-    跨 sleeve 查名单（cross_sleeve=True）只会让放行集合更小，符合「宁缺毋滥」。
-    日历天 1.6 倍回溯的理由与 run.py 一致：误差方向恒为「多拦」，不会漏拦。
+    同日再改返回值形态为 {code: {count, last_date, last_close}}：冷却动作由
+    block 改为 label 后，标签需要写出「第几次 + 上次价 → 本次价」，纯代码集合不够用。
 
-    DB 未配置或查询失败时返回空集（冷却不生效），但必须显式打日志——
+    跨 sleeve 查明细（cross_sleeve=True）的含义是「同一只票在任何一个 sleeve 里
+    近期推过都算重复」，与 run.py 完全对称，两套策略因此互相可见。
+    日历天 1.6 倍回溯的理由与 run.py 一致：误差方向恒为「多标」，不会漏标。
+
+    DB 未配置或查询失败时返回空 dict（冷却不生效），但必须显式打日志——
     不可观测的风控等于没有风控。
     """
     days = int(getattr(config, "QV_REPEAT_COOLDOWN_DAYS", 0) or 0)
-    if not enabled or days <= 0:
-        logger.info("重复推荐冷却：关闭（QV_REPEAT_COOLDOWN_DAYS=%d）", days)
-        return set()
+    mode = str(getattr(config, "QV_REPEAT_COOLDOWN_MODE", "label") or "label").lower()
+    if not enabled or days <= 0 or mode == "off":
+        logger.info("重复推荐冷却：关闭（QV_REPEAT_COOLDOWN_DAYS=%d，mode=%s）", days, mode)
+        return {}
     since = (date.today() - timedelta(days=int(days * 1.6) + 2)).isoformat()
     try:
-        codes = fetch_recent_recommended_codes(
+        detail = fetch_recent_recommendation_detail(
             STRATEGY_LONGTERM_QUALITY, since, cross_sleeve=cross_sleeve)
     except Exception:
-        logger.warning("查询近期已推荐代码异常（冷却本次不生效）:\n%s",
+        logger.warning("查询近期推荐明细异常（冷却本次不生效）:\n%s",
                        traceback.format_exc()[-400:])
-        return set()
-    logger.info("重复推荐冷却：已查库，since_date=%s（%d 个交易日窗口，%s），命中历史推荐 %d 只",
-                since, days, "跨 sleeve" if cross_sleeve else "仅本 sleeve", len(codes))
-    return codes
+        return {}
+    logger.info("重复推荐冷却：since_date=%s（%d 个交易日窗口，%s，动作=%s），"
+                "命中历史推荐 %d 只%s",
+                since, days, "跨 sleeve" if cross_sleeve else "仅本 sleeve", mode, len(detail),
+                "" if detail else "（空：库中无近期推荐，或 MySQL 未配置/查询失败）")
+    return detail
 
 
 def _valuation_mode_of(df) -> str | None:
@@ -217,9 +224,9 @@ def main(argv: list[str] | None = None):
         volatile_rows: list[dict] = []
         index_df = bfs.get_index_daily(config, cache)
         # 重复推荐冷却（2026-10-26 补齐，跨 sleeve）：本脚本此前从不查冷却，
-        # 造成亚普股份 3 天被推 3 次。策略层不碰 DB，由入口查库后以集合传入。
-        recently_recommended = (set() if args.no_save
-                                else _recent_recommended_codes(config))
+        # 造成亚普股份 3 天被推 3 次。策略层不碰 DB，由入口查库后以明细传入。
+        recently_recommended = ({} if args.no_save
+                                else _recent_recommended_detail(config))
         if args.no_save:
             logger.info("重复推荐冷却：--no-save 模式下跳过（不查库）")
         output_df = bfs._screen_quality_pool(

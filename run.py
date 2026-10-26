@@ -24,15 +24,15 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
 from notify.feishu import (
     notify_screening_result,
 )
-from store.mysql_store import save_recommendations, fetch_recent_recommended_codes
+from store.mysql_store import save_recommendations, fetch_recent_recommendation_detail
 from src.shadow_ledger import record_shadow_pending
 
 logger = logging.getLogger("run")
 
 
-def _recent_recommended_codes(config, enabled: bool = True,
-                              cross_sleeve: bool = True) -> set:
-    """查询冷却期内已落库推荐的代码，供 main() 的重复推荐冷却使用。
+def _recent_recommended_detail(config, enabled: bool = True,
+                               cross_sleeve: bool = True) -> dict:
+    """查询冷却期内已落库推荐**明细**，供 main() 的重复推荐冷却使用。
 
     2026-10-13 新增。对应真实推荐追踪发现的问题「越跌越推」：云天化在
     09-17/09-23/09-24 被连续推荐 3 次，推荐价 28.29 → 27.95 → 27.56 一路走低，
@@ -42,33 +42,41 @@ def _recent_recommended_codes(config, enabled: bool = True,
     strategy='bottom_fishing'，导致 run_longterm.py 的推荐对本策略不可见、
     而 run_longterm.py 自己又从不查冷却，两套 sleeve 互不知道对方推了什么。
     实证：亚普股份 10-21/22/23 三天各被 longterm_quality 推 1 次，10-22 还被
-    bottom_fishing 再推 1 次，同一只票 3 天 4 行。跨 sleeve 拉名单只会让
-    放行集合更小（拦得更严），符合「宁缺毋滥」。
+    bottom_fishing 再推 1 次，同一只票 3 天 4 行。
+
+    2026-10-26 同日再改**返回值形态**：从 set[str] 改为
+    {code: {"count": 累计第几次, "last_date": 上次推荐日, "last_close": 上次推荐价}}。
+    原因：冷却动作由 block 改为 label（命中票照常推荐、只加标注），
+    标签必须能写出「10 日内第 2 次、上次 27.95 → 本次 27.56(-1.4%)」，
+    否则重复推荐只会制造困惑。策略层 _normalize_cooldown_info 兼容 set 与 dict，
+    旧调用不会因此报错。
 
     【日历天近似是有意为之】冷却期按「交易日」定义，这里用 1.6 倍日历天回溯。
-    A 股 1 个交易日 ≈ 1.4 个日历天，取 1.6 倍**只会多圈进几只更早的推荐**
-    （拦得更严），绝不会漏掉本应被冷却的票——即误差方向恒为「只减不增」，
-    不会因为日历近似而放行本应被拦的票。
+    A 股 1 个交易日 ≈ 1.4 个日历天，取 1.6 倍**只会多圈进几只更早的推荐**，
+    绝不会漏掉本该被标重复的票——误差方向恒为「多标」，不会漏标。
 
-    DB 未配置或查询失败时返回空集 → 冷却不生效。这里必须显式记录状态，
+    DB 未配置或查询失败时返回空 dict → 冷却不生效。这里必须显式记录状态，
     否则「看起来有冷却、实际没生效」与死闸门同样危险（_screen_quality_pool
     也会再打一次日志，两处都能看到）。
     """
     days = int(getattr(config, "QV_REPEAT_COOLDOWN_DAYS", 0) or 0)
-    if not enabled or days <= 0:
-        logger.info("重复推荐冷却：关闭（QV_REPEAT_COOLDOWN_DAYS=%d）", days)
-        return set()
+    mode = str(getattr(config, "QV_REPEAT_COOLDOWN_MODE", "label") or "label").lower()
+    if not enabled or days <= 0 or mode == "off":
+        logger.info("重复推荐冷却：关闭（QV_REPEAT_COOLDOWN_DAYS=%d，mode=%s）", days, mode)
+        return {}
     since = (date.today() - timedelta(days=int(days * 1.6) + 2)).isoformat()
     try:
-        codes = fetch_recent_recommended_codes(
+        detail = fetch_recent_recommendation_detail(
             "bottom_fishing", since, cross_sleeve=cross_sleeve)
     except Exception:
-        logger.warning("查询近期已推荐代码异常（冷却本次不生效）:\n%s",
+        logger.warning("查询近期推荐明细异常（冷却本次不生效）:\n%s",
                        traceback.format_exc()[-400:])
-        return set()
-    logger.info("重复推荐冷却：已查库，since_date=%s（%d 个交易日窗口，%s），命中历史推荐 %d 只",
-                since, days, "跨 sleeve" if cross_sleeve else "仅本 sleeve", len(codes))
-    return codes
+        return {}
+    logger.info("重复推荐冷却：since_date=%s（%d 个交易日窗口，%s，动作=%s），"
+                "命中历史推荐 %d 只%s",
+                since, days, "跨 sleeve" if cross_sleeve else "仅本 sleeve", mode, len(detail),
+                "" if detail else "（空：库中无近期推荐，或 MySQL 未配置/查询失败）")
+    return detail
 
 
 def _setup_logging() -> None:
@@ -192,8 +200,8 @@ def run(argv: list[str] | None = None):
         logger.info("Step 2/4 执行选股策略（明细见 strategy 日志）...")
         pending_rows: list[dict] = []
         volatile_rows: list[dict] = []
-        # 重复推荐冷却：查库拿近期已落库推荐的代码，交由策略层过滤（策略层不碰 DB）
-        recently_recommended = _recent_recommended_codes(config) if save_enabled else set()
+        # 重复推荐冷却：查库拿近期已落库推荐明细（含次数/上次价），交由策略层标注（策略层不碰 DB）
+        recently_recommended = _recent_recommended_detail(config) if save_enabled else {}
         if not save_enabled:
             logger.info("重复推荐冷却：--no-save 模式下跳过（不查库，避免无意义连接）")
         output_df = main(config=config, cache=cache, pending_out=pending_rows,
