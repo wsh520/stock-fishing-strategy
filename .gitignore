@@ -1,3 +1,19 @@
+# ============================================================
+# 【最高优先级】本地数据库凭据 —— 严禁入库
+# 本仓库是 PUBLIC。凭据一旦进入 commit 历史即不可撤回：
+# force push 之后 GitHub secret scanning 与第三方爬虫早已抓取。
+# .git/hooks/pre-commit 会二次拦截（防止 git add -f 绕过本规则）。
+# 位置：.secrets/stock-db.env   模板字段：MYSQL_HOST/PORT/USER/PASSWORD/DATABASE
+# ============================================================
+.secrets/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+id_rsa*
+
 # Python
 __pycache__/
 *.py[cod]
@@ -51,3 +67,6 @@ data/diag_*.csv
 .test-artifacts/
 .acl-recovery/
 tmpw32v7zve/
+
+# 忽略log
+*.log
