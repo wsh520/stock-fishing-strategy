@@ -241,8 +241,15 @@ def _ensure_tables(conn) -> None:
         existing = {row[0] for row in cur.fetchall()}
         for col, alter in _RECOMMENDATION_ALTERS.items():
             if col not in existing:
-                cur.execute(f"ALTER TABLE stock_recommendation {alter}")
-                logger.info("stock_recommendation 已补充列: %s", col)
+                # 逐条 try：补列是**加性**操作，一条失败不应连带后一条也加不上。
+                # 必须 logger.error 而不是 warning —— 这里失败会被 save_recommendations 的
+                # 兜底 except 吞成「新增 0 条」，看起来和「今天没推荐」完全一样。
+                try:
+                    cur.execute(f"ALTER TABLE stock_recommendation {alter}")
+                    logger.info("stock_recommendation 已补充列: %s", col)
+                except Exception as e:  # noqa: BLE001
+                    logger.error("stock_recommendation 补列 %s 失败（该列相关功能将降级）: %s "
+                                 "| DDL: ALTER TABLE stock_recommendation %s", col, e, alter)
         # ===== 文本列容量升级 + 实际容量探测（2026-10-13）=====
         # 幂等：已是 TEXT 就跳过 MODIFY。无论升级成功与否，都记录**实际**列容量
         # 供落库前截断兜底——存量库的列可能短于代码 DDL，不能假设它就是 255。
