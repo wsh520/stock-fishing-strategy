@@ -76,6 +76,8 @@ CREATE TABLE IF NOT EXISTS stock_recommendation (
     rec_tier         VARCHAR(8)      NULL COMMENT '推荐层级 formal/pending',
     strategy         VARCHAR(16)     NOT NULL DEFAULT 'bottom_fishing' COMMENT '策略来源 bottom_fishing/volume_breakout/longterm_quality',
     missing_tags     TEXT            NULL COMMENT '缺失项标签（逗号分隔）',
+    score_weights    VARCHAR(24)     NULL COMMENT '综合分权重快照 质量/估值/技术，例 0.45/0.30/0.25',
+    stop_rule        VARCHAR(32)     NULL COMMENT '止损失口径快照，例 atr3x_floor15 / fixed15',
     created_at       DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '写入时间',
     PRIMARY KEY (id),
     UNIQUE KEY uk_rec_date_code_strategy (rec_date, code, strategy),
@@ -121,6 +123,11 @@ _RECOMMENDATION_ALTERS = {
     "rec_tier": "ADD COLUMN rec_tier VARCHAR(8) NULL COMMENT '推荐层级 formal/pending' AFTER weekly_status",
     "strategy": "ADD COLUMN strategy VARCHAR(16) NOT NULL DEFAULT 'bottom_fishing' COMMENT '策略来源 bottom_fishing/volume_breakout' AFTER rec_tier",
     "missing_tags": "ADD COLUMN missing_tags TEXT NULL COMMENT '缺失项标签（逗号分隔）' AFTER rec_tier",
+    # 2026-10-26 新增口径快照列：同一列在不同日期代表不同规则，回看必须可判别。
+    # score 权重 09-28 前为 0.50/0.35/0.15、之后 0.45/0.30/0.25；
+    # stop_loss 10-07 前为纯 3×ATR、之后为 max(3×ATR,15%)。
+    "score_weights": "ADD COLUMN score_weights VARCHAR(24) NULL COMMENT '综合分权重快照 质量/估值/技术，例 0.45/0.30/0.25' AFTER missing_tags",
+    "stop_rule": "ADD COLUMN stop_rule VARCHAR(32) NULL COMMENT '止损失口径快照，例 atr3x_floor15 / fixed15' AFTER score_weights",
 }
 
 # ===== 文本列容量升级（幂等，非破坏，不改任何已有数据）=====
@@ -322,6 +329,26 @@ def _f(v: Any) -> Optional[float]:
     return float(v)
 
 
+def _opt_text(v: Any) -> Optional[str]:
+    """可选短文本字段：None/NaN/空串 → NULL，避免把 'nan' 当口径写进库。
+
+    2026-10-26 新增，用于 score_weights / stop_rule 这类口径快照列。
+    `str(nan) == 'nan'` 是真值，直接 str() 会把缺失值写成字面量 'nan'，
+    事后查库会误以为那是某种口径名。
+    """
+    if v is None:
+        return None
+    try:
+        if pd.isna(v):
+            return None
+    except (TypeError, ValueError):
+        pass
+    s = str(v).strip()
+    if not s or s.lower() in {"nan", "none", "nat"}:
+        return None
+    return s
+
+
 def _clip_to_capacity(value: Any, column: str, code: str) -> Optional[str]:
     """按**实际列容量**裁剪文本，裁剪时 warning。容量未知（未探测/TEXT）则原样返回。
 
@@ -419,14 +446,17 @@ def save_recommendations(df: Optional[pd.DataFrame], strategy: str = STRATEGY_BO
             "formal",
             strategy,
             _clip_to_capacity(r.get("missing_tags"), "missing_tags", code_str),
+            _opt_text(r.get("score_weights")),
+            _opt_text(r.get("stop_rule")),
         ))
 
     insert_sql = """
         INSERT INTO stock_recommendation
         (rec_date, code, name, rec_close, score, grade, daily_score, rsi, rsi7, rsi21,
          vol_ratio, turnover_ratio, stop_loss, take_profit, rr_ratio, market_env, has_divergence,
-         signals_hit, fund_status, weekly_status, rec_tier, strategy, missing_tags)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+         signals_hit, fund_status, weekly_status, rec_tier, strategy, missing_tags,
+         score_weights, stop_rule)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     """
     # 查询已存在记录的 created_at，判断是否超过30天
     check_sql = """
@@ -566,7 +596,8 @@ def fetch_rec_codes_for_date(rec_date: str) -> set[str]:
         return set()
 
 
-def fetch_recent_recommended_codes(strategy: str, since_date: str) -> set[str]:
+def fetch_recent_recommended_codes(strategy: str, since_date: str,
+                                   cross_sleeve: bool = False) -> set[str]:
     """查询 since_date（含）以来该 strategy 已落库的 formal 推荐代码集合，供冷却期使用。
 
     【为什么需要】真实落库推荐追踪（diag_real_recs.py，2026-09-08~10-09）显示
@@ -584,17 +615,31 @@ def fetch_recent_recommended_codes(strategy: str, since_date: str) -> set[str]:
     风控等于没有风控。
 
     since_date 格式 YYYY-MM-DD，由调用方按交易日历回溯，不在此处做日期运算。
+
+    cross_sleeve（2026-10-26 新增）：True 时**忽略 strategy 过滤**，把其他 sleeve
+    近期已推出的代码一并返回，用于跨 sleeve 去重。实证依据：亚普股份(603013) 在
+    10-21/22/23 连续 3 天各被 longterm_quality 推荐 1 次，10-22 当天还被
+    bottom_fishing 再推 1 次 —— 同一只票 3 天写了 4 行。原因是 run_longterm.py
+    从未传 recently_recommended（冷却只对 run.py 生效），且它与 run.py 各查各的
+    strategy，互不可见。用户视角这是「同一只票被反复推送」，归因侧则把 1 个观点
+    计成 4 个观测，胜率分布被污染。跨 sleeve 只会让结果更少，符合「只减不增」。
     """
     if not is_configured():
         return set()
-    sql = ("SELECT DISTINCT code FROM stock_recommendation "
-           "WHERE strategy = %s AND rec_date >= %s")
+    if cross_sleeve:
+        sql = ("SELECT DISTINCT code FROM stock_recommendation "
+               "WHERE rec_date >= %s")
+        params: tuple = (str(since_date),)
+    else:
+        sql = ("SELECT DISTINCT code FROM stock_recommendation "
+               "WHERE strategy = %s AND rec_date >= %s")
+        params = (str(strategy), str(since_date))
     try:
         conn = _connect()
         try:
             _ensure_tables(conn)
             with conn.cursor() as cur:
-                cur.execute(sql, (str(strategy), str(since_date)))
+                cur.execute(sql, params)
                 return {str(row[0]) for row in cur.fetchall()}
         finally:
             conn.close()

@@ -362,5 +362,50 @@ class LongTermOfflineTest(unittest.TestCase):
         notify_mock.assert_called_once()
 
 
+    def test_longterm_passes_cross_sleeve_cooldown(self):
+        """P0-1（2026-10-26）：run_longterm 必须把重复推荐冷却名单传进筛选层。
+
+        背景：亚普股份(603013) 10-21/22/23 连续 3 天各被 longterm_quality 推荐 1 次，
+        10-22 还被 bottom_fishing 再推 1 次 —— 同一只票 3 天 4 行。根因是
+        run_longterm.py 从不查冷却，且两套 sleeve 各查各的 strategy。
+        """
+        import run_longterm
+        from unittest.mock import MagicMock, patch
+        import pandas as pd
+
+        index_df = pd.DataFrame({"date": ["2026-10-09", "2026-10-12", "2026-10-13"],
+                                 "close": [3900.0, 3950.0, 4000.0]})
+
+        def _run(argv):
+            with patch.object(self.bfs, "get_market_environment",
+                              return_value={"regime": "bull", "description": "偏多（测试）"}), \
+                 patch.object(self.bfs, "get_index_daily", return_value=index_df), \
+                 patch.object(self.bfs, "latest_completed_trade_day", return_value="2026-10-13"), \
+                 patch.object(self.bfs, "market_crash_halt", return_value=None), \
+                 patch.object(self.bfs, "is_data_degraded", return_value=False), \
+                 patch.object(self.bfs, "_screen_quality_pool",
+                              MagicMock(return_value=None)) as screen_mock, \
+                 patch.object(run_longterm, "fetch_recent_recommended_codes",
+                              MagicMock(return_value={"603013"})) as fetch_mock, \
+                 patch.object(run_longterm, "save_recommendations", MagicMock(return_value=0)), \
+                 patch.object(run_longterm, "notify_screening_result", MagicMock()):
+                run_longterm.main(argv)
+                return screen_mock, fetch_mock
+
+        # ① 正常路径：查库 → 传入冷却集合
+        screen_mock, fetch_mock = _run([])
+        fetch_mock.assert_called_once()
+        self.assertTrue(fetch_mock.call_args.kwargs.get("cross_sleeve") is True,
+                        "冷却查询必须跨 sleeve，否则两套策略互不可见")
+        self.assertEqual(str(fetch_mock.call_args.args[0]), "longterm_quality")
+        passed = screen_mock.call_args.kwargs.get("recently_recommended")
+        self.assertEqual(passed, {"603013"}, "冷却名单必须真的传进筛选层")
+
+        # ② --no-save：不查库（避免无意义连接），传空集
+        screen_mock, fetch_mock = _run(["--no-save"])
+        fetch_mock.assert_not_called()
+        self.assertEqual(screen_mock.call_args.kwargs.get("recently_recommended"), set())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

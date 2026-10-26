@@ -30,12 +30,20 @@ from src.shadow_ledger import record_shadow_pending
 logger = logging.getLogger("run")
 
 
-def _recent_recommended_codes(config, enabled: bool = True) -> set:
+def _recent_recommended_codes(config, enabled: bool = True,
+                              cross_sleeve: bool = True) -> set:
     """查询冷却期内已落库推荐的代码，供 main() 的重复推荐冷却使用。
 
     2026-10-13 新增。对应真实推荐追踪发现的问题「越跌越推」：云天化在
     09-17/09-23/09-24 被连续推荐 3 次，推荐价 28.29 → 27.95 → 27.56 一路走低，
     三次推荐后首日收益全为负。
+
+    2026-10-26 改为**跨 sleeve**（cross_sleeve=True）：原来只查
+    strategy='bottom_fishing'，导致 run_longterm.py 的推荐对本策略不可见、
+    而 run_longterm.py 自己又从不查冷却，两套 sleeve 互不知道对方推了什么。
+    实证：亚普股份 10-21/22/23 三天各被 longterm_quality 推 1 次，10-22 还被
+    bottom_fishing 再推 1 次，同一只票 3 天 4 行。跨 sleeve 拉名单只会让
+    放行集合更小（拦得更严），符合「宁缺毋滥」。
 
     【日历天近似是有意为之】冷却期按「交易日」定义，这里用 1.6 倍日历天回溯。
     A 股 1 个交易日 ≈ 1.4 个日历天，取 1.6 倍**只会多圈进几只更早的推荐**
@@ -52,13 +60,14 @@ def _recent_recommended_codes(config, enabled: bool = True) -> set:
         return set()
     since = (date.today() - timedelta(days=int(days * 1.6) + 2)).isoformat()
     try:
-        codes = fetch_recent_recommended_codes("bottom_fishing", since)
+        codes = fetch_recent_recommended_codes(
+            "bottom_fishing", since, cross_sleeve=cross_sleeve)
     except Exception:
         logger.warning("查询近期已推荐代码异常（冷却本次不生效）:\n%s",
                        traceback.format_exc()[-400:])
         return set()
-    logger.info("重复推荐冷却：已查库，since_date=%s（%d 个交易日窗口），命中历史推荐 %d 只",
-                since, days, len(codes))
+    logger.info("重复推荐冷却：已查库，since_date=%s（%d 个交易日窗口，%s），命中历史推荐 %d 只",
+                since, days, "跨 sleeve" if cross_sleeve else "仅本 sleeve", len(codes))
     return codes
 
 

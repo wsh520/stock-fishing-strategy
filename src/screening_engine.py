@@ -360,6 +360,18 @@ class StrategyConfig:
     INDUSTRY_PE_WARN: float = 50.0
     CYCLICAL_INDUSTRY_KEYWORDS: tuple = ("煤炭", "钢铁", "黑色金属", "有色", "石油", "化工", "化学原料", "采矿", "航运", "水上运输")
     CYCLICAL_INDUSTRY_CODES: tuple = ("B06", "B07", "B08", "B09", "B10", "B11", "C25", "C26", "C30", "C31", "C32", "G55")
+    # ===== 周期性误判豁免名单（2026-10-26 新增）=====
+    # 【为什么需要】Baostock query_stock_industry 只给证监会大类，C26
+    # 「化学原料和化学制品制造业」把云天化（磷肥，真周期）与珀莱雅（化妆品）、
+    # 登康口腔（牙膏，日化）归为同一个逐字相同的行业名，**无法用关键词区分**。
+    # 误判的两个实测后果：
+    #   ① 消费股被强行施加 CYCLICAL_NORMALIZED_PE_MAX=25 的周期正常化检查；
+    #   ② 归因失真——把这两只算进周期组，周期组均值从 -4.62% 被抬到 -2.44%，
+    #      而它们恰是「周期组」里表现最好的两条（+0.96% / +7.22%）。
+    # 【边界】只按代码豁免，且豁免判断在 missing 之后（行业缺失仍判 missing，
+    # 不会绕过「行业分类缺失」的待核验标记）。**新增标的必须人工维护**：
+    # 宁可漏豁免（继续按周期收紧），也不放宽行业判定口径。
+    CYCLICAL_EXEMPT_CODES: tuple = ("603605", "001328")  # 珀莱雅、登康口腔
     CYCLICAL_PEAK_PROFIT_MULT: float = 1.5
     CYCLICAL_PEAK_AS_PENDING: bool = False
     REQUIRE_CYCLICAL_NORMALIZED_VALUATION: bool = True
@@ -2773,6 +2785,40 @@ def compute_risk_reward(entry_price: float, config: StrategyConfig, atr: Optiona
     rr_ratio = reward / risk if risk > 0 else 0.0
     return {"stop_loss": round(stop_loss, 2), "take_profit": round(take_profit, 2), "rr_ratio": round(rr_ratio, 2)}
 
+def params_fingerprint(config: StrategyConfig) -> dict:
+    """本次运行的「落库口径快照」（2026-10-26 新增，写入 stock_recommendation）。
+
+    【为什么必须落库】同一个字段在不同日期代表不同规则，事后回看无法判别：
+      · `score`：2026-09-28 前权重 0.50/0.35/0.15，之后 0.45/0.30/0.25
+        （云天化 09-23 的 84.6 分 = 质量100×0.50 + 估值99×0.35 + 技术0×0.15，
+         换成现行权重只有 74.7 分且会因技术分<40 降为 pending）；
+      · `stop_loss`：2026-10-07 前是纯 3×ATR，之后是 max(3×ATR, 15%)
+        （云天化 09-24 落库 26.05 = -5.5% 旧口径；华东医药 10-09 落库 23.20
+         = 恰好 -15% 新口径）。
+    实测危害：按字段机械执行止损会得出**相反结论**——云天化 10-22 收 26.03，
+    旧口径=已破位止损，新口径=距止损还有 15% 空间。复盘与归因都不能再靠猜。
+
+    返回的键名与 stock_recommendation 列名一一对应；取不到时置 None（不伪造）。
+    """
+    try:
+        weights = "{:.2f}/{:.2f}/{:.2f}".format(
+            float(config.QUALITY_SCORE_WEIGHT),
+            float(config.VALUATION_SCORE_WEIGHT),
+            float(config.TECHNICAL_SCORE_WEIGHT))
+    except Exception:  # noqa: BLE001 配置缺失不应阻断落库
+        weights = None
+    try:
+        floor_pct = int(round(float(config.FIXED_STOP_LOSS_PCT)))
+        if getattr(config, "USE_ATR_STOP", False):
+            rule = "atr{}x_floor{}".format(
+                int(round(float(config.ATR_STOP_MULT))), floor_pct)
+        else:
+            rule = "fixed{}".format(floor_pct)
+    except Exception:  # noqa: BLE001
+        rule = None
+    return {"score_weights": weights, "stop_rule": rule}
+
+
 def _fmt_cell(v: Any, default: str = "-") -> Any:
     """展示用取值：None/NaN 统一回退默认值，避免卡片出现 None 或 nan。"""
     if v is None:
@@ -4855,7 +4901,9 @@ def evaluate_quality_value(daily_df: Optional[pd.DataFrame], code: str, name: st
         hw = float(np.clip(config.HISTORICAL_VALUATION_WEIGHT, 0, 1))
         valuation_score = (1 - hw) * valuation_score + hw * 100 * (1 - history["percentile"])
     from src.recommendation_factors import classify_cyclical_industry
-    cycle_class = classify_cyclical_industry(industry_name, config.CYCLICAL_INDUSTRY_CODES, config.CYCLICAL_INDUSTRY_KEYWORDS)
+    cycle_class = classify_cyclical_industry(
+        industry_name, config.CYCLICAL_INDUSTRY_CODES, config.CYCLICAL_INDUSTRY_KEYWORDS,
+        code=code, exempt_codes=getattr(config, "CYCLICAL_EXEMPT_CODES", ()))
     if cycle_class == "missing" and (config.REQUIRE_CYCLICAL_NORMALIZED_VALUATION or config.INDUSTRY_PE_ABSOLUTE_CAPS):
         missing.append("industry_classification")
     cyclical = cycle_class == "cyclical"
@@ -5468,6 +5516,11 @@ def _screen_quality_pool(config: StrategyConfig, cache: CacheManager, market_env
     if len(formal) > cap:
         logger.info("通过 formal %d 只，按综合分截取前 %d 只（市场环境上限）", len(formal), cap)
     selected = formal.head(cap).reset_index(drop=True)
+    # 口径快照：把本次实际生效的评分权重与止损失规则写进每一行，供事后判别。
+    # 缺列时不下发也不伪造 —— store 层读不到就写 NULL。
+    if not selected.empty:
+        for _k, _v in params_fingerprint(config).items():
+            selected[_k] = _v
     logger.info("[QV_DELIVERY_SUMMARY] 最终可推送=%d，资格通过=%d，冷却转出=%d，普通待核验=%d，观察合计=%d",
                 len(selected), qualified_count, len(cooldown_rows), len(pending), len(pending) + len(cooldown_rows))
     return selected

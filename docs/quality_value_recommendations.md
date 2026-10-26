@@ -16,7 +16,7 @@
 | 中长期位置 | 至少250根有效日线，当前收盘在250日收盘序列中秩分位≤40%；同价按中间名次计，不把完全横盘误判成最低位 |
 | 近期底部 | `QV_LOW_ANCHOR_MODE="recent_structure"`；近60日收盘最低点年龄5～40个交易日，距底上限为 `5×ATR/现价`，限制在10%～20%。底部未确认pending，涨离上限否决；250日盘中极值距离用于诊断，固定15%仅属legacy模式 |
 | 止跌 | `QV_STABILIZATION_MODE="strict"`；强/中确认通过，弱确认pending，无改善否决；窗口缺失不能当确认。**medium 必须站上 MA20**（`QV_STABILIZATION_MEDIUM_REQUIRES_MA20=True`，2026-10-13）：原左侧通道（MACD改善+无新低）不再构成 medium，降级为 weak→pending |
-| 重复推荐 | `QV_REPEAT_COOLDOWN_DAYS=10`（2026-10-13）：同一股票在冷却期内已落库推荐过则不再重复推送，移入待核验（可见不丢弃）。集合由 `run.py` 查库经 `store.fetch_recent_recommended_codes` 传入，策略层不碰 DB；未配置 DB 时不生效且会显式打印状态 |
+| 重复推荐 | `QV_REPEAT_COOLDOWN_DAYS=10`（2026-10-13，**2026-10-26 改为跨 sleeve**）：同一股票在冷却期内已落库推荐过则不再重复推送，移入待核验（可见不丢弃）。集合由入口脚本查库经 `store.fetch_recent_recommended_codes(..., cross_sleeve=True)` 传入，`run.py` 与 `run_longterm.py` 共用同一份名单，策略层不碰 DB；未配置 DB 时不生效且会显式打印状态。改为跨 sleeve 的实证：亚普股份 10-21/22/23 各被 `longterm_quality` 推 1 次、10-22 又被 `bottom_fishing` 推 1 次，同一只票 3 天 4 行 |
 | 状态技术分 | `QV_TECHNICAL_STATE_SCORING=True`，趋势40+动能30+量价30，持续状态与最近5日衰减事件共同计分；技术分<40进入pending。旧事件日评分可显式关闭状态评分后对照 |
 | 额外分数线 | `MIN_QV_SCORE=0`、`MIN_QUALITY_SCORE=0`，默认关闭重复综合分/质量分硬门；年度资格与技术40门仍生效。38/50等旧值不是当前默认 |
 | 行情与风控 | 独立交易日历确认北京时间应完成交易日，指数与个股必须核验；合法OHLC、成交额、停牌缺口及ATR风控仍独立生效。金融企业留专项pending |
@@ -24,6 +24,8 @@
 PB/PE 是 TTM 盈利与 MRQ 净资产构成的估值盈利能力 proxy，不是真实年度 ROE，也没有实现增长可比组。年度ROE质量检查使用财报证据，不能用该proxy代替。行业内便宜也不等于绝对便宜；默认PE>50给风险提示，`INDUSTRY_PE_ABSOLUTE_CAPS` 可设置行业专属硬上限。
 
 周期正常化估值用 `当前PE TTM × 当前归母利润TTM / 连续年度归母利润中位数`，至少3个正且有限年度样本，不以合并净利替代归母利润。合并净利TTM超过年度合并净利中位数1.5倍是独立盈利高点风险标签，默认 `CYCLICAL_PEAK_AS_PENDING=False`；它不替代正常化估值硬门。
+
+**周期行业误判豁免（2026-10-26）**：`classify_cyclical_industry` 依赖行业名，而 Baostock `query_stock_industry` 只给证监会大类——`C26化学原料和化学制品制造业` 逐字相同地覆盖云天化（磷肥）与珀莱雅（化妆品）、登康口腔（牙膏）。两只消费股因此被误加周期正常化检查，并把归因里的「周期组」均值从 −4.62% 抬到 −2.44%。现由 `CYCLICAL_EXEMPT_CODES=("603605","001328")` 按代码豁免；豁免判断在 `missing` 之后，行业缺失仍判 missing 并照常打 `industry_classification`。新增标的只能人工维护：**宁可漏豁免（继续按周期收紧），也不放宽行业判定口径**。
 
 ## 经营、公告日与风险证据
 

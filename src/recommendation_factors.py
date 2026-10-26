@@ -4,12 +4,27 @@ import numpy as np
 import pandas as pd
 
 
-def classify_cyclical_industry(industry, codes, keywords):
+def classify_cyclical_industry(industry, codes, keywords, code=None, exempt_codes=()):
+    """按行业名判定是否周期行业。
+
+    2026-10-26 增加 code / exempt_codes：数据源（Baostock query_stock_industry）
+    只给证监会大类，**C26「化学原料和化学制品制造业」同时覆盖云天化（磷肥，真周期）
+    与珀莱雅（化妆品）、登康口腔（牙膏）——行业名逐字相同，无法靠关键词区分**。
+    实测后果：这两只消费股被当成周期股，一是被强行施加 CYCLICAL_NORMALIZED_PE_MAX
+    检查，二是把「周期组」业绩统计抬高了约 2.2 个百分点
+    （-4.62% → -2.44%），归因结论直接失真。
+    故只能按代码显式豁免；豁免判断放在 missing 之后，行业缺失仍判 missing，
+    不会因为进了豁免名单就绕过「行业分类缺失」的待核验标记。
+    """
     name = str(industry or "").strip()
     if not name or name.lower() in {"unknown", "none", "nan", "未知", "未分类"}:
         return "missing"
-    code = re.match(r"^([A-Z]\d{2})(?:\D|$)", name.upper())
-    if (code and code.group(1) in codes) or any(word in name for word in keywords):
+    if code is not None:
+        exempt = {str(c).strip() for c in (exempt_codes or ())}
+        if str(code).strip() in exempt:
+            return "non_cyclical"
+    code_match = re.match(r"^([A-Z]\d{2})(?:\D|$)", name.upper())
+    if (code_match and code_match.group(1) in codes) or any(word in name for word in keywords):
         return "cyclical"
     return "non_cyclical"
 

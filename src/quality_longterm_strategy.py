@@ -631,7 +631,9 @@ def evaluate_quality_longterm(daily_df: Optional[pd.DataFrame], code: str, name:
     industry_name = str((val_context or {}).get("industry", ""))
     cycle_class = classify_cyclical_industry(
         industry_name, config.CYCLICAL_INDUSTRY_CODES,
-        config.CYCLICAL_INDUSTRY_KEYWORDS)
+        config.CYCLICAL_INDUSTRY_KEYWORDS,
+        code=getattr(signal, "code", None),
+        exempt_codes=getattr(config, "CYCLICAL_EXEMPT_CODES", ()))
 
     extra_tags: list[str] = []
     if cycle_class == "cyclical" and getattr(config, "CYCLICAL_PB_FALLBACK_ENABLED", False):

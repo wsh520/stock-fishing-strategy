@@ -34,7 +34,7 @@
 | 价格位置 | 至少250根有效日线，收盘价序列中秩分位≤40%；同价取中间名次，取数窗口600自然日 |
 | 近期底部 | 默认 `QV_LOW_ANCHOR_MODE="recent_structure"`：近60日收盘低点年龄5～40个交易日；距底上限 `5×ATR/现价` 限制在10%～20%（`recommendation_factors.assess_low_structure`），未确认pending、超限否决（`FAIL_OVEREXTENDED`）。`legacy` 模式改用250日盘中极值 + `QV_MAX_GAIN_FROM_250D_LOW`=15% 判定，同一否决码 |
 | 止跌与技术40 | 默认strict：MA20确认且站上MA60为strong；**medium 必须站上MA20**（`QV_STABILIZATION_MEDIUM_REQUIRES_MA20=True`，2026-10-13收紧）——旧式左侧通道（MACD连续3日改善且近5日不创新低）不再构成medium，降级为weak只观察；无确认否决。默认状态技术分趋势40+动能30+量价30，持续状态与最近5日衰减事件计分，技术<40（`MIN_TECHNICAL_SCORE_FORMAL`）为pending。`QV_STABILIZATION_MODE` 可切 `risk_only`（只否决MACD深度弱势且恶化，「站上MA20」降级为标签）与 `disabled`；**默认仍为 strict** |
-| 重复推荐冷却 | `QV_REPEAT_COOLDOWN_DAYS=10`（2026-10-13）：同一股票在冷却期内已落库推荐过则**不再重复推送**，移入待核验（可见、不丢弃、不落库）。集合由 `run.py` 查库（`store.fetch_recent_recommended_codes`）经 `main(recently_recommended=…)` 传入，**策略层不碰 DB**；过滤走纯函数 `_apply_repeat_cooldown`。DB未配置时不生效，但 run.py 与筛选层**两处都显式打印状态**——不可观测的风控等于没有风控。设为0可关闭 |
+| 重复推荐冷却 | `QV_REPEAT_COOLDOWN_DAYS=10`（2026-10-13，**2026-10-26 改为跨 sleeve**）：同一股票在冷却期内已落库推荐过则**不再重复推送**，移入待核验（可见、不丢弃、不落库）。集合由入口脚本查库（`store.fetch_recent_recommended_codes(strategy, since, cross_sleeve=True)`）经 `main(recently_recommended=…)` 传入，**策略层不碰 DB**；过滤走纯函数 `_apply_repeat_cooldown`。跨 sleeve 理由：此前 `run_longterm.py` 从不查冷却、且两套 sleeve 各查各的 strategy，实测造成亚普股份 3 天 4 行（10-21/22/23 各 1 条 `longterm_quality` + 10-22 再 1 条 `bottom_fishing`）。DB未配置时不生效，但入口脚本与筛选层**两处都显式打印状态**——不可观测的风控等于没有风控。设为0可关闭 |
 | 额外分数线 | `MIN_QV_SCORE=0`、`MIN_QUALITY_SCORE=0`，默认关闭重复综合分/质量分硬门；旧38/50不是当前规则。年度资格、止跌与技术40仍必须核验 |
 | 执行口径（交易计划） | **纯展示，不参与准入/排序/否决**（2026-10-13 执行中期化）：持有 **40~60** 个交易日（原 10~20）、止盈固定 **+15%**（原 +30%）、止损 `max(3×ATR, 15%)` 不变、建仓区间＝信号日收盘 ±`ENTRY_BAND_PCT`=1.5% 次日开盘执行。依据：strict 幸存者 F20 −1.40% 而 F60 +3.55%（`audit_current_strict.out`）+31880 次随机起点实测（+30% 止盈 20 日触发率仅 5.9%）。突破 sleeve 为短线口径（持有 10~20、止盈 min(+15%,+5×ATR)）已显式覆写，不随本改动变长 |
 | 行情时效与缓存 | 北京时间盘中/闭市阶段用行情 `.meta.json` 记录版本、取数时间、阶段和末bar日期；touch/mtime不能证明新鲜。独立覆盖当日的交易日历给出应完成交易日，指数必须核验，不能由index自身证明index时效 |
@@ -46,12 +46,12 @@
 数据校验/时效 → 流动性(3000万) → 停牌缺口(>12天) → 250日低位(≤40%)
   → PE估值(行业分位≤60%，样本不足回退绝对≤25) → PB异常(PB≤0否决/偏高仅标签) → 自身历史PE分位(≤60%) → 行业PE绝对上限
   → 财务risk → 近期经营(六维) → 年度质量(3年) → 净利同比(仅legacy)
-  → 技术分计算 → KDJ/MACD下限否决(可选，默认关) → 周期正常化(归母PE≤25)
+  → 技术分计算 → KDJ/MACD下限否决(可选，默认关) → 周期正常化(归母PE≤25；`CYCLICAL_EXEMPT_CODES` 按代码豁免误判)
   → 止跌确认(strict，medium须站上MA20) → 高位保护(近期底部结构)
   → 质量分下限 → 技术分<40(降pending) → 综合分下限 → ATR风控(≤6%)
 ```
 
-**重复推荐冷却不在上述闸门链内**：它在 `_screen_quality_pool` 排序完成、最终分层之后执行，只把冷却期内已推过的票从 `formal` 移入 `pending_out`，**不改任何闸门判定**，因此放行集合只减不增。
+**重复推荐冷却不在上述闸门链内**：它在 `_screen_quality_pool` 排序完成、最终分层之后执行，只把冷却期内已推过的票从 `formal` 移入 `pending_out`，**不改任何闸门判定**，因此放行集合只减不增。名单按 `code` **跨 sleeve** 查询（2026-10-26 起），`run.py` 与 `run_longterm.py` 共享同一份冷却集合。
 
 新增否决码必须同步登记到 `_QV_REASON_CODES`，否则漏斗日志会把它误算进 `ERROR`、无法归因（`FAIL_OVEREXTENDED` 就是 2026-10-07 补登记的例子）。该元组包含**含 0 计数**的完整闸门集——长期为 0 的闸门即对区分候选无贡献，是数据驱动瘦身的审计对象。
 
@@ -166,6 +166,8 @@ python run_breakout.py --no-notify    # 仅落库，不通知
 | 底部窗口 | 低点年龄 5~40 日、距底上限 clip(5×ATR,10%,20%) | 年龄 3~90 日、窗口 120 日、距底上限 clip(8×ATR,10%,20%) |
 | 综合分权重 | 0.45 质量 + 0.30 估值 + 0.25 技术 | 0.55 / 0.35 / 0.10（质量和为 1.0 由基类硬校验） |
 | 质量分下限 | 0（关闭） | **60**（真实的额外收紧；注意别再上调到 65——与年度资格重复计权会恒 0 推荐） |
+
+**周期行业误判豁免（2026-10-26）**：`classify_cyclical_industry` 按行业名判定，但数据源 Baostock `query_stock_industry` 只给证监会大类——`C26化学原料和化学制品制造业` 同时覆盖云天化（磷肥，真周期）与珀莱雅（化妆品）、登康口腔（牙膏），**行业名逐字相同，无法用关键词区分**。实测后果：两只消费股被强行施加周期正常化检查，且把归因里的「周期组」均值从 −4.62% 抬到 −2.44%（它们恰是该组表现最好的两条）。现由 `CYCLICAL_EXEMPT_CODES=("603605","001328")` 按代码豁免；豁免判断放在 `missing` **之后**，行业缺失仍判 missing、照常打 `industry_classification` 缺项。**新增标的只能人工维护，宁可漏豁免（继续按周期收紧），也不放宽行业判定口径。**
 
 **架构约束（2026-10-13 修复）**：`run_longterm.py` 与 `run.py` 同构（四步流水线：市场环境 → 筛选 → 落库 → 通知），长期口径只通过「`LongTermQualityConfig` + `evaluate_quality_longterm`」两个参数注入，**不要**再写独立编排层。曾因独立复刻编排层与 src 真实接口全面脱节（导入不存在的函数、错误的调用签名）而完全不可用；也因 `_screen_quality_pool` 是两趟评估（第一趟 `fund_data=None` 做廉价行情预筛）而年度财务闸门误在预筛趟执行，导致每只股票 `insufficient`、恒 0 推荐——依赖年度财务的闸门必须判 `fund_data is not None`。
 
@@ -360,6 +362,8 @@ SOURCE schema.sql;
 │   ├── test_longterm_pipeline_offline.py   # 长期 sleeve 离线端到端回归（全打桩，锁定构造/两趟评估/收紧断言）
 │   ├── test_stab_cooldown_20261013.py      # 2026-10-13 两项收紧回归（medium须站上MA20 + 重复推荐冷却）
 │   ├── test_mysql_text_columns.py          # 文本列 TEXT 化回归（DDL/幂等MODIFY/截断兜底/预探测顺序）
+│   ├── test_cyclical_exempt_20261026.py    # 周期行业误判豁免回归（C26 日用化学品/豁免不绕过 missing/向后兼容）
+│   ├── test_params_version_20261026.py     # 落库口径快照回归（score_weights/stop_rule 取值、列数与占位符一致、nan 不落库）
 │   └── test_bottom_diagnostics.py     # 待核验/淘汰归因诊断日志
 ├── test_entry_filters.py             # 入场质量过滤器单测（合成数据，不联网）
 ├── test_main_layering.py             # main() 编排分层回归测试（打桩数据源，不联网）
@@ -512,7 +516,7 @@ python src/volume_breakout_strategy.py screen
 
 ### 离线审计与诊断脚本
 
-`audit_*.py`（9 个）/ `diag_*.py`（10 个），**全部只读、不接入生产流程、不改产线口径**：用项目真实函数 + 本地缓存面板（`cache/`、`backtest_cache/`）复现漏斗、检验前瞻收益、扫描阈值。它们的用途是**为「策略评价」提供可复现的量化证据，而不是引用文档宣称**；结论落地前必须按「改产线口径前先 A/B」的约定走一遍对照。
+`audit_*.py`（11 个）/ `diag_*.py`（10 个），**全部只读、不接入生产流程、不改产线口径**：用项目真实函数 + 本地缓存面板（`cache/`、`backtest_cache/`）复现漏斗、检验前瞻收益、扫描阈值。它们的用途是**为「策略评价」提供可复现的量化证据，而不是引用文档宣称**；结论落地前必须按「改产线口径前先 A/B」的约定走一遍对照。
 
 ```bash
 python diag_real_recs.py        # 真实落库推荐逐条追踪（需把推荐记录同步进脚本内 RECS 表）
@@ -534,6 +538,7 @@ python diag_longterm_e2e.py     # 长期 sleeve 与生产 sleeve 端到端对照
 | `audit_production_funnel.py` | 按**生产口径**（行业内分位）重算漏斗，给出可安全修复的空间 |
 | `audit_rank_tiers.py` | 按 `rank_score` 取前 N 只的质量分层（为「每天 2~3 只」找依据） |
 | `audit_threshold_scan.py` | 技术分门槛 30/35/38/40/42/45 逐档扫描及新增放行样本特征 |
+| `audit_pe_percentile_forward_20261026.py` | **PE 分位单调性检验**（全市场 600 日缓存横截面）：分档看 20/40 日前瞻收益。结论：低位池（pos250≤40%）40 日档均值 `+1.74/-1.02/-1.61/-2.01/-2.82%`，Spearman ρ=**−1.000**（完全单调，「越便宜越好」成立）。据此**否决**了「极低 PE 分位档应降分/分段封顶」的提案——该提案源自 38 条落库推荐的小样本（11 条 PE≤5% 中有 6 条同时技术分为 0，属共线偏差） |
 | `diag_funnel.py` / `diag_stabilization.py` | 闸门淘汰分布；strict 口径内部死因结构拆解 |
 | `diag_p0_modes.py` | strict / risk_only / disabled 三口径对比 + 前瞻收益 |
 | `diag_p4_feasibility.py` / `diag_pe_value.py` | 权重再分配与 PE 区分度的真实分布模拟 |
@@ -589,6 +594,8 @@ python -B -m unittest tests.test_backtest_execution tests.test_quality_backtest_
 |----|--------|------|
 | `stock_recommendation` | `run.py` / `run_breakout.py` / `run_longterm.py` | 每日推荐明细，`(rec_date, code, strategy)` 唯一（`uk_rec_date_code_strategy`）；重复写入时已有记录**入库未超 30 天则跳过、超过 30 天则删除旧行重新入库**（支持过期数据刷新，替代旧 `INSERT IGNORE`）。`save_recommendations` 只接受已注册 strategy（`bottom_fishing` / `volume_breakout` / `longterm_quality`） |
 | `stock_tracking` | `run_weekly_tracking.py`（每周） | 固定期限表现追踪，`(rec_id, holding_trade_days)` 唯一（`uk_rec_horizon`）+ `(rec_id, unique_close_date)` 唯一（`uk_rec_close_date`，生成列，历史重复行映射 NULL 后不参与约束）；`week_no` 原唯一索引已降为普通索引。除累计收益率 `return_pct` 外，另存**期收益率** `weekly_return_pct` / `monthly_return_pct`（见下文「期收益率」） |
+
+**口径快照列（2026-10-26）**：`stock_recommendation` 新增 `score_weights`（综合分权重快照，如 `0.45/0.30/0.25`）与 `stop_rule`（止损口径快照，如 `atr3x_floor15`），由 `screening_engine.params_fingerprint(config)` 逐行写入。理由是**同一个字段在不同日期代表不同规则**：`score` 权重 09-28 前为 0.50/0.35/0.15、之后 0.45/0.30/0.25；`stop_loss` 10-07 前是纯 3×ATR、之后是 `max(3×ATR,15%)`；长期 sleeve 又是另一套（0.55/0.35/0.10、`atr4x_floor20`、止盈 +50%）。实测危害：云天化 09-24 落库 `stop_loss=26.05`（−5.5% 旧口径），而 10-22 收 26.03 —— 按旧口径**已破位止损**，按现行口径（成本 28.243 → 24.01）**还有 15% 空间**；同日同股亚普股份 10-22 则有 longterm（SL 12.24/TP 22.95）与 bottom_fishing（SL 13.01/TP 17.59）两套值并存。没有这两列，复盘与归因只能靠猜。存量为 NULL 属正常（旧行无快照，不得据 NULL 反推口径）。
 
 **strategy 来源字段**：`stock_recommendation.strategy` 区分 `bottom_fishing`（优质低估低位，含 technical 抄底对照口径）/ `volume_breakout`（放量突破）/ `longterm_quality`（长期优质低估低位，恰好 16 字符 = `VARCHAR(16)` 上限）。`save_recommendations` 只接受这三个**已注册值**（`KNOWN_STRATEGIES`），传入未注册策略直接抛错——避免第三拼写变体把推荐写进错误的 sleeve、造成同日同股覆盖与归因混算。同一股票同日可被多套策略分别推荐并存（`run.py` 与 `run_breakout.py` 之间组合层去重默认已拦截，唯一键兜底；长期 sleeve 为独立工作流，不参与合计上限 `DAILY_TOTAL_MAX_PICKS=7`）；**周度追踪**按来源分列统计（飞书卡片分列 + 逐只 `[优质低估低位]`/`[放量突破]`/`[长期优质低估低位]` 标签）；**信号归因**按 `strategy × holding_trade_days` 分列统计持有期效应，并额外给出 `by_strategy` 分组。存量表由程序自动幂等迁移：推荐表补 `signals_hit` / `strategy` 等新列并把旧唯一键 `(rec_date, code)` 升级为 `(rec_date, code, strategy)`（历史行回填 `'bottom_fishing'`）；追踪表由 `_ensure_tracking_schema` 补 `holding_trade_days` / `legacy_duplicate` / `unique_close_date` / `weekly_return_pct` / `monthly_return_pct`，旧行保留原周号、日期与价格，同 `rec_id + close_date` 仅最早一行 `legacy_duplicate=0`，其余标 1（迁移用数据库锁串行化）。
 
@@ -652,7 +659,7 @@ WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'stock_recommendation'
 | 近 60 个交易日个股 vs 沪深300 区间涨跌幅差 | 日线 + 指数 | 相对强度（`relative_strength`，百分点）：生产 quality_value 仅作正式候选间**有界排序微调**（±`RS_WEIGHT`=3）与跑输风险提示（≤−10pp 打标签），无硬性准入线；**长期 sleeve 升级为硬门槛**（`REQUIRE_RELATIVE_STRENGTH`，近 60 日跑输超过 15pp → `FAIL_RELATIVE_STRENGTH_WEAK`；指数数据不可计算时不否决）；按共有交易日对齐，指数缺失为 None（排序中性） |
 | 现价 vs MA20/MA60 + 距 250 日低点天数与幅度 | 日线（展示） | P0 择时读数：右侧·站上MA20/MA60 / 右侧雏形 / 左侧·MA20下方 / ⚠左侧·仍在下跌（MACD深度走弱）；**标签本身不参与否决与排序**，但 2026-10-13 起「左侧·MA20下方」的票已无法拿到 medium，因而不再进入正式推荐（实测该组 15 只 F5 全部下跌、中位 −3.67%、胜率 0%，同期沪深300 上涨） |
 | 近60日收盘低点年龄 + 距底涨幅 vs 5×ATR | 日线 | **高位保护**（`FAIL_OVEREXTENDED`）：与止跌闸门正交——止跌管「有没有止跌」，本项管「止跌后是否已涨离底部」。低点年龄须 5～40 交易日，距底涨幅上限 `clip(5×ATR/现价, 10%, 20%)`；未确认→pending，超限→否决。只做减法，放行集合 ⊆ 原集合。长期 sleeve 放宽为年龄 3～90 日、窗口 120 日、上限 `clip(8×ATR/现价, 10%, 20%)` |
-| 落库推荐历史（同 strategy） | 库 | **重复推荐冷却**（`QV_REPEAT_COOLDOWN_DAYS`=10）：在 `_screen_quality_pool` 排序完成、最终分层**之后**执行，把冷却期内已落库推荐过的票从 `formal` 移入 `pending_out`（可见、不丢弃、不落库）。**不在闸门链内，不改任何闸门判定**；DB 未配置/查询失败时整体不生效，但筛选层每次显式打印是否生效（死闸门原则） |
+| 落库推荐历史（**跨 strategy**，2026-10-26 起） | 库 | **重复推荐冷却**（`QV_REPEAT_COOLDOWN_DAYS`=10）：在 `_screen_quality_pool` 排序完成、最终分层**之后**执行，把冷却期内已落库推荐过的票从 `formal` 移入 `pending_out`（可见、不丢弃、不落库）。**不在闸门链内，不改任何闸门判定**；DB 未配置/查询失败时整体不生效，但筛选层每次显式打印是否生效（死闸门原则）。跨 sleeve 查询避免「同一只票 3 天 4 行」（亚普股份 10-21/22/23 实证） |
 | MA20 近 5 日斜率 | 日线（长期 sleeve） | 加速下跌否决（`DETECT_ACCELERATING_DECLINE`，MA20 近 5 日跌幅 >5% → `FAIL_ACCELERATING_DECLINE`）：长期策略唯一新增的技术面否决项，只拦「下跌仍在加速」的接飞刀形态，两趟评估都执行；数据缺失不否决 |
 | ROE 变异系数 / 5 年现金流 / 盈利持续性 / 资质评分 | 年度财务（长期 sleeve） | 长期专项闸门（均在拿到年度财务的第二趟执行）：ROE 稳定性 CV≤0.5、5 年累计经营现金流/净利润≥1.0、5 条年报 4 次同比至少 3 次为正、资质评分≥60（ROE稳定25% + 现金流25% + 盈利持续20% + 增长质量15% + 估值边际15%） |
 | ATR% | 日线 | 波动率风控（quality_value ≤6% / technical ≤6%——两路径共用 `MAX_ATR_PCT`；突破 ≤4.0% 独立阈值，超限否决 FAIL_VOLATILE；ATR 缺失为 FAIL_DATA。阈值 10% 曾是死闸门，超限占比 0.000%，已下调） |
