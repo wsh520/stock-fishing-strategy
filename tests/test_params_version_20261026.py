@@ -83,22 +83,27 @@ class ParamsVersionTest(unittest.TestCase):
         self.assertEqual(mysql_store._opt_text(" 0.45/0.30/0.25 "), "0.45/0.30/0.25")
 
     def test_insert_columns_match_placeholders(self):
-        """INSERT 的列数与 %s 占位符数必须一致（经典 1136 列数不匹配生产事故）。"""
-        with open(STORE_PATH, encoding="utf-8") as fh:
-            src = fh.read()
-        block = re.search(r"insert_sql = \"\"\"(.*?)\"\"\"", src, re.S)
-        self.assertIsNotNone(block, "找不到 insert_sql 定义")
-        sql = block.group(1)
-        cols_part = re.search(r"INSERT INTO stock_recommendation\s*\((.*?)\)\s*VALUES",
+        """INSERT 的列数与 %s 占位符数必须一致（经典 1136 列数不匹配生产事故）。
+
+        2026-10-27：INSERT 由源码字面量改为 _build_insert_sql() 按实际列动态生成
+        （补列 ALTER 失败时只裁掉那一列，不拖垮整批落库）。故这里改断言**运行时**
+        生成的 SQL —— 原意图（列数 == 占位符数）不变，且额外锁定「保留下标数与列数
+        一致」，防止裁剪时列/值错位落库。
+        """
+        sql, keep = mysql_store._build_insert_sql()
+        cols_part = re.search(r"INSERT INTO stock_recommendation \((.*?)\) VALUES",
                               sql, re.S)
-        self.assertIsNotNone(cols_part)
+        self.assertIsNotNone(cols_part, "INSERT 语句缺少列清单")
         columns = [c.strip() for c in cols_part.group(1).split(",") if c.strip()]
-        values_part = re.search(r"VALUES\s*\((.*?)\)", sql, re.S)
-        placeholders = values_part.group(1).count("%s")
+        placeholders = sql.count("%s")
         self.assertEqual(len(columns), placeholders,
                          f"列 {len(columns)} 个但占位符 {placeholders} 个")
+        self.assertEqual(len(columns), len(keep),
+                         "裁剪后保留下标数与列数不一致 → 值会错位落库")
+        self.assertEqual(len(columns), len(mysql_store._INSERT_COLUMNS),
+                         "未探测列集合时应退回全列")
         # 新列必须真的在插入列表里，否则列建了却永远为 NULL
-        for col in ("score_weights", "stop_rule"):
+        for col in ("score_weights", "stop_rule", "prev_rec_date", "prev_rec_close"):
             self.assertIn(col, columns)
 
 

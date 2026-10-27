@@ -80,6 +80,8 @@ CREATE TABLE IF NOT EXISTS stock_recommendation (
     stop_rule        VARCHAR(32)     NULL COMMENT '止损失口径快照，例 atr3x_floor15 / fixed15',
     repeat_seq       TINYINT UNSIGNED NULL COMMENT '同一 code+strategy 的重复推荐序号（首次=1，冷却窗口内第2次=2），NULL=未知',
     superseded_by    BIGINT UNSIGNED NULL COMMENT '被哪条更新的推荐取代（旧行打废弃标签；NULL=仍是最新）。仅标注，统计不排除',
+    prev_rec_date    DATE            NULL COMMENT '上一条推荐日期（跨 sleeve 冷却窗口内的「上次」，NULL=首次/非重复）',
+    prev_rec_close   DECIMAL(10, 3)  NULL COMMENT '上一条推荐时的收盘价（NULL=首次/非重复）',
     created_at       DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '写入时间',
     PRIMARY KEY (id),
     UNIQUE KEY uk_rec_date_code_strategy (rec_date, code, strategy),
@@ -136,6 +138,14 @@ _RECOMMENDATION_ALTERS = {
     # 故这两列只是**标注**，任何统计/追踪查询都不得按 superseded_by 过滤。
     "repeat_seq": "ADD COLUMN repeat_seq TINYINT UNSIGNED NULL COMMENT '同一 code+strategy 的重复推荐序号（首次=1，冷却窗口内第2次=2），NULL=未知' AFTER stop_rule",
     "superseded_by": "ADD COLUMN superseded_by BIGINT UNSIGNED NULL COMMENT '被哪条更新的推荐取代（旧行打废弃标签；NULL=仍是最新）。仅标注，统计不排除' AFTER repeat_seq",
+    # 2026-10-27 新增：把「上一次推荐」的锚点真正落库（此前只在内存 DataFrame 里生成，
+    # 落库时被丢弃，只留在 signals_hit 文本中，事后无法用 SQL 重建重复推荐链条）。
+    # 跨 sleeve 冷却（3ccbe84）与 label 标注（7b4c20e）都需要这一环才能被验证：
+    # repeat_seq 是 per-sleeve 累计序号，而卡片文案的「10日内第N次」是跨 strategy
+    # 窗口口径，两者分母不同；有了 prev_rec_date/prev_rec_close 才能从任一 sleeve
+    # 的行一路回溯到跨 sleeve 的上一环。
+    "prev_rec_date": "ADD COLUMN prev_rec_date DATE NULL COMMENT '上一条推荐日期（跨 sleeve 冷却窗口内的「上次」，NULL=首次/非重复）' AFTER superseded_by",
+    "prev_rec_close": "ADD COLUMN prev_rec_close DECIMAL(10, 3) NULL COMMENT '上一条推荐时的收盘价（NULL=首次/非重复）' AFTER prev_rec_date",
 }
 
 # ===== 文本列容量升级（幂等，非破坏，不改任何已有数据）=====
@@ -162,6 +172,11 @@ _TEXT_COLUMN_UPGRADES = {
 _TEXT_TYPES = ("text", "mediumtext", "longtext", "tinytext")
 # 列实际字符容量缓存：VARCHAR 为 CHARACTER_MAXIMUM_LENGTH；TEXT 记 None 表示不需截断。
 _text_column_capacity: dict = {}
+# stock_recommendation 的**实际存在**列集合（由 _ensure_tables 探测后填入）。
+# None = 尚未探测成功。落库时据此裁剪 INSERT 列清单：任一新增列 ALTER 失败时，
+# 只丢该列的标注，不让整批推荐因 Unknown column 全部落库失败
+# （与「宁可少标注也要落库」一致，见 _mark_repeat_sequence 的同类兜底）。
+_existing_columns: Optional[set] = None
 
 # 追踪表补列：周收益率、月收益率
 _TRACKING_ALTERS = {
@@ -227,7 +242,7 @@ def _connect():
 
 
 def _ensure_tables(conn) -> None:
-    global _tables_ready
+    global _tables_ready, _existing_columns
     if _tables_ready:
         return
     with conn.cursor() as cur:
@@ -246,10 +261,13 @@ def _ensure_tables(conn) -> None:
                 # 兜底 except 吞成「新增 0 条」，看起来和「今天没推荐」完全一样。
                 try:
                     cur.execute(f"ALTER TABLE stock_recommendation {alter}")
+                    existing.add(col)  # 成功即视为存在，供落库时裁剪 INSERT 列清单
                     logger.info("stock_recommendation 已补充列: %s", col)
                 except Exception as e:  # noqa: BLE001
                     logger.error("stock_recommendation 补列 %s 失败（该列相关功能将降级）: %s "
                                  "| DDL: ALTER TABLE stock_recommendation %s", col, e, alter)
+        # 落库列裁剪依据：以**补列后的真实集合**为准，未补齐的列不会进 INSERT。
+        _existing_columns = set(existing)
         # ===== 文本列容量升级 + 实际容量探测（2026-10-13）=====
         # 幂等：已是 TEXT 就跳过 MODIFY。无论升级成功与否，都记录**实际**列容量
         # 供落库前截断兜底——存量库的列可能短于代码 DDL，不能假设它就是 255。
@@ -414,6 +432,14 @@ def _repeat_seq_map(cur, strategy: str, keys: list[tuple[str, str, str]]) -> dic
     胜率是否更差」真正可验证，必须先有 repeat_seq 这一维，否则只能靠 signals_hit
     里的人类可读文本反推。
 
+    【两种「第 N 次」的分母不同，不要混用（2026-10-27 明确）】
+      · 本函数的 repeat_seq = **同一 code+strategy 累计序号**，服务「按 sleeve
+        分开统计」；A 股同股被两套 sleeve 各推一次，各自都是各自的第 N 次。
+      · 卡片文案的「10 日内第 N 次」= **跨 strategy 窗口计数**，告诉使用者这只票
+        整体被推了几次。
+    两者都自洽，但统计时必须明确用哪个。跨 sleeve 的上一环由
+    prev_rec_date / prev_rec_close 落库锚定，可从任一行回溯整条推荐链。
+
     必须在 INSERT 之前调用：计数含历史行但不含本次新行，+1 后即为本次序号。
     """
     codes = sorted({str(k[1]) for k in keys})
@@ -466,6 +492,41 @@ def _mark_repeat_sequence(cur, strategy: str, keys: list[tuple[str, str, str]],
         "WHERE code = %s AND strategy = %s AND rec_date < %s AND id <> %s "
         "AND superseded_by IS NULL", sup_updates)
     return int(marked or 0)
+
+
+# INSERT 列顺序，与 save_recommendations 里 rows 元组**逐位对应**。
+# 新增列时两处必须同步；_build_insert_sql 会在长度不一致时快速失败（编程错误）。
+_INSERT_COLUMNS = (
+    "rec_date", "code", "name", "rec_close", "score", "grade", "daily_score",
+    "rsi", "rsi7", "rsi21", "vol_ratio", "turnover_ratio", "stop_loss",
+    "take_profit", "rr_ratio", "market_env", "has_divergence", "signals_hit",
+    "fund_status", "weekly_status", "rec_tier", "strategy", "missing_tags",
+    "score_weights", "stop_rule", "prev_rec_date", "prev_rec_close",
+)
+
+
+def _build_insert_sql() -> tuple[str, list[int]]:
+    """按**实际存在的列**生成 INSERT 语句，返回 (sql, 需要保留的列下标)。
+
+    【为什么动态】此前列名硬编码在 SQL 里，任何一条补列 ALTER 失败（权限/锁/
+    MySQL 版本差异）都会让 INSERT 报 Unknown column，被外层 except 吞成
+    「新增 0 条」—— 当天全部推荐一条都落不了库，日志却和「今天没推荐」长得一样。
+    现改为按 _existing_columns 裁剪：补列失败只丢该列的标注，推荐本身照常落库。
+
+    _existing_columns 为 None（探测未成功）时退回全列，与改造前行为一致。
+    """
+    total = len(_INSERT_COLUMNS)
+    present = _existing_columns
+    if present is None:
+        keep = list(range(total))
+    else:
+        keep = [i for i, c in enumerate(_INSERT_COLUMNS) if c in present]
+        if not keep:
+            raise ValueError("stock_recommendation 实际列集合为空，无法构建 INSERT")
+    cols = ", ".join(_INSERT_COLUMNS[i] for i in keep)
+    placeholders = ", ".join(["%s"] * len(keep))
+    sql = (f"INSERT INTO stock_recommendation ({cols}) VALUES ({placeholders})")
+    return sql, keep
 
 
 def save_recommendations(df: Optional[pd.DataFrame], strategy: str = STRATEGY_BOTTOM_FISHING) -> int:
@@ -525,16 +586,13 @@ def save_recommendations(df: Optional[pd.DataFrame], strategy: str = STRATEGY_BO
             _clip_to_capacity(r.get("missing_tags"), "missing_tags", code_str),
             _opt_text(r.get("score_weights")),
             _opt_text(r.get("stop_rule")),
+            # 2026-10-27：重复推荐锚点（此前生成后在此处被丢弃，只留 signals_hit 文本）
+            _opt_text(r.get("prev_rec_date")),
+            _f(r.get("prev_rec_close")),
         ))
 
-    insert_sql = """
-        INSERT INTO stock_recommendation
-        (rec_date, code, name, rec_close, score, grade, daily_score, rsi, rsi7, rsi21,
-         vol_ratio, turnover_ratio, stop_loss, take_profit, rr_ratio, market_env, has_divergence,
-         signals_hit, fund_status, weekly_status, rec_tier, strategy, missing_tags,
-         score_weights, stop_rule)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-    """
+    insert_sql, keep_idx = _build_insert_sql()
+
     # 查询已存在记录的 created_at，判断是否超过30天
     check_sql = """
         SELECT rec_date, code, strategy, created_at
@@ -598,6 +656,14 @@ def save_recommendations(df: Optional[pd.DataFrame], strategy: str = STRATEGY_BO
 
                 inserted = 0
                 if rows_to_insert:
+                    if len(rows_to_insert[0]) != len(_INSERT_COLUMNS):
+                        # 编程错误：_INSERT_COLUMNS 与 rows 元组不同步，按列裁剪会错位落库
+                        raise ValueError(
+                            f"INSERT 列定义({len(_INSERT_COLUMNS)}) 与取值元组"
+                            f"({len(rows_to_insert[0])}) 长度不一致：新增列必须同步 _INSERT_COLUMNS")
+                    if len(keep_idx) != len(_INSERT_COLUMNS):
+                        rows_to_insert = [tuple(row[i] for i in keep_idx)
+                                          for row in rows_to_insert]
                     inserted = cur.executemany(insert_sql, rows_to_insert)
 
                 # ===== 重复推荐标注（2026-10-26）=====

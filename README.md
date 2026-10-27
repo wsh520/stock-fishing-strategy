@@ -365,6 +365,8 @@ SOURCE schema.sql;
 │   ├── test_cyclical_exempt_20261026.py    # 周期行业误判豁免回归（C26 日用化学品/豁免不绕过 missing/向后兼容）
 │   ├── test_params_version_20261026.py     # 落库口径快照回归（score_weights/stop_rule 取值、列数与占位符一致、nan 不落库）
 │   ├── test_repeat_cooldown_label_20261026.py  # 冷却「标注模式」回归（保留推荐/标签文案/block 回退/统计不排除旧行）
+│   ├── test_prev_rec_columns_20261027.py   # 重复推荐锚点落库回归（prev_rec_date/prev_rec_close 列+补列+动态INSERT裁剪）
+│   ├── test_save_recommendations_prev_smoke_20261027.py  # 落库端到端冒烟（假连接核对列/值对齐、补列失败降级）
 │   └── test_bottom_diagnostics.py     # 待核验/淘汰归因诊断日志
 ├── test_entry_filters.py             # 入场质量过滤器单测（合成数据，不联网）
 ├── test_main_layering.py             # main() 编排分层回归测试（打桩数据源，不联网）
@@ -600,6 +602,11 @@ python -B -m unittest tests.test_backtest_execution tests.test_quality_backtest_
 
 **重复推荐标注列（2026-10-26）**：`stock_recommendation` 新增 `repeat_seq`（同一 `code + strategy` 的第几次推荐，首次=1、冷却窗口内第 2 次=2，NULL=未知）与 `superseded_by`（被哪条更新的推荐取代，NULL=仍是最新）。写入口径：`_repeat_seq_map` 在 INSERT **之前**按 `code` 计数得序号，`_mark_repeat_sequence` 在 INSERT **之后**写序号并把同股更早的行标 `superseded_by=新行 id`（每行指向其直接后继，形成链）。
 **这两列只是标注，任何统计/追踪/冷却查询都不得按 `superseded_by` 过滤**——旧推荐也是一次真实推荐，把它从样本里排除等于抹掉「第 1 次推荐」的亏损，与「统计照常、支持多条分开统计」的要求相反（`tests/test_repeat_cooldown_label_20261026.py::StatisticsNotExcludedTest` 用源码级断言锁死这条不变式）。标注失败只 warning、不让落库失败：宁可少标注也要落库。
+
+**重复推荐锚点列（2026-10-27）**：`stock_recommendation` 新增 `prev_rec_date`（上一条推荐日期）与 `prev_rec_close`（上一条推荐时的收盘价）。此前 `_apply_repeat_cooldown` 在内存里生成了这两个字段，但 `save_recommendations` 的 INSERT 列清单里没有它们——**值在落库时被静默丢弃**，只剩 `signals_hit` 里的人类可读文本，事后无法用 SQL 重建「这只票 10 日内推了几次、上次什么价」，跨 sleeve 冷却也只能靠翻日志验证；直接按这两列过滤还会报 `(1054, "Unknown column 'prev_rec_date'")`。现取值经 `_opt_text` / `_f` 写入（空串、`NaN`、`NaT`、字面量 `'nan'` 一律存 NULL）。
+> **两种「第 N 次」的分母不同，统计时不要混用**：`repeat_seq` = **同一 `code + strategy` 累计序号**（服务「按 sleeve 分开统计」，用户明确要求）；卡片与 `signals_hit` 的「10 日内第 N 次」= **跨 strategy 窗口计数**（告诉使用者这只票整体被推了几次）。实测亚普股份 10-26：`repeat_seq=4`（`longterm_quality` 第 4 次）而文案是「第 5 次」（含 10-22 的 `bottom_fishing` 那一环）。`prev_rec_date` / `prev_rec_close` 落库后，可从任一行沿锚点回溯整条跨 sleeve 推荐链。
+
+**INSERT 列动态裁剪（2026-10-27）**：`_build_insert_sql()` 按 `_existing_columns`（`_ensure_tables` 补列后的**真实**列集合）生成列清单与占位符。此前列名硬编码，任何一条补列 ALTER 失败（权限/锁/版本差异）都会让 INSERT 报 `Unknown column`，被外层兜底 `except` 吞成「新增 0 条」，日志与「今天没推荐」无法区分。现改为：补列失败只丢该列标注，推荐本身照常落库，落实「宁可少标注也要落库」；列定义常量 `_INSERT_COLUMNS` 与取值元组长度不一致时快速失败，防止裁剪时列/值错位（1136 类事故）。回归：`tests/test_prev_rec_columns_20261027.py`(31)、`tests/test_save_recommendations_prev_smoke_20261027.py`(20)。
 
 **strategy 来源字段**：`stock_recommendation.strategy` 区分 `bottom_fishing`（优质低估低位，含 technical 抄底对照口径）/ `volume_breakout`（放量突破）/ `longterm_quality`（长期优质低估低位，恰好 16 字符 = `VARCHAR(16)` 上限）。`save_recommendations` 只接受这三个**已注册值**（`KNOWN_STRATEGIES`），传入未注册策略直接抛错——避免第三拼写变体把推荐写进错误的 sleeve、造成同日同股覆盖与归因混算。同一股票同日可被多套策略分别推荐并存（`run.py` 与 `run_breakout.py` 之间组合层去重默认已拦截，唯一键兜底；长期 sleeve 为独立工作流，不参与合计上限 `DAILY_TOTAL_MAX_PICKS=7`）；**周度追踪**按来源分列统计（飞书卡片分列 + 逐只 `[优质低估低位]`/`[放量突破]`/`[长期优质低估低位]` 标签）；**信号归因**按 `strategy × holding_trade_days` 分列统计持有期效应，并额外给出 `by_strategy` 分组。存量表由程序自动幂等迁移：推荐表补 `signals_hit` / `strategy` 等新列并把旧唯一键 `(rec_date, code)` 升级为 `(rec_date, code, strategy)`（历史行回填 `'bottom_fishing'`）；追踪表由 `_ensure_tracking_schema` 补 `holding_trade_days` / `legacy_duplicate` / `unique_close_date` / `weekly_return_pct` / `monthly_return_pct`，旧行保留原周号、日期与价格，同 `rec_id + close_date` 仅最早一行 `legacy_duplicate=0`，其余标 1（迁移用数据库锁串行化）。
 
