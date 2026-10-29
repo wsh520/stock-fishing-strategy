@@ -54,6 +54,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from notify.feishu import notify_screening_result
 from store.mysql_store import (
     STRATEGY_LONGTERM_QUALITY,
+    fetch_rec_codes_for_date,
     fetch_recent_recommendation_detail,
     save_recommendations,
 )
@@ -111,6 +112,45 @@ def _recent_recommended_detail(config, enabled: bool = True,
                 since, days, "跨 sleeve" if cross_sleeve else "仅本 sleeve", mode, len(detail),
                 "" if detail else "（空：库中无近期推荐，或 MySQL 未配置/查询失败）")
     return detail
+
+
+def _same_day_other_sleeve_codes(trade_date: str | None,
+                                 enabled: bool = True) -> set[str]:
+    """查询**同一交易日**已被其他 sleeve 推荐过的代码（跨 sleeve 同日唯一性）。
+
+    2026-10-29 新增。此前跨 sleeve 冷却只有 label 模式（只标注不拦截），
+    实测 10-22 / 10-27 / 10-28 三天亚普股份(603013) 同时被 bottom_fishing 与
+    longterm_quality 各推一条，而两套执行参数互相矛盾：
+        bottom_fishing    止损 atr3x_floor15  止盈 +15%（→17.88）
+        longterm_quality  止损 atr4x_floor20  止盈 +50%（→23.33）
+    手工执行时同一只票会收到两个止盈价，这不是信息冗余而是执行歧义。
+
+    本函数只负责「查库→返回集合」，判定与剔除在策略层
+    （_apply_same_day_cross_sleeve_block）。策略层不碰 DB 的边界保持不变。
+
+    必须排除本 sleeve（exclude_strategy）：否则手动重跑时会把本 sleeve 当日
+    已写入的记录也算成「其他策略已推」，导致自己把自己全部拦截 → 0 推荐。
+
+    trade_date 为空 / 未启用 / DB 未配置 / 查询失败 → 返回空集并显式留痕，
+    降级为「不去重」而不是「假装去过重」。
+    """
+    if not enabled:
+        logger.info("跨 sleeve 同日去重：关闭（--no-save 模式，不查库）")
+        return set()
+    if not trade_date:
+        logger.info("跨 sleeve 同日去重：未生效（缺少交易日，无法确定当日范围）")
+        return set()
+    try:
+        taken = fetch_rec_codes_for_date(str(trade_date),
+                                        exclude_strategy=STRATEGY_LONGTERM_QUALITY)
+    except Exception:
+        logger.warning("查询当日其他策略推荐异常（同日去重本次不生效）:\n%s",
+                       traceback.format_exc()[-400:])
+        return set()
+    logger.info("跨 sleeve 同日去重：交易日=%s，其他策略当日已推 %d 只%s",
+                trade_date, len(taken),
+                "" if taken else "（空：daily 尚未运行/未配置 MySQL/查询失败）")
+    return taken
 
 
 def _valuation_mode_of(df) -> str | None:
@@ -223,23 +263,37 @@ def main(argv: list[str] | None = None):
         pending_rows: list[dict] = []
         volatile_rows: list[dict] = []
         index_df = bfs.get_index_daily(config, cache)
+        # 交易日必须只取一次：冷却窗口与同日去重都吃它，分别调用可能跨日翻转。
+        trade_date = bfs.latest_completed_trade_day(config, cache)
         # 重复推荐冷却（2026-10-26 补齐，跨 sleeve）：本脚本此前从不查冷却，
         # 造成亚普股份 3 天被推 3 次。策略层不碰 DB，由入口查库后以明细传入。
         recently_recommended = ({} if args.no_save
                                 else _recent_recommended_detail(config))
         if args.no_save:
             logger.info("重复推荐冷却：--no-save 模式下跳过（不查库）")
+        # 跨 sleeve 同日硬拦截（2026-10-29）：daily 于 18:34 UTC 先跑，
+        # 本 job 19:02 UTC 后跑，因此这里能看到 daily 当日已推的票并避让。
+        same_day_taken = _same_day_other_sleeve_codes(trade_date,
+                                                      enabled=not args.no_save)
+        same_day_excluded: list[dict] = []
         output_df = bfs._screen_quality_pool(
             config=config,
             cache=cache,
             market_env=market_env,
-            latest_trade_date=bfs.latest_completed_trade_day(config, cache),
+            latest_trade_date=trade_date,
             pending_out=pending_rows,
             evaluator=evaluate_quality_longterm,
             index_df=index_df,
             volatile_out=volatile_rows,
             recently_recommended=recently_recommended,
+            same_day_taken=same_day_taken,
+            same_day_excluded_out=same_day_excluded,
         )
+        if same_day_excluded:
+            logger.info("跨 sleeve 同日去重：被剔除 %d 只（资格已通过，仅因当日已被其他策略推荐）%s",
+                        len(same_day_excluded),
+                        "，".join(f"{r.get('name')}({r.get('code')}) 评分{r.get('score')}"
+                                  for r in same_day_excluded))
         # _screen_quality_pool 不含市场熔断与 regime 数量收缩（那两步在 main() 里），
         # 长期 sleeve 同样必须受这两层组合风控保护，故在此显式补齐。
         # 先熔断后限量：顺序与 main() 一致，急跌中不因限量逻辑而漏掉熔断日志。

@@ -35,6 +35,8 @@
 | 近期底部 | 默认 `QV_LOW_ANCHOR_MODE="recent_structure"`：近60日收盘低点年龄5～40个交易日；距底上限 `5×ATR/现价` 限制在10%～20%（`recommendation_factors.assess_low_structure`），未确认pending、超限否决（`FAIL_OVEREXTENDED`）。`legacy` 模式改用250日盘中极值 + `QV_MAX_GAIN_FROM_250D_LOW`=15% 判定，同一否决码 |
 | 止跌与技术40 | 默认strict：MA20确认且站上MA60为strong；**medium 必须站上MA20**（`QV_STABILIZATION_MEDIUM_REQUIRES_MA20=True`，2026-10-13收紧）——旧式左侧通道（MACD连续3日改善且近5日不创新低）不再构成medium，降级为weak只观察；无确认否决。默认状态技术分趋势40+动能30+量价30，持续状态与最近5日衰减事件计分，技术<40（`MIN_TECHNICAL_SCORE_FORMAL`）为pending。`QV_STABILIZATION_MODE` 可切 `risk_only`（只否决MACD深度弱势且恶化，「站上MA20」降级为标签）与 `disabled`；**默认仍为 strict** |
 | 重复推荐冷却 | `QV_REPEAT_COOLDOWN_DAYS=10` + `QV_REPEAT_COOLDOWN_MODE`（2026-10-13 新增；**2026-10-26 改为跨 sleeve + 默认 `label` 标注**）：同一股票在冷却期内已落库推荐过时——`label`（默认）**照常推荐并落库**，行上写 `repeat_count`/`prev_rec_date`/`prev_rec_close`，`signals_hit` 追加「重复推荐(10日内第3次，上次10-23@27.95→本次27.56(-1.4%))」，旧行由落库层标 `superseded_by`（废弃）；`block` 为 2026-10-13 旧行为（移入待核验，可见、不丢弃、不推送不落库）；`off` 不查库不判定。明细由入口脚本查库（`store.fetch_recent_recommendation_detail(strategy, since, cross_sleeve=True)`）经 `main(recently_recommended=…)` 传入，**策略层不碰 DB**；判定走纯函数 `_apply_repeat_cooldown`。跨 sleeve 理由：此前 `run_longterm.py` 从不查冷却、且两套 sleeve 各查各的 strategy，实测造成亚普股份 3 天 4 行（10-21/22/23 各 1 条 `longterm_quality` + 10-22 再 1 条 `bottom_fishing`）。**`label` 是刻意的放宽**（原 `block` 让票「消失」，既分不清是冷却还是闸门否决，也无法统计第 N 次推荐的表现），补偿是可见性 + 可统计：`repeat_seq` 落库使「第 2、3 次推荐是否更差」可被验证，且**统计口径完全不变、旧行照常计入**。DB 未配置时不生效，但入口脚本与筛选层**两处都显式打印状态与生效动作**——不可观测的风控等于没有风控。设为 0 可关闭 |
+| 同日跨 sleeve 唯一性 | `QV_SAME_DAY_CROSS_SLEEVE_BLOCK=True`（2026-10-29 新增）：**后运行的 sleeve 剔除当日已被其他 sleeve 推荐过的代码**，命中转 pending（标签 `same_day_other_sleeve`，可见可查）且名额让给下一名。理由：冷却 `label` 只标注不拦截，实测 10-22/27/28 三天 603013 同时在 `bottom_fishing`（止盈 +15%→17.88）与 `longterm_quality`（止盈 +50%→23.33）各落一条，**同一只票两个止盈价**，手工执行是歧义而非冗余。守卫幂等重跑：查询用 `fetch_rec_codes_for_date(date, exclude_strategy=…)` 排除本 sleeve 自身。单向生效（先跑者看不到后跑者），当前顺序 daily→longterm，故主要是长期 sleeve 避让；顺序调换则自动反向。只减不增 |
+| 冷却票名额后置 | `QV_COOLDOWN_RANK_DEFER=True`（2026-10-29 新增）：命中冷却标注的行**整体后置**，未命中的新票优先占用 `max_picks` 名额，两组内部仍按原 `rank_score` 取。理由：10-28 通过 7 只、冷却 5 只、熊市名额 2，最终推送的 2 只**全部**是冷却票——老票技术分随价格上行走高（603013 70.8→77.4），排序天然压制刚达标的新票，使「标注可见」退化为「老票自我强化」。本项只改名额分配顺序，**不改放行集合、不改评分、不改闸门**；全部命中或全部未命中时不重排。置 False 回到「纯按综合分取前 N」 |
 | 额外分数线 | `MIN_QV_SCORE=0`、`MIN_QUALITY_SCORE=0`，默认关闭重复综合分/质量分硬门；旧38/50不是当前规则。年度资格、止跌与技术40仍必须核验 |
 | 执行口径（交易计划） | **纯展示，不参与准入/排序/否决**（2026-10-13 执行中期化）：持有 **40~60** 个交易日（原 10~20）、止盈固定 **+15%**（原 +30%）、止损 `max(3×ATR, 15%)` 不变、建仓区间＝信号日收盘 ±`ENTRY_BAND_PCT`=1.5% 次日开盘执行。依据：strict 幸存者 F20 −1.40% 而 F60 +3.55%（`audit_current_strict.out`）+31880 次随机起点实测（+30% 止盈 20 日触发率仅 5.9%）。突破 sleeve 为短线口径（持有 10~20、止盈 min(+15%,+5×ATR)）已显式覆写，不随本改动变长 |
 | 行情时效与缓存 | 北京时间盘中/闭市阶段用行情 `.meta.json` 记录版本、取数时间、阶段和末bar日期；touch/mtime不能证明新鲜。独立覆盖当日的交易日历给出应完成交易日，指数必须核验，不能由index自身证明index时效 |
@@ -53,6 +55,17 @@
 
 **重复推荐冷却不在上述闸门链内**：它在 `_screen_quality_pool` 排序完成、最终分层之后执行，**不改任何闸门判定**。动作由 `QV_REPEAT_COOLDOWN_MODE` 决定——`block` 把冷却期内已推过的票从 `formal` 移入 `pending_out`（放行集合只减不增）；`label`（2026-10-26 起的生产默认）**保留在 `formal`**、只加标注与落库序号，因此放行集合**不变**（这是「可见 + 可统计」换来的有意放宽，旧行在统计中照常计入）。明细按 `code` **跨 sleeve** 查询，`run.py` 与 `run_longterm.py` 共享同一份冷却明细。
 
+**出口层还有两道 2026-10-29 新增的机制，都不在闸门链内、都不改准入**，执行顺序固定为：
+
+```
+排序(_rank_signals) → 冷却标注(label 写 repeat_count) → 同日跨 sleeve 剔除(pending)
+  → 行业去重 → 冷却票名额后置 → head(max_picks) → 写口径快照
+```
+
+- **同日跨 sleeve 剔除**必须在冷却标注**之后**：先让 `label` 把「第几次、上次价」写全，再剔除，否则被剔除的行在 pending 里丢掉冷却标注。
+- **冷却票名额后置**必须在行业去重**之后**、`head(cap)` **之前**：去重决定「谁还活着」，后置只管「活下来的人谁先占名额」；顺序颠倒会让去重按旧顺序取舍。
+- 名额截取处必须打印被剔除名单（`[QV_CAP_CUT]`，含评分与是否命中冷却）。合格池只剩个位数时这一步直接决定用户看到什么，却是全链路唯一曾经没有留痕的决策点。
+
 新增否决码必须同步登记到 `_QV_REASON_CODES`，否则漏斗日志会把它误算进 `ERROR`、无法归因（`FAIL_OVEREXTENDED` 就是 2026-10-07 补登记的例子）。该元组包含**含 0 计数**的完整闸门集——长期为 0 的闸门即对区分候选无贡献，是数据驱动瘦身的审计对象。
 
 综合规则分仍为45%质量+30%估值+25%技术，默认用于排序；已核验历史PE以30%权重混入估值分。`rank_score` 再加入近60日相对沪深300强度有界微调（最多±3）与经结构确认的横盘加分（最多5），低位分位额外排序权重默认0。按排序分、质量、估值降序及代码升序排列，排序不能抵消资格硬伤。`describe_qv_floor()` 按实际配置解释显式开启的分数线；权重和必须为1。
@@ -64,6 +77,8 @@
 年度质量优先原始新浪摘要真实公告日；摘要fallback无公告日时保守按次年5月1日可用，显式记录 `availability_assumed` 与公告日假定标签。真实晚公告不被假定覆盖，原始已知失败不被fallback抹掉。近期经营及财务risk必须有真实公告日。免费接口不是历史财报修订版本库，不保证历史证据完整。
 
 **三条 sleeve 并行**：共用数据层、财务risk、近期经营与市场风控，信号资格保持独立。`run.py` 与 `run_breakout.py` 在同一 GitHub job 内顺序执行（突破为后运行者，执行组合层去重与合计上限）；`run_longterm.py` 是独立工作流，只通过「配置类 `LongTermQualityConfig` + evaluator `evaluate_quality_longterm`」两个参数注入长期口径，并发骨架、漏斗日志、pending/volatile 分层、行业去重、落库与通知全部复用 src 层同一份实现（`_screen_quality_pool` 的 `evaluator` 形参就是为多口径预留的正式入口）。
+
+三条 sleeve 之间还有两层**出口层**约束（均不参与闸门判定）：一是 10 日窗口的重复推荐冷却（按 `code` 跨 sleeve 查明细，`label` 模式只标注不拦截）；二是 2026-10-29 新增的**同日跨 sleeve 唯一性**（后运行者剔除当日已被其他 sleeve 推过的代码，硬拦截）。两者正交：前者管「10 天内推过没有」，后者管「今天这只票是否已被别的 sleeve 占掉」。同日拦截单向生效——两个 workflow 先后运行，先跑者看不到后跑者，当前顺序为 daily（18:34 UTC）→ longterm（19:02 UTC），故实际主要是长期 sleeve 避让；顺序一旦调换即自动反向，无需改代码。
 
 | 策略 | 定位 | 信号类型 | 推荐数量（牛/中/熊） |
 |---|---|---|---|

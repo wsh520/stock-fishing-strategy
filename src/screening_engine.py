@@ -705,6 +705,36 @@ class StrategyConfig:
     # 补偿是「可见性 + 可统计」：标签写明第几次、上次推荐价与本次价差，
     # 落库的 repeat_seq 让「第 N 次推荐的胜率是否更差」可以被真正验证。
     QV_REPEAT_COOLDOWN_MODE: str = "label"
+    # ===== 冷却标注票的名额排序后置（2026-10-29 新增，默认 True）=====
+    # 【为什么需要】label 模式不让冷却票出局，但也没规定它们的**排序**。实测
+    # 2026-10-28：7 只资格通过、5 只命中冷却，熊市名额上限 2 → 最终推送的 2 只
+    # **全部**来自冷却名单，新票一只都没进。原因是冷却票已连续满足条件数日，
+    # 技术分随价格上行走高（603013：10-21 评分 70.8 → 10-28 评分 77.4，技术分 87.7），
+    # 排序天然压过刚达标的新票 —— 冷却标注因此变成「老票自我强化」。
+    #
+    # 本项只改**名额分配顺序**，不改放行集合、不改评分、不改闸门：
+    # 命中冷却的行整体后置，未命中的新票优先占用 max_picks 名额；两组内部
+    # 仍按原 rank_score 顺序取。全部命中冷却时不重排（否则等于没变化但会动日志）。
+    #
+    # 与「放行集合只减不增」的关系：这是**名额层**的再分配，不新增放行标的；
+    # 冷却票仍可能在名额有余量时被推送（不再是必然出局）。设 False 可回退到
+    # 2026-10-28 及以前「纯按综合分取前 N」的行为。
+    QV_COOLDOWN_RANK_DEFER: bool = True
+    # ===== 跨 sleeve 同日硬拦截（2026-10-29 新增，默认 True）=====
+    # 【为什么需要】2026-10-22 / 10-27 / 10-28 三天，亚普股份(603013) 同时被
+    # bottom_fishing 与 longterm_quality 各推一条，而两个 sleeve 的执行参数不同：
+    #   bottom_fishing　 权重 0.45/0.30/0.25　止损 atr3x_floor15　止盈 +15%（→17.88）
+    #   longterm_quality 权重 0.55/0.35/0.10　止损 atr4x_floor20　止盈 +50%（→23.33）
+    # 手工执行时同一只票会同时收到两个互相矛盾的止盈价，冷却 label 模式在两个
+    # sleeve 之间又只标注不拦截，等于没有约束。
+    #
+    # 本项语义：**后运行的 sleeve 剔除当日已被其他 sleeve 推荐的代码**，
+    # 被剔除票转入 pending（可见、可查，带 same_day_other_sleeve 标签），
+    # 名额让给下一名，而不是直接作废。
+    # 只做减法（放行集合变小），不新增任何放行标的。
+    # 单向生效：现有 workflow 顺序是 daily(18:34 UTC) → longterm(19:02 UTC)，
+    # 因此主要是长期 sleeve 避让；若日后调换顺序则自动反向，无需改配置。
+    QV_SAME_DAY_CROSS_SLEEVE_BLOCK: bool = True
     # 市场级熔断：沪深300 近 MARKET_CRASH_LOOKBACK 个交易日累计跌幅低于该阈值（%）
     # → 本次运行不推荐。急跌期间全市场同步满足 RSI 超卖 / MA5 拐头 / 创新低底背离，
     # 抄底信号会批量触发，而 MA20_TREND_MIN_SLOPE 是个股级过滤，抓不到系统性风险。
@@ -3033,6 +3063,7 @@ _MISSING_TAG_ZH = {
     "valuation_pe": "PE未核验", "valuation_pb": "PB未核验",
     "fund_annual": "多年财务未核验", "annual_availability_assumed": "年度财务公告日需人工核对", "market_date": "行情基准日期缺失",
     "financial_review": "金融企业待专项核验", "repeat_cooldown": "资格已通过·重复推荐冷却",
+    "same_day_other_sleeve": "资格已通过·当日已被其他策略推荐",
     "valuation": "估值缺失", "pct_chg": "涨幅数据缺失", "gap": "开盘价缺失",
     "macd_mom": "MACD柱数据缺失", "kdj": "KDJ数据缺失",
     "operating_trend": "近期经营证据未核验", "operating_weak": "近期经营走弱·观察",
@@ -5388,12 +5419,91 @@ def _apply_repeat_cooldown(formal: pd.DataFrame, frame: pd.DataFrame,
     return formal.loc[~hit_mask].copy()
 
 
+def _apply_same_day_cross_sleeve_block(formal: pd.DataFrame, frame: pd.DataFrame,
+                                       same_day_taken, pending_out: Optional[list],
+                                       excluded_out: Optional[list] = None) -> pd.DataFrame:
+    """跨 sleeve 同日硬拦截：后运行的 sleeve 剔除当日已被其他 sleeve 推荐的代码。
+
+    【为什么需要（2026-10-29）】冷却 label 模式既然「只标注不拦截」，就管不住
+    两个 sleeve 之间的重复：2026-10-22 / 10-27 / 10-28，亚普股份(603013) 在
+    bottom_fishing 与 longterm_quality 各落一条，而两套执行参数不同
+    （止盈 +15% vs +50%，止损 atr3x_floor15 vs atr4x_floor20）。用户手工执行时
+    会同时拿到两个互相矛盾的止盈价 —— 这不是「多推一次」的信息冗余，是执行歧义。
+
+    【与 repeat_cooldown 的分工】
+      · repeat_cooldown：同一 sleeve 内 10 日窗口的去重，动作由 mode 决定（label/block）。
+      · 本函数：**同一交易日内跨 sleeve** 的唯一性，无条件硬拦截，无 mode。
+        两者正交：本函数只管「今天这只票是否已被别的 sleeve 占掉」。
+
+    【为什么不是直接丢弃】命中的票资格已通过，转 pending_out 保留可查性
+    （带 same_day_other_sleeve 标签），名额让给下一名，而不是让当日产出归零。
+    这与「宁缺毋滥」不冲突：**放行集合只减不增**。
+
+    【单向性】两个 workflow 先后运行，先跑的看不到后跑的。当前顺序为
+    daily(18:34 UTC) → longterm(19:02 UTC)，故实际主要是长期 sleeve 避让；
+    若日后调换顺序则自动反向，无需改代码。
+
+    same_day_taken 为空（未配置 DB / 查询失败 / 无记录）时原样返回，不阻断。
+    """
+    if not same_day_taken or formal is None or getattr(formal, "empty", True):
+        return formal
+    taken = {str(c) for c in same_day_taken if str(c).strip()}
+    if not taken:
+        return formal
+    hit_mask = formal["code"].astype(str).isin(taken)
+    if not bool(hit_mask.any()):
+        return formal
+    hit_codes = sorted(set(formal.loc[hit_mask, "code"].astype(str)))
+    if pending_out is not None and frame is not None:
+        for record in frame.loc[frame["code"].astype(str).isin(hit_codes)
+                                & frame["tier"].eq("formal")].to_dict("records"):
+            record.update(tier="pending", qualification_status="passed",
+                          delivery_status="same_day_other_sleeve")
+            record["missing_tags"] = ",".join(dict.fromkeys(
+                [t for t in str(record.get("missing_tags") or "").split(",") if t]
+                + ["same_day_other_sleeve"]))
+            pending_out.append(record)
+    if excluded_out is not None:
+        for record in formal.loc[hit_mask].to_dict("records"):
+            excluded_out.append({"code": str(record.get("code")),
+                                 "name": record.get("name"),
+                                 "score": record.get("score")})
+    logger.info("跨 sleeve 同日拦截：%d 只当日已被其他策略推荐，本次不再重复推送"
+                "（转入待核验，名额让给下一名）：%s", len(hit_codes),
+                "，".join(f"{c}" for c in hit_codes))
+    return formal.loc[~hit_mask].copy()
+
+
+def _defer_cooldown_rows(formal: pd.DataFrame) -> pd.DataFrame:
+    """把命中冷却标注的行整体后置，让新票优先占用 max_picks 名额。
+
+    仅用于 label 模式（该模式才会在 formal 上留下 repeat_count 标注）。
+    两组内部各自保持原有 rank_score 顺序 —— concat 不重排，head(cap) 仍按原序取。
+    全部命中或全部未命中时直接返回原表（重排无意义，还会无谓改动日志）。
+    """
+    if formal is None or getattr(formal, "empty", True):
+        return formal
+    if "repeat_count" not in formal.columns:
+        return formal
+    cool_mask = formal["repeat_count"].notna()
+    n_cool = int(cool_mask.sum())
+    if n_cool == 0 or n_cool == len(formal):
+        return formal
+    reordered = pd.concat([formal.loc[~cool_mask], formal.loc[cool_mask]],
+                          ignore_index=False)
+    logger.info("[QV_COOLDOWN_DEFER] 冷却标注 %d 只后置排序，%d 只新票优先占用名额"
+                "（不改放行集合，只改名额分配顺序）", n_cool, len(formal) - n_cool)
+    return reordered.reset_index(drop=True)
+
+
 def _screen_quality_pool(config: StrategyConfig, cache: CacheManager, market_env: dict,
                          latest_trade_date: Optional[str], pending_out: Optional[list] = None,
                          evaluator=None, max_picks: Optional[int] = None,
                          index_df: Optional[pd.DataFrame] = None,
                          volatile_out: Optional[list] = None,
-                         recently_recommended: Optional[Any] = None) -> Optional[pd.DataFrame]:
+                         recently_recommended: Optional[Any] = None,
+                         same_day_taken: Optional[Any] = None,
+                         same_day_excluded_out: Optional[list] = None) -> Optional[pd.DataFrame]:
     """先廉价行情筛选、后年度财务核验；核验完所有候选才排序和行业限额。
 
     max_picks：本次推荐数量上限（由 main 按市场环境 resolve_max_picks 解析后传入）；
@@ -5406,6 +5516,12 @@ def _screen_quality_pool(config: StrategyConfig, cache: CacheManager, market_env
         见 StrategyConfig.QV_REPEAT_COOLDOWN_DAYS / QV_REPEAT_COOLDOWN_MODE：
         mode="label"（默认）命中票**保留在正式推荐**并打「重复推荐」标签（放行集合不变），
         mode="block" 命中票移入待核验（不推送、不落库），mode="off" 不判定。
+    same_day_taken：**同一交易日内已被其他 sleeve 推荐**的代码集合（由调用方查库传入）。
+        与 recently_recommended 正交：后者管同一 sleeve 的 10 日窗口去重（可标注可拦截），
+        本参数负责「今天这只票是否已被别的 sleeve 占掉」，命中即硬拦截并转 pending，
+        避免同一只票带着两套互相矛盾的止损/止盈参数进入同一天的两张卡片。
+        见 StrategyConfig.QV_SAME_DAY_CROSS_SLEEVE_BLOCK。为空/None 时不拦截。
+    same_day_excluded_out：可选，收集被同日拦截剔除的行（code/name/score），供调用方留痕。
     """
     evaluator = evaluator or evaluate
     stocks = get_stock_list(config, cache)
@@ -5571,13 +5687,34 @@ def _screen_quality_pool(config: StrategyConfig, cache: CacheManager, market_env
         if _cooldown_mode == "label" and len(formal) != _before_rows:
             logger.warning("冷却(label)应保持行数不变，实际 %d → %d，请检查标注逻辑",
                            _before_rows, len(formal))
+    # ===== 跨 sleeve 同日硬拦截（2026-10-29）=====
+    # 放在冷却标注**之后**：先让 label 把「第几次、上次价」写全（pending 里也带着标签），
+    # 再剔除当日已被别的 sleeve 占掉的票。若放在之前，被剔除的行会丢掉冷却标注。
+    # 放在行业去重与名额截取**之前**：剔除后名额让给下一名，而不是当日产出直接归零。
+    same_day_blocked = 0
+    if bool(getattr(config, "QV_SAME_DAY_CROSS_SLEEVE_BLOCK", True)) and same_day_taken:
+        _before_same_day = len(formal)
+        formal = _apply_same_day_cross_sleeve_block(
+            formal, frame, same_day_taken, pending_out, same_day_excluded_out)
+        same_day_blocked = _before_same_day - len(formal)
+        same_day_checked = len({str(c) for c in same_day_taken if str(c).strip()})
+        logger.info("跨 sleeve 同日去重：已查当日推荐 %d 只，本 sleeve 命中拦截 %d 只",
+                    same_day_checked, same_day_blocked)
+    else:
+        # 死闸门原则：开关打开但没拿到集合（未配置 DB / 查询失败）必须显式留痕，
+        # 否则日志看起来「有去重」实际一次都没判定过。
+        if not bool(getattr(config, "QV_SAME_DAY_CROSS_SLEEVE_BLOCK", True)):
+            logger.info("跨 sleeve 同日去重：关闭（QV_SAME_DAY_CROSS_SLEEVE_BLOCK=False）")
+        else:
+            logger.info("跨 sleeve 同日去重：未生效（当日已推荐集合为空或未查询——"
+                        "未配置 MySQL / 查询失败 / 本 sleeve 先运行）")
     if pending_out is not None:
         pending_out.extend(pending.to_dict("records"))
         pending_out.extend(cooldown_rows)
     logger.info("优质低估低位最终分层：候选 %d，资格通过 %d，冷却转出 %d，冷却标注 %d，"
-                "普通待核验 %d，观察合计 %d，冷却后正式 %d（行业去重/名额截取前）",
+                "同日跨sleeve剔除 %d，普通待核验 %d，观察合计 %d，冷却后正式 %d（行业去重/名额截取前）",
                 len(frame), qualified_count, len(cooldown_rows), cooldown_labeled,
-                len(pending), len(pending) + len(cooldown_rows), len(formal))
+                same_day_blocked, len(pending), len(pending) + len(cooldown_rows), len(formal))
     for row in cooldown_rows:
         logger.info("[QV_COOLDOWN] %s(%s) | 资格=passed | 推送=cooldown | 原因=repeat_cooldown | 冷却期=%d",
                     row.get("name"), row.get("code"), _cooldown_days)
@@ -5645,8 +5782,25 @@ def _screen_quality_pool(config: StrategyConfig, cache: CacheManager, market_env
     # 估值口径逐行标注：写入 valuation_mode 列，供日志汇总与飞书卡片声明本次实际口径
     if getattr(config, "USE_INDUSTRY_RELATIVE_VALUATION", False) and not formal.empty:
         formal = _tag_valuation_mode(formal, snapshot, industry_map, config)
+    # ===== 冷却标注票名额后置（2026-10-29）=====
+    # 必须在 head(cap) 之前、行业去重之后：行业去重决定「谁还活着」，
+    # 名额后置只管「活下来的人谁先占名额」。顺序颠倒会让去重按旧顺序取舍。
+    if (_cooldown_mode == "label" and cooldown_labeled
+            and bool(getattr(config, "QV_COOLDOWN_RANK_DEFER", True))):
+        formal = _defer_cooldown_rows(formal)
     if len(formal) > cap:
         logger.info("通过 formal %d 只，按综合分截取前 %d 只（市场环境上限）", len(formal), cap)
+        # 被砍名单必须留痕（2026-10-29）：合格池只剩个位数时，这一步直接决定
+        # 用户看到什么，却是全链路唯一没有打印的决策点，事后无法复盘取舍是否合理。
+        _cut_rows = formal.iloc[cap:]
+        logger.info("[QV_CAP_CUT] 名额截取剔除 %d 只：%s", len(_cut_rows),
+                    "，".join(
+                        "%s(%s) 评分%s%s" % (
+                            r.get("name"), r.get("code"),
+                            "-" if pd.isna(r.get("score")) else f"{float(r['score']):.1f}",
+                            "·冷却" if ("repeat_count" in formal.columns
+                                     and not pd.isna(r.get("repeat_count"))) else "")
+                        for _, r in _cut_rows.iterrows()))
     selected = formal.head(cap).reset_index(drop=True)
     # 口径快照：把本次实际生效的评分权重与止损失规则写进每一行，供事后判别。
     # 缺列时不下发也不伪造 —— store 层读不到就写 NULL。
@@ -5654,9 +5808,9 @@ def _screen_quality_pool(config: StrategyConfig, cache: CacheManager, market_env
         for _k, _v in params_fingerprint(config).items():
             selected[_k] = _v
     logger.info("[QV_DELIVERY_SUMMARY] 最终可推送=%d，资格通过=%d，冷却转出=%d，冷却标注=%d，"
-                "普通待核验=%d，观察合计=%d",
+                "同日跨sleeve剔除=%d，普通待核验=%d，观察合计=%d",
                 len(selected), qualified_count, len(cooldown_rows), cooldown_labeled,
-                len(pending), len(pending) + len(cooldown_rows))
+                same_day_blocked, len(pending), len(pending) + len(cooldown_rows))
     return selected
 
 
@@ -5812,7 +5966,9 @@ def run_concurrent_screen(
 
 def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] = None,
          pending_out: Optional[list] = None, volatile_out: Optional[list] = None,
-         recently_recommended: Optional[Any] = None) -> Optional[pd.DataFrame]:
+         recently_recommended: Optional[Any] = None,
+         same_day_taken: Optional[Any] = None,
+         same_day_excluded_out: Optional[list] = None) -> Optional[pd.DataFrame]:
     """执行选股主流程，返回正式推荐（formal）DataFrame。
 
     pending_out：可选 list，传出「待核验候选」（财务/周线数据缺失、不与正式推荐混排），
@@ -5824,6 +5980,9 @@ def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] 
     由调用方查库后传入 set[str]（仅代码）或 dict{code:{count,last_date,last_close}}（带明细，
     label 模式才能标出「第几次、上次价→本次价」）；策略层不直接访问 DB；
     不传则冷却不生效（测试/回测路径即为此默认值）。
+    same_day_taken：同一交易日内已被其他 sleeve 推荐的代码集合，命中即硬拦截并转
+    pending（见 StrategyConfig.QV_SAME_DAY_CROSS_SLEEVE_BLOCK）。不传则不拦截。
+    same_day_excluded_out：可选，收集被同日拦截剔除的行。
     """
     if config is None: config = StrategyConfig()
     if cache is None: cache = CacheManager(expire_hours=config.CACHE_EXPIRE_HOURS)
@@ -5898,7 +6057,9 @@ def main(config: Optional[StrategyConfig] = None, cache: Optional[CacheManager] 
             return _screen_quality_pool(config, cache, market_env, latest_trade_date, pending_out,
                                         max_picks=max_picks, index_df=index_df,
                                         volatile_out=volatile_out,
-                                        recently_recommended=recently_recommended)
+                                        recently_recommended=recently_recommended,
+                                        same_day_taken=same_day_taken,
+                                        same_day_excluded_out=same_day_excluded_out)
 
         stock_list = get_stock_list(config, cache)
         if not stock_list:

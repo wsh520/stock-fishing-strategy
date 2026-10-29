@@ -62,6 +62,11 @@ audit_*_out.csv
 # diag_*_*.py 的结构化输出（如 diag_cooldown_forward → data/diag_cooldown_forward_20261024.csv、
 # diag_operating_relax → data/diag_operating_relax_20260604.csv）：可再生产物，重跑脚本即可。
 data/diag_*.csv
+# 审计脚本的中间样本缓存（audit_technical_score_forward → data/diag_technical_score_rows_*.csv.gz）
+data/diag_*.csv.gz
+# 一次性命令输出（10 月下旬排查用），可再生产物
+/oct_run.out
+/pe_audit.out
 
 # Local recommendation test and permission-diagnostic artifacts
 .test-artifacts/
@@ -70,3 +75,6 @@ tmpw32v7zve/
 
 # 忽略log
 *.log
+# 周度复盘留档（含当日推荐明细与个股代码，PUBLIC 仓库不入库）
+logs/
+reports/

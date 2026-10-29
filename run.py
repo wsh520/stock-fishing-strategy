@@ -24,7 +24,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
 from notify.feishu import (
     notify_screening_result,
 )
-from store.mysql_store import save_recommendations, fetch_recent_recommendation_detail
+from store.mysql_store import (
+    fetch_rec_codes_for_date,
+    fetch_recent_recommendation_detail,
+    save_recommendations,
+)
 from src.shadow_ledger import record_shadow_pending
 
 logger = logging.getLogger("run")
@@ -77,6 +81,45 @@ def _recent_recommended_detail(config, enabled: bool = True,
                 since, days, "跨 sleeve" if cross_sleeve else "仅本 sleeve", mode, len(detail),
                 "" if detail else "（空：库中无近期推荐，或 MySQL 未配置/查询失败）")
     return detail
+
+
+def _same_day_other_sleeve_codes(config, cache=None, enabled: bool = True) -> set[str]:
+    """查询同一交易日已被**其他 sleeve** 推荐过的代码（跨 sleeve 同日唯一性）。
+
+    2026-10-29 新增，与 run_longterm.py 的同名函数对称（详细动机见该处注释）：
+    冷却 label 模式只标注不拦截，管不住"同一只票带着两套互相矛盾的止损/止盈
+    参数进入同一天的两张卡片"（bottom_fishing 止盈 +15% vs longterm +50%）。
+
+    本 job 正常先于长期 sleeve 运行，因此通常查不到记录（返回空集，日志留痕）；
+    接上的意义是 workflow 顺序调换或手动重跑时自动生效。
+
+    失效方向是安全的：日期算错/未配置 DB → 查不到记录 → 空集 → 不去重，
+    不会误杀任何候选（fail-open 到"少去重"，而非"错杀"）。
+    """
+    if not enabled:
+        logger.info("跨 sleeve 同日去重：关闭（--no-save 模式，不查库）")
+        return set()
+    from src.screening_engine import latest_completed_trade_day
+    try:
+        trade_date = latest_completed_trade_day(config, cache)
+    except Exception:
+        logger.warning("跨 sleeve 同日去重：交易日获取失败，本次不生效:\n%s",
+                       traceback.format_exc()[-400:])
+        return set()
+    if not trade_date:
+        logger.info("跨 sleeve 同日去重：未生效（交易日为空）")
+        return set()
+    try:
+        taken = fetch_rec_codes_for_date(str(trade_date),
+                                         exclude_strategy="bottom_fishing")
+    except Exception:
+        logger.warning("跨 sleeve 同日去重：查询异常（本次不生效）:\n%s",
+                       traceback.format_exc()[-400:])
+        return set()
+    logger.info("跨 sleeve 同日去重：交易日=%s，其他策略当日已推 %d 只%s",
+                trade_date, len(taken),
+                "" if taken else "（空：本 sleeve 先运行/未配置 MySQL/查询失败）")
+    return taken
 
 
 def _setup_logging() -> None:
@@ -204,9 +247,23 @@ def run(argv: list[str] | None = None):
         recently_recommended = _recent_recommended_detail(config) if save_enabled else {}
         if not save_enabled:
             logger.info("重复推荐冷却：--no-save 模式下跳过（不查库，避免无意义连接）")
+        # 跨 sleeve 同日去重（2026-10-29）：本 job 18:34 UTC 先于 longterm(19:02 UTC) 运行，
+        # 正常情况下查不到当日其他 sleeve 记录；接上是为了
+        #   (a) workflow 顺序调换时自动反向生效；
+        #   (b) 手动触发/重跑时避免与已写入的长期 sleeve 重复推同一只票。
+        same_day_taken = _same_day_other_sleeve_codes(config, cache,
+                                                      enabled=save_enabled)
+        same_day_excluded: list[dict] = []
         output_df = main(config=config, cache=cache, pending_out=pending_rows,
                          volatile_out=volatile_rows,
-                         recently_recommended=recently_recommended)
+                         recently_recommended=recently_recommended,
+                         same_day_taken=same_day_taken,
+                         same_day_excluded_out=same_day_excluded)
+        if same_day_excluded:
+            logger.info("跨 sleeve 同日去重：被剔除 %d 只（资格已通过，仅因当日已被其他策略推荐）%s",
+                        len(same_day_excluded),
+                        "，".join(f"{r.get('name')}({r.get('code')}) 评分{r.get('score')}"
+                                  for r in same_day_excluded))
         n_picks = 0 if output_df is None else len(output_df)
         logger.info("Step 2/4 完成 (%.1f 分钟)，正式推荐 %d 只，待核验候选 %d 只，波动率超限观察 %d 只",
                     (time.time() - t) / 60, n_picks, len(pending_rows), len(volatile_rows))

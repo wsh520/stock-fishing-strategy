@@ -732,22 +732,37 @@ def get_active_recommendations(max_age_days: int = TRACK_MAX_AGE_DAYS,
         return []
 
 
-def fetch_rec_codes_for_date(rec_date: str) -> set[str]:
+def fetch_rec_codes_for_date(rec_date: str,
+                            exclude_strategy: Optional[str] = None) -> set[str]:
     """查询某日已落库推荐的股票代码集合（跨全部策略），供组合层同股去重。
 
     后运行的策略在落库前调用：剔除当日已被其他策略推荐的个股，
     避免两套策略同日重复推荐同一标的。未配置 MySQL 或查询失败时返回空集
     （降级为不去重，与落库可选哲学一致）。
+
+    exclude_strategy（2026-10-29 新增）：排除指定的 strategy，语义是「**其他** sleeve
+    当日已推的代码」。不加这个参数时，幂等重跑（手动 workflow_dispatch）会把本 sleeve
+    当天已写入的记录也算进来，导致自己把自己全部拦截 → 0 推荐。
     """
     if not is_configured():
+        # 死闸门原则：必须显式留痕。否则调用方只能打印「其他策略当日已推 0 只」，
+        # 无法区分「daily 还没跑」「没配 DB」「查询失败」三种完全不同的情况，
+        # 会把「同日去重没生效」误读成「今天没有重复票」。
+        logger.info("MySQL 未配置，当日已推荐代码为空 → 跨 sleeve 同日去重不生效")
         return set()
-    sql = "SELECT DISTINCT code FROM stock_recommendation WHERE rec_date = %s"
+    if exclude_strategy:
+        sql = ("SELECT DISTINCT code FROM stock_recommendation "
+               "WHERE rec_date = %s AND strategy <> %s")
+        params: tuple = (str(rec_date), str(exclude_strategy))
+    else:
+        sql = "SELECT DISTINCT code FROM stock_recommendation WHERE rec_date = %s"
+        params = (str(rec_date),)
     try:
         conn = _connect()
         try:
             _ensure_tables(conn)
             with conn.cursor() as cur:
-                cur.execute(sql, (str(rec_date),))
+                cur.execute(sql, params)
                 return {str(row[0]) for row in cur.fetchall()}
         finally:
             conn.close()
