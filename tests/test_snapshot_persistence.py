@@ -12,6 +12,7 @@ import os
 import shutil
 import unittest
 import uuid
+from datetime import date, timedelta
 from unittest.mock import Mock, patch
 
 import pandas as pd
@@ -19,7 +20,11 @@ import pandas as pd
 import src.screening_engine as m
 from src.screening_engine import StrategyConfig
 
-DAY = "2026-10-16"
+# 【必须是相对日期，不能硬编码】本文件断言的是「SNAPSHOT_CACHE_MAX_AGE_DAYS=7 内
+# 命中缓存」。原值为固定字符串 "2026-10-16"，于是 2026-10-24 起快照必然过期、
+# 缓存永不命中，test_successful_build_is_persisted_and_reused 每天假失败——
+# 「代码回归」和「日期流逝」被混成同一个信号。改成「昨天」后恒落在窗口内。
+DAY = (date.today() - timedelta(days=1)).isoformat()
 _WORKSPACE_TMP = os.path.join(os.getcwd(), ".test-artifacts")
 
 
